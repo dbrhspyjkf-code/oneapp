@@ -1506,6 +1506,8 @@ def test_tv():
 
     real_spawn = dash.App._tv_spawn
     dash.App._tv_spawn = fake_spawn
+    real_log = dash.App._tv_log
+    dash.App._tv_log = lambda self, line: None   # 测试不污染 /tmp/oneapp_tv.log
     app2 = None
     try:
         lst = app.tv_list()
@@ -1623,6 +1625,7 @@ def test_tv():
         assert app2.tool is None
     finally:
         dash.App._tv_spawn = real_spawn
+        dash.App._tv_log = real_log
         app.tv_stop()
         if app2:
             app2.tv_stop()
