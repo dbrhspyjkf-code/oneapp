@@ -269,6 +269,29 @@ def test_render():
     app.fdetail = None
     its = app.fin_items()
     assert its and its[0]["code"] == "sh600519", its
+    # 自选股: qt_code 幂等 (行情没显示的根因) + n 添加 / d 删除 (本地 json)
+    assert dash.qt_code("sh600519") == "sh600519"
+    assert dash.qt_code("600519") == "sh600519"
+    assert dash.qt_code("000001") == "sz000001"
+    assert dash.norm_stock_code("300750") == "sz300750"
+    assert dash.norm_stock_code("sh600519") == "sh600519"
+    assert dash.norm_stock_code("abc") is None
+    dash.WATCH_FILE = os.path.join(tmp, "watch.json")
+    app.watch = {"items": [{"code": "sh600519", "name": ""}]}
+    app.key(pygame.K_n)
+    assert app.fin_input
+    app.ime_mode = False
+    for chr_ in "002594":
+        app.key(0, chr_)
+    app.key(pygame.K_RETURN)
+    assert not app.fin_input
+    assert [i["code"] for i in app.watch["items"]] == ["sh600519", "sz002594"]
+    app.fsel = 1
+    app.key(pygame.K_d)
+    assert app.dialog and app.dialog[0] == "delwatch"
+    app.key(pygame.K_RETURN)
+    assert [i["code"] for i in app.watch["items"]] == ["sh600519"]
+    app.draw(canvas)                              # 顶部跑马灯渲染
     # 快捷键 4-8 → 页 1-5 (主页触发; 新闻/电台页数字为功能键)
     pg = pygame
     for key, page in [(pg.K_4, 1), (pg.K_5, 2), (pg.K_6, 3),

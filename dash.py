@@ -291,7 +291,23 @@ GATE_URL = "https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BTC_USDT"
 
 
 def qt_code(code):
-    return ("sh" if str(code)[0] == "6" else "sz") + str(code)
+    """→ qt 代码 (幂等): 已带 sh/sz/bj 前缀原样; 裸 6 位按首位补前缀."""
+    c = str(code)
+    if c[:2] in ("sh", "sz", "bj"):
+        return c
+    return ("sh" if c[0] == "6" else "sz") + c
+
+
+def norm_stock_code(s):
+    """添加自选股输入 → qt 代码: sh/sz/bj+6位原样; 裸 6 位按首位补
+    (5/6/9→sh, 0/3→sz, 4/8→bj). 无效返回 None."""
+    s = (s or "").strip().lower()
+    if re.match(r"^(sh|sz|bj)[0-9]{6}$", s):
+        return s
+    if re.match(r"^[0-9]{6}$", s):
+        pre = "sh" if s[0] in "569" else ("bj" if s[0] in "48" else "sz")
+        return pre + s
+    return None
 
 
 def parse_qt_text(txt):
@@ -978,6 +994,9 @@ class App:
         self.autoplay_key = None              # 设备测试: DASH_PLAY=<key>
         # 行情页状态
         self.fin_view = 0                     # 0 自选 1 指数 2 商品
+        self.fin_input = False                # 添加自选股输入态 (n 键)
+        self._hk_at = 0.0                     # 每日一句跑马灯相位
+        self._tk_at = 0.0                     # 行情顶部跑马灯相位
         self.fsel = 0
         self.fscroll = 0
         self.fdetail = None                   # None | {"code","name","view"}
@@ -1098,7 +1117,6 @@ class App:
         self.mu_tick()                        # 音乐连播: 任意页/离线都要走 (本地曲库)
         if self.net.mode == "online":
             if self.page == 0:
-                self.net.job("ipo", fetchers.ipo_fetch, 1800)
                 self.net.job("hitokoto", fetchers.hitokoto_fetch, 3600)
                 self.net.job("news", news_rss.news_fetch_all, 600)   # 主页新闻卡
                 self.net.job("wxloc", fetchers.wx_locate, 1800)      # IP 归属地 30min 重探
@@ -1106,6 +1124,7 @@ class App:
             if self.page == 2:
                 pass                          # 站台表内置 (radio_stations.STATIONS)
             if self.page == 3:
+                self.net.job("ipo", fetchers.ipo_fetch, 1800)   # 顶部跑马灯
                 self.net.pub_text(QT_BASE + ",".join(
                     c for c in self._qt_codes()), "quotes", 12)
                 self.net.pub_text(QT_BASE + ",".join(c for _, c in IDX_LIST),
@@ -1162,6 +1181,30 @@ class App:
         return [qt_code(it["code"]) for it in self.watch.get("items", [])
                 if it.get("code")][:16]
 
+    def fin_add_commit(self):
+        """输入框 Enter: 规范化代码 → 去重 → 落 watch.json."""
+        code = norm_stock_code(self.buf)
+        self.buf = ""
+        if not code:
+            self.osd = ("代码无效 · 如 600519 / sh600519", time.monotonic() + 2)
+            return
+        if any(it.get("code") == code for it in self.watch.get("items", [])):
+            self.osd = ("已在自选股", time.monotonic() + 1.5)
+            return
+        self.watch.setdefault("items", []).append({"code": code, "name": ""})
+        netmod.save_json_file(WATCH_FILE, self.watch)
+        self.osd = ("已添加 " + code, time.monotonic() + 1.5)
+
+    def watch_del(self, idx):
+        """删除自选股 (dialog 确认后调) → 落 watch.json."""
+        items = self.watch.get("items", [])
+        if 0 <= idx < len(items):
+            code = items[idx].get("code")
+            del items[idx]
+            netmod.save_json_file(WATCH_FILE, self.watch)
+            self.fsel = max(0, min(self.fsel, max(0, len(items) - 1)))
+            self.osd = ("已删除 " + (code or ""), time.monotonic() + 1.2)
+
     def fin_items(self):
         """自选股: 本地 watchlist + 实时 quotes 覆盖."""
         items = [dict(it) for it in self.watch.get("items", [])
@@ -1173,6 +1216,8 @@ class App:
                 it["price"] = qt_num(f, 3)
                 it["chg"] = qt_num(f, 31)
                 it["pchg"] = qt_num(f, 32)
+                if not it.get("name") and len(f) > 1:
+                    it["name"] = f[1]
         return items
 
     def open_detail(self, code, name, view="min"):
@@ -2028,12 +2073,59 @@ class App:
                         return False          # 主页确认 → 退出
                     self.dialog = None        # 非主页: 只关闭对话框
                     return True
-                self.delete_selected()        # ("del", item) 确认删除
+                if self.dialog[0] == "delwatch":
+                    self.watch_del(self.dialog[1])   # ("delwatch", idx)
+                else:
+                    self.delete_selected()   # ("del", item) 确认删除
                 self.dialog = None
             elif k == pygame.K_ESCAPE:
                 self.dialog = None
             else:                             # 其余任意键 = 关闭对话框
                 self.dialog = None
+            return True
+
+        if self.page == 3 and self.fin_input:
+            # 添加自选股输入框 (想法页同款 IME 交互)
+            if k == pygame.K_SLASH:
+                self.ime_mode = not self.ime_mode
+                self.ime_clear()
+                return True
+            if self.ime_mode:
+                if not self.ime_buf:
+                    if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self.ime_clear()
+                        self.fin_input = False
+                        self.fin_add_commit()
+                        return True
+                    if k == pygame.K_ESCAPE:
+                        self.ime_clear()
+                        self.fin_input = False
+                        self.buf = ""
+                        return True
+                act = self.ime_key(k, ch)
+                if act is None:
+                    return True
+                tag, val = act
+                if tag == "del":
+                    self.buf = self.buf[:-1]
+                elif tag == "submit":
+                    self.ime_clear()
+                    self.fin_input = False
+                    self.fin_add_commit()
+                else:
+                    self.buf = (self.buf + val)[:16]
+                return True
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.fin_input = False
+                self.fin_add_commit()
+            elif k == pygame.K_ESCAPE:
+                self.fin_input = False
+                self.buf = ""
+            elif k == pygame.K_BACKSPACE:
+                self.buf = self.buf[:-1]
+            elif ch and 0x20 <= ord(ch) < 0x7F:
+                if len(self.buf) < 16:
+                    self.buf += ch
             return True
 
         if self.page == 1 and self.in_input:
@@ -2124,7 +2216,7 @@ class App:
                 self.move_sel(-2 if k == pygame.K_UP else -1)
             elif self.page == 2:
                 self.move_rsel(-1)
-            elif self.page == 3 and not self.fdetail:
+            elif self.page == 3 and not self.fdetail and not self.fin_input:
                 self._move_fsel(-3 if k == pygame.K_UP else -1)
             elif self.page == 4:
                 if k == pygame.K_LEFT:
@@ -2143,7 +2235,7 @@ class App:
                 self.move_sel(2 if k == pygame.K_DOWN else 1)
             elif self.page == 2:
                 self.move_rsel(1)
-            elif self.page == 3 and not self.fdetail:
+            elif self.page == 3 and not self.fdetail and not self.fin_input:
                 self._move_fsel(3 if k == pygame.K_DOWN else 1)
             elif self.page == 4:
                 if k == pygame.K_RIGHT:
@@ -2162,6 +2254,11 @@ class App:
             elif self.fdetail:                # 图表详情 → 关图表
                 self.fdetail = None
             elif self.page != 0:
+                if self.fin_input:            # 输入态: Esc 先退输入
+                    self.fin_input = False
+                    self.buf = ""
+                    self.ime_clear()
+                    return True
                 if self.rec_proc:
                     self.rec_stop()           # 离开想法页自动收音保存
                 self.page = 0                 # 回主页
@@ -2238,7 +2335,17 @@ class App:
                 elif k == pygame.K_0:             # 缩小
                     self.fdetail["zoom"] = max(0.5, self.fdetail.get("zoom", 1.0) / 1.3)
             else:
-                if k == pygame.K_4:               # 自选股
+                if k == pygame.K_n and self.fin_view == 0:   # 添加自选股
+                    self.ime_clear()
+                    self.fin_input = True
+                    self.buf = ""
+                    self.cv_armed = False
+                elif (k == pygame.K_d or k == pygame.K_x) \
+                        and self.fin_view == 0 and self.fin_items():
+                    n_items = len(self.fin_items())
+                    self.dialog = ("delwatch",
+                                   self.fsel if self.fsel < n_items else 0)
+                elif k == pygame.K_4:               # 自选股
                     self.fin_view = 0
                     self.fsel = self.fscroll = 0
                 elif k == pygame.K_5:             # 指数
@@ -2887,10 +2994,11 @@ class App:
         # 秒与分底部对齐 (30px/12px 字形底差 ≈13, 实测校正)
         text(surf, ss, 12, dim, (x0 + textw(hm, 30) + 4, 25))
 
-        # 时钟下方四行 (日期/农历/天气/新股) 等距; 电池图标贴底
+        # 时钟下方三行 (日期/农历/天气) 等距; 电池图标贴底
+        # (新股/自选股信息挪行情页顶部跑马灯, 主页卡不再显示)
         rows_y = []
         top_y, bot_y = 42, r.bottom - 22
-        n_rows = 4
+        n_rows = 3
         slot = (bot_y - top_y) / n_rows
         for i in range(n_rows):
             rows_y.append(int(top_y + i * slot + (slot - 9) // 2))
@@ -2911,16 +3019,6 @@ class App:
         else:
             textc(surf, "天气获取中" if self.net.mode != "offline" else "离线",
                   BODY, dim, ccx, rows_y[2])
-        ipo = self.data.get("ipo") or {}
-        ip = (ipo.get("items") or [])[:1]
-        if ipo.get("ok") and ip:
-            it = ip[0]
-            textc(surf, clip_text("新股 " + (it.get("name") or "") + " " +
-                                  (it.get("date") or "") +
-                                  ("(今)" if it.get("today") else ""),
-                                  BODY, LW - 6), BODY, soft, ccx, rows_y[3])
-        else:
-            textc(surf, "新股 · 暂无", BODY, dim, ccx, rows_y[3])
         # 电池图标 (贴底右下, 距底边 = 时钟距顶边 8px): 外壳+电量填充+正极头
         bp, bs = battery_state()
         if bp is not None:
@@ -2948,25 +3046,33 @@ class App:
         cw2 = W - cx - M                           # 192
         chh, gap = 43, M
         tops = (M, M + chh + gap)
+        now = time.monotonic()
         for i, (lab, top) in enumerate(zip(("每日一句", "新闻"), tops)):
             rr = pygame.Rect(cx, top, cw2, chh)
             pygame.draw.rect(surf, self.card(i + 1), rr, border_radius=6)
             pygame.draw.rect(surf, border, rr, 1, border_radius=6)
             text(surf, lab, 8, dim, (rr.x + 8, rr.y + 3))
-        # 每日一句: 垂直居中, 最多两行 + 出处
+        # 每日一句: 单行跑马灯 (溢出卡宽即滚动, 同新闻卡)
         top0 = tops[0]
         hk = self.data.get("hitokoto") or {}
         if hk.get("text"):
             txt = hk["text"]
             if hk.get("from"):
                 txt += " — " + hk["from"]
-            lines = self._wrap_lines(txt, BODY, cw2 - 16, 2)
-            zone_h = chh - 13
-            used = 15 if len(lines) > 1 else 13
-            ty = top0 + 13 + (zone_h - used) // 2
-            for li, ln in enumerate(lines):
-                text(surf, ln, BODY, soft if li == 0 else dim,
-                     (cx + 8, ty + li * 15))
+            vw = cw2 - 16
+            tw = textw(txt, BODY)
+            vy = top0 + 13 + (chh - 13 - BODY) // 2
+            if tw <= vw:
+                text(surf, txt, BODY, soft, (cx + 8, vy))
+            else:
+                SPEED = 28.0
+                span = tw + vw + 24
+                if now - self._hk_at > span / SPEED + 1.0:
+                    self._hk_at = now
+                off = (now - self._hk_at) * SPEED
+                surf.set_clip((cx + 8, top0, vw, chh))
+                text(surf, txt, BODY, soft, (cx + 8 + vw - off, vy))
+                surf.set_clip(None)
         else:
             text(surf, "获取中" if self.net.mode == "online" else "--",
                  BODY, dim, (cx + 8, top0 + 13 + (chh - 13 - BODY) // 2))
@@ -3043,6 +3149,8 @@ class App:
                 it["price"] = qt_num(f, 3)
                 it["chg"] = qt_num(f, 31)
                 it["pchg"] = qt_num(f, 32)
+                if not it.get("name") and len(f) > 1:
+                    it["name"] = f[1]
         return items
 
     def idx_cards(self):
@@ -3100,6 +3208,7 @@ class App:
             text(surf, "行情", 14, hi, (6, 2))
             text(surf, "· " + self.FIN_TABS[view], 11, dim,
                  (6 + textw("行情", 14) + 6, 4))
+            self._draw_fin_ticker(surf)   # 顶部标题: 自选股行情+新股 跑马灯
 
         if self.fdetail:
             self.draw_fin_detail(surf)
@@ -3151,7 +3260,64 @@ class App:
             text(surf, lab, 13, col, (x, y))
             x += textw(lab, 13) + textw("我我我", 13)
         if view == 0:
-            text(surf, "8 图表", 13, soft, (W - 6, y), right=True)
+            text(surf, "8 图表 · n 添加 · d 删", 13, soft, (W - 6, y),
+                 right=True)
+
+        # 添加自选股输入框 (第 2 排卡片之上浮层)
+        if self.fin_input:
+            r = pygame.Rect(M, 116, W - 2 * M, 27)
+            pygame.draw.rect(surf, self.th("track"), r, border_radius=5)
+            pygame.draw.rect(surf, acc, r, 2, border_radius=5)
+            ty = r.y + (27 - 13) // 2
+            text(surf, "+", BODY, acc, (r.x + 8, ty))
+            tag = "拼" if self.ime_mode else "EN"
+            text(surf, tag, 10, acc, (r.x + 22, ty + 1))
+            shown = clip_text(self.buf + self.ime_buf, BODY, 150)
+            text(surf, shown, BODY, hi, (r.x + 40, ty))
+            if int(time.monotonic() * 2) % 2 == 0:
+                cx2 = r.x + 40 + textw(shown, BODY) + 1
+                pygame.draw.rect(surf, acc, (cx2, ty + 2, 7, 13))
+            text(surf, "Enter 存 · / 英 · Esc 退", 9, dim,
+                 (r.right - 8, ty + 3), right=True)
+            if not self.ime_bar(surf, 146):
+                pass
+
+    def _draw_fin_ticker(self, surf):
+        """顶部标题跑马灯: 自选股行情 + 新股 (主页卡不再显示, 挪这里)."""
+        parts = []
+        for it in self.fin_items():
+            if it.get("price"):
+                parts.append("%s %.2f %+.2f%%" % (
+                    (it.get("name") or it["code"])[:8], it["price"],
+                    it.get("pchg") or 0))
+        ipo = self.data.get("ipo") or {}
+        for it in (ipo.get("items") or [])[:2]:
+            parts.append("新股 %s %s%s" % (
+                (it.get("name") or "")[:8], it.get("date") or "",
+                "(今)" if it.get("today") else ""))
+        if not parts:
+            return
+        txt = " · ".join(parts)
+        tab = "· " + self.FIN_TABS[self.fin_view]
+        tx = 6 + textw("行情", 14) + 6 + textw(tab, 11) + 10
+        vw = W - 6 - tx
+        if vw < 60:
+            return
+        dim = self.th("dim")
+        tw = textw(txt, 11)
+        vy = 5
+        now = time.monotonic()
+        if tw <= vw:
+            text(surf, txt, 11, dim, (tx, vy))
+            return
+        SPEED = 24.0
+        span = tw + vw + 20
+        if now - self._tk_at > span / SPEED + 1.0:
+            self._tk_at = now
+        off = (now - self._tk_at) * SPEED
+        surf.set_clip((tx, 0, vw, 17))
+        text(surf, txt, 11, dim, (tx + vw - off, vy))
+        surf.set_clip(None)
 
     def draw_fin_detail(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
