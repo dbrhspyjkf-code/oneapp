@@ -664,6 +664,62 @@ def test_radio_out():
         assert (app6.rsel, app6.playing_key) == mark
         assert app6.page == 2                 # 5 不再被电台占用 → 跳页 (5=电台)
 
+        # AirPlay 会话内音量: 路由(不碰 pactl) + SETVOL 走 FIFO + 记忆落盘
+        # + Fn+A 静音/恢复 + RAOPVOL 回执采纳 + radio_stop 关命令通道
+        dash.RAOP_VOL_FILE = os.path.join(tmp, "raop_vol.json")
+        app8 = dash.App(FakeNet())
+        app8.page = 2
+        app8.raop = devs
+        app8.radio_out = 1
+
+        class FakeCons:
+            def poll(self):
+                return None
+
+        app8.raop_cons = FakeCons()
+        app8.playing_key = "k"
+        vol_fifo = os.path.join(tmp, "vol.fifo")
+        os.mkfifo(vol_fifo)
+        app8.vol_fifo = vol_fifo
+        app8.vol_w = os.open(vol_fifo, os.O_RDWR | os.O_NONBLOCK)
+        assert app8.raop_vol == 50             # 无记忆默认 50
+        # 会话内绝不能落到本地 pactl 路径
+        real_run = dash.subprocess.run
+        dash.subprocess.run = \
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("pactl hit"))
+        try:
+            app8.adjust_volume(115)            # Fn+S 音量+
+        finally:
+            dash.subprocess.run = real_run
+        assert app8.raop_vol == 55
+        assert os.read(app8.vol_w, 64) == b"SETVOL 55\n"
+        assert netmod.load_json_file(dash.RAOP_VOL_FILE, None) == 55
+        assert "55%" in app8.osd[0] and "AirPlay·A音箱" in app8.osd[0]
+        app8.adjust_volume(114)                # Fn+D 音量-
+        assert app8.raop_vol == 50 and os.read(app8.vol_w, 64) == b"SETVOL 50\n"
+        app8.adjust_volume(113)                # Fn+A 静音
+        assert app8.raop_vol == 0 and os.read(app8.vol_w, 64) == b"SETVOL 0\n"
+        app8.adjust_volume(113)                # 再按恢复
+        assert app8.raop_vol == 50 and os.read(app8.vol_w, 64) == b"SETVOL 50\n"
+        # RAOPVOL 回执采纳 (音箱/iPhone 侧音量变化 → pyatv 视角回流)
+        app8.raop_vol = 0
+        wsrc = "import sys, time; print('RAOPVOL 37', flush=True); time.sleep(0.4)"
+        wproc = subprocess.Popen([sys.executable, "-c", wsrc],
+                                 stdout=subprocess.PIPE)
+        dash.App._raop_watch(app8, wproc)      # 读到行后随 EOF 返回
+        assert app8.raop_vol == 37, app8.raop_vol
+        app8.radio_stop()                      # 命令通道随会话关
+        assert app8.vol_w is None and not os.path.exists(vol_fifo)
+        assert app8.raop_cons is None
+
+        # 会话不在 (未播放/已停) → 不走 AirPlay, 落回本地且标签注明 本机
+        app9 = dash.App(FakeNet())
+        app9.page = 2
+        app9.radio_out = 1
+        app9.raop = devs
+        app9.playing_key = None
+        assert app9.adjust_volume(115) is None  # Mac 无 pactl → OSD 兜底不崩
+
         # 设备 ffmpeg SIGTERM 会卡死 futex (真机实证) → radio_stop 必须
         # 补刀 SIGKILL: 产端/消费端都是忽略 SIGTERM 的替身, 停播后 2s 内死透
         stubborn = "import signal,time; signal.signal(signal.SIGTERM," \
@@ -681,7 +737,7 @@ def test_radio_out():
             _time.sleep(0.05)
         assert prod.poll() is not None and cons.poll() is not None, \
             "radio_stop 未杀掉忽略 SIGTERM 的进程 (futex 僵尸复现)"
-        print("radio out OK (filter/restore/cycle/fallback/keys/kill)")
+        print("radio out OK (filter/restore/cycle/fallback/keys/vol/kill)")
     finally:
         _sh.rmtree(tmp, ignore_errors=True)
 

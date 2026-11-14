@@ -120,6 +120,7 @@ WX_LOC_FILE = os.path.join(STATE_DIR, "wx_loc.json")   # IP 归属地快照
 # Dash 已装); 缺库/无设备时 O 键回落本机。局域网自动发现 (mDNS 扫描)。
 RAOP_CACHE = os.path.join(STATE_DIR, "raop_devs.json")
 RADIO_OUT_FILE = os.path.join(STATE_DIR, "radio_out.json")
+RAOP_VOL_FILE = os.path.join(STATE_DIR, "raop_vol.json")   # AirPlay 会话音量记忆
 _RAOP_SKIP = re.compile(r"电视|tv|macbook|ipad|iphone", re.I)
 
 
@@ -148,7 +149,7 @@ async def _s():
 asyncio.run(_s())
 '''
 _ATVR_PLAY = r"""
-import asyncio, sys
+import asyncio, os, sys, threading
 async def _s():
     from pyatv import connect
     from pyatv.conf import AppleTV, ManualService
@@ -164,6 +165,29 @@ async def _s():
         md = None                        # 台名进 RAOP 元数据 (HomePod 显示真台名)
         if len(sys.argv) > 4 and sys.argv[4]:
             md = MediaMetadata(title=sys.argv[4])
+        if len(sys.argv) > 5 and sys.argv[5]:
+            def _vol_ctl(path=sys.argv[5]):
+                # 音量命令线程: SETVOL <0-100> → atv.audio.set_volume
+                # (同 RTSP 会话 SET_PARAMETER = iPhone 播放条同款会话音量,
+                # 直达音箱); 落盘成功回执 RAOPVOL <pyatv 视角音量>.
+                try:
+                    fd = os.open(path, os.O_RDONLY)   # 父端持 O_RDWR → 立即开
+                    for line in os.fdopen(fd, "r"):
+                        line = line.strip()
+                        if not line.startswith("SETVOL "):
+                            continue
+                        try:
+                            v = max(0.0, min(100.0, float(line.split()[1])))
+                            fut = asyncio.run_coroutine_threadsafe(
+                                atv.audio.set_volume(v), loop)
+                            fut.result(timeout=5)
+                            print("RAOPVOL %d" % int(atv.audio.volume),
+                                  flush=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            threading.Thread(target=_vol_ctl, daemon=True).start()
         await atv.stream.stream_file(sys.stdin.buffer, metadata=md,
                                      override_missing_metadata=True)
     finally:
@@ -1118,6 +1142,11 @@ class App:
         self.playing_key = None               # 播放中电台 key
         self.play_at = 0.0                    # 本次开播时刻
         self.raop_cons = None                 # AirPlay 消费端 (atvremote stream=-)
+        self.vol_w = None                     # 音量控制 FIFO 写端 (O_RDWR, 会话期常开)
+        self.vol_fifo = None
+        self.raop_mute_prev = None            # Fn+A 静音前的音量 (恢复位)
+        _v = netmod.load_json_file(RAOP_VOL_FILE, 50)
+        self.raop_vol = _v if isinstance(_v, int) and 0 <= _v <= 100 else 50
         # 电台输出 (0=本机, ≥1 → raop[idx-1]); 缓存须带 id, 旧格式无 id → 重扫
         self.raop = [d for d in netmod.load_json_file(RAOP_CACHE, [])
                      if isinstance(d, dict) and _raop_ok(d)]
@@ -1633,13 +1662,23 @@ class App:
     def _radio_play_raop(self, st, dev):
         """AirPlay 播放: ffmpeg (-re 节流) → flac 管道 → atvremote stream=-.
         成功置 playing_key 返回 True; 失败返回 False (radio_play 回落本机).
-        VU 旁路 FIFO wav (AirPlay 不走本地 pulse, monitor 采不到)."""
+        VU 旁路 FIFO wav (AirPlay 不走本地 pulse, monitor 采不到).
+        音量控制 FIFO (O_RDWR 自持不互等) → 消费端线程 → 同会话 SET_PARAMETER."""
         vufifo = "/tmp/oneapp_vu_%d.fifo" % int(time.monotonic() * 1000)
+        self._vol_fifo_close()                # 上一会话残留 (异常退出兜底)
         try:
             os.unlink(vufifo)
         except Exception:
             pass
         os.mkfifo(vufifo, 0o600)
+        volfifo = "/tmp/oneapp_vol_%d.fifo" % int(time.monotonic() * 1000)
+        try:
+            os.unlink(volfifo)
+        except Exception:
+            pass
+        os.mkfifo(volfifo, 0o600)
+        self.vol_fifo = volfifo
+        self.vol_w = os.open(volfifo, os.O_RDWR | os.O_NONBLOCK)
         apfh = None
         try:                                  # stderr 落盘: 无声/失败可回查
             aplog = "/tmp/oneapp_radio_ap.log"
@@ -1655,11 +1694,12 @@ class App:
             cons = subprocess.Popen(
                 [sys.executable, "-c", _ATVR_PLAY, dev["ip"],
                  str(dev.get("port", 7000)), dev.get("id", ""),
-                 (st.get("name") or "")[:120]],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                 (st.get("name") or "")[:120], volfifo],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=apfh or subprocess.DEVNULL, env=_AUDIO_ENV,
                 preexec_fn=_FFPLAY_KW.get("preexec_fn"), close_fds=True)
         except Exception:
+            self._vol_fifo_close()
             self._raop_cleanup(vufifo, apfh)
             self.osd = ("AirPlay 启动失败 (pip install pyatv==0.18.0)",
                         time.monotonic() + 2.0)
@@ -1676,7 +1716,8 @@ class App:
                 stderr=apfh or subprocess.DEVNULL, env=_AUDIO_ENV,
                 preexec_fn=_FFPLAY_KW.get("preexec_fn"), close_fds=True)
         except Exception:
-            cons.kill()
+            self._radio_kill(cons)
+            self._vol_fifo_close()
             self._raop_cleanup(vufifo, apfh)
             self.osd = ("AirPlay 解码启动失败", time.monotonic() + 1.5)
             return False
@@ -1690,11 +1731,70 @@ class App:
             except Exception:
                 pass
         self.raop_cons = cons
+        threading.Thread(target=self._raop_watch, args=(cons,),
+                         daemon=True).start()
         self.lvl.start_fifo(vufifo)           # 读端 NONBLOCK 开, 不与写端互等
         self.playing_key = st["key"]
         self.play_at = time.monotonic()
         self.osd = (st["name"], time.monotonic() + 1.5)
         return True
+
+    def _vol_fifo_close(self):
+        """音量控制 FIFO 收尾 (写端关闭 → 消费端命令线程 EOF 退出)."""
+        if self.vol_w is not None:
+            try:
+                os.close(self.vol_w)
+            except Exception:
+                pass
+            self.vol_w = None
+        if self.vol_fifo:
+            try:
+                os.unlink(self.vol_fifo)
+            except Exception:
+                pass
+            self.vol_fifo = None
+
+    def _raop_watch(self, proc):
+        """消费端 stdout: RAOPVOL <n> → 采纳 pyatv 视角会话音量 (音箱端/iPhone
+        侧的音量变更会被 pyatv 拦截进来, 比纯本地记忆更准)."""
+        try:
+            for line in proc.stdout:
+                line = line.decode(errors="replace").strip()
+                if line.startswith("RAOPVOL "):
+                    try:
+                        self.raop_vol = max(0,
+                                            min(100, int(float(line.split()[1]))))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _raop_volume(self, code):
+        """AirPlay 会话内音量: SETVOL 走控制 FIFO → 消费端 atv.audio.set_volume
+        (同 RTSP 会话直达音箱, iPhone 播放条同款). 不新连会话 — 频繁重连触发
+        音箱冷却拒连 (dash 实证). 音量记忆落盘, 重启沿用."""
+        if code == 113:                       # Fn+A 静音 ↔ 恢复
+            if self.raop_mute_prev is None:
+                self.raop_mute_prev = max(self.raop_vol, 20)
+                v = 0
+            else:
+                v, self.raop_mute_prev = self.raop_mute_prev, None
+        else:                                 # Fn+S+/Fn+D- ±5, 钳 0-100
+            self.raop_mute_prev = None
+            v = max(0, min(100, self.raop_vol + (-5 if code == 114 else 5)))
+        self.raop_vol = v
+        try:
+            netmod.save_json_file(RAOP_VOL_FILE, v)
+        except Exception:
+            pass
+        if self.vol_w is not None:
+            try:
+                os.write(self.vol_w, ("SETVOL %d\n" % v).encode())
+            except Exception:
+                pass
+        self.osd = ("%s %d%% · %s" % ("静音" if v == 0 else "音量",
+                                      v, self.radio_out_name()),
+                    time.monotonic() + 1.2)
 
     @staticmethod
     def _raop_cleanup(vufifo, apfh):
@@ -1740,6 +1840,7 @@ class App:
         self.player = None
         self._radio_kill(self.raop_cons)      # RAOP 消费端随产端一起断
         self.raop_cons = None
+        self._vol_fifo_close()                # 音量命令通道随会话关
         self.playing_key = None
         self.lvl.stop()                       # 电平源随播放进程一起断
         self.vu = [3.0] * 12
@@ -3578,6 +3679,10 @@ class App:
         return out
 
     def adjust_volume(self, code):
+        if self.playing_key and self.raop_cons is not None \
+                and self.raop_cons.poll() is None:
+            self._raop_volume(code)           # AirPlay 会话内: 音量直达音箱
+            return
         try:
             env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/1000")
             if code == 113:                   # Fn+A 静音
@@ -3604,6 +3709,9 @@ class App:
             label = "音量 " + m.group(1) + "%" if m else "音量?"
             if "yes" in mute:
                 label = "静音 " + label
+            if self.radio_out >= 1 and not (self.playing_key
+                                            and self.raop_cons is not None):
+                label = "本机 " + label       # 输出选了 AirPlay 但无会话: 讲明调的是本机
             self.osd = (label, time.monotonic() + 1.2)
         except Exception:
             self.osd = ("音量调节不可用", time.monotonic() + 1.0)

@@ -21,8 +21,11 @@ M5Stack CardputerZero (320×170) 的 pygame 工具箱 app。**零本地服务依
 (musrc.py 自实现 weapi/eapi, 扫码绑定, 歌词走 LRCLIB+网易兜底), 输出仅本机。
 
 电台 AirPlay 输出: O 键循环 本机→局域网 AirPlay 音箱 (mDNS 自动发现,
-pyatv RAOP 直推, 台名进音箱元数据)。设备需 `pip install --user --break-system-packages
-pyatv==0.18.0 srptools==1.0.1`; 缺库/无设备时自动回落本机播放。
+pyatv RAOP 直推, 台名进音箱元数据)。AirPlay 播放中 Fn+S/D/A 音量±/静音
+直达当前音箱 (同 RTSP 会话 SET_PARAMETER, 音量记忆 `raop_vol.json`;
+未播放时回落本机并在 OSD 注明 "本机")。设备需 `pip install --user
+--break-system-packages pyatv==0.18.0 srptools==1.0.1`;
+缺库/无设备时自动回落本机播放。
 
 ## 运行
 
