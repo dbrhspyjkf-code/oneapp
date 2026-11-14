@@ -3797,6 +3797,7 @@ class App:
         if self.sel >= self.scroll + 4:
             self.scroll = (self.sel // 4) * 4
 
+    @staticmethod
     def _pl_lrc_parse(s):
         """LRC → [(秒, 文本)]; 多时间戳行展开, 稳定排序 (tab5 同款)."""
         out = []
@@ -4954,6 +4955,7 @@ class App:
 
     # ── 家居页: HA 设备控制 ──
     # ── 工具·照片 ──
+    @staticmethod
     def _cover_blit(surf, img, rect):
         w, h = img.get_size()
         scale = max(rect.w / w, rect.h / h)
