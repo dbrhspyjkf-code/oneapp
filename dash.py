@@ -2205,6 +2205,10 @@ class App:
             # (方向键已在上方分支转入 tool_grid_key; Esc 全局分支 → 回主页)
             self.tool_grid_key(k)
         elif self.page == 4:
+            if k == pygame.K_p:
+                self.page = (self.page + 1) % len(PAGES)   # P 换页 (方向键
+                self.in_input = False                       #   已被占用)
+                return True
             digit = k - pygame.K_0
             if pygame.K_1 <= k <= pygame.K_7 and not self.news_detail:
                 idx = self.news_scroll + digit - 1   # 窗口内 1-7, 翻页复用
@@ -3313,7 +3317,7 @@ class App:
 
         # 列表头
         text(surf, "新闻", 14, hi, (6, 2))
-        text(surf, "· %s %d 条 · ←→ 切换源" % (src_name, len(items)), 11, dim,
+        text(surf, "· %s %d 条" % (src_name, len(items)), 11, dim,
              (6 + textw("新闻", 14) + 6, 4))
 
         # 列表行: 均匀分布
@@ -3340,7 +3344,7 @@ class App:
         if not items:
             textc(surf, "新闻获取中" if self.net.mode != "offline"
                   else "离线 · 联网后同步", BODY, dim, W // 2, 70)
-        text(surf, "F/X 换页 · ↑↓ 选择 · 1-7 打开 · ←→ 源", BODY, soft, (6, 151))
+        text(surf, "P 换页 · ↑↓ 选择 · 1-7 打开 · ←→ 源", BODY, soft, (6, 151))
 
     def draw_tool(self, surf):
         {"fx": self.draw_fx, "unit": self.draw_unit,

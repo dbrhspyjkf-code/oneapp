@@ -308,6 +308,9 @@ def test_render():
     app.key(pg.K_RIGHT)
     assert app.news_src_i == 0
     app.news_detail = None
+    # P = 换页 (4→5 工具), 其余数字仍留给选条
+    app.key(pg.K_p)
+    assert app.page == 5, app.page
     sel0 = app.news_sel
     app.key(pg.K_DOWN)
     assert app.news_sel == sel0 + 1                   # ↓ 选择下一条
