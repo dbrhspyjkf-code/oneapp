@@ -476,7 +476,7 @@ def test_voice():
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     os.makedirs(dash.VOICES_DIR, exist_ok=True)
 
-    def mkwav(path, sec, pre_silence=0.0):
+    def mkwav(path, sec, pre_silence=0.0, amp=9000, spike=False):
         sr = 8000
         w = _wave.open(path, "wb")
         w.setnchannels(1)
@@ -486,8 +486,10 @@ def test_voice():
         frames = []
         for i in range(n):
             t = i / sr
-            v = 0 if t < pre_silence else int(9000 * _math.sin(2 * 3.14159 * 440 * t))
+            v = 0 if t < pre_silence else int(amp * _math.sin(2 * 3.14159 * 440 * t))
             frames.append(v)
+        if spike:
+            frames[len(frames) // 3] = 32000   # 单击脉冲 (削波/碰撞)
         w.writeframes(_struct.pack("<%dh" % n, *frames))
         w.close()
 
@@ -521,25 +523,30 @@ def test_voice():
         mkwav(f2, 1.5, pre_silence=0.5)
         dur = dash.trim_silence_head(f2, keep=0.1)
         assert dur is not None and 0.9 <= dur <= 1.4, dur
-        # clean_voice: 高通+噪声门+归一 — 440Hz 纯音+静音尾, 处理后峰值≈target
+        # clean_voice: 小声量被 RMS 归一拉起 (k≈5), 尖峰文件峰值安全回缩
         f3 = os.path.join(tmp, "clean.wav")
-        mkwav(f3, 2.0, pre_silence=0.5)
+        mkwav(f3, 2.0, pre_silence=0.5, amp=900)   # 小声量
         cdur = dash.clean_voice(f3)
         assert cdur is not None and abs(cdur - 2.0) < 0.1, cdur
         import wave as _w2
-        w = _w2.open(f3)
-        d2 = _w2._array if False else None
-        frames = w.readframes(w.getnframes())
-        w.close()
         import struct as _s
-        vals = _s.unpack("<%dh" % (len(frames) // 2), frames)
-        pk = max(abs(v) for v in vals)
-        assert 20000 <= pk <= 30000, pk        # 归一到 26000 档
-        # 纯静音文件: 归一增益钳在 8x 内不爆放
-        f4 = os.path.join(tmp, "sil.wav")
-        mkwav(f4, 0.2, pre_silence=99)
-        cdur2 = dash.clean_voice(f4)
-        assert cdur2 is not None
+
+        def pkof(path):
+            w = _w2.open(path)
+            frames = w.readframes(w.getnframes())
+            w.close()
+            return max(abs(v) for v in _s.unpack("<%dh" % (len(frames) // 2),
+                                                 frames))
+        pk = pkof(f3)
+        assert 2500 <= pk <= 9000 and pk > 900 * 2, pk   # 拉响 ≥2×
+        f4 = os.path.join(tmp, "spike.wav")
+        mkwav(f4, 2.0, pre_silence=0.5, amp=900, spike=True)
+        assert dash.clean_voice(f4) is not None
+        assert pkof(f4) <= 32000, pkof(f4)     # 安全回缩不炸
+        # 纯静音文件: 不崩不爆放
+        f5 = os.path.join(tmp, "sil.wav")
+        mkwav(f5, 0.2, pre_silence=99)
+        assert dash.clean_voice(f5) is not None
         # 文字与语音互不影响
         app.submit_idea()
         assert len(app.idea_items()) == 1

@@ -435,9 +435,9 @@ REC_MAX = 60                             # 秒, 自动截断 (arecord -d 自己�
 REC_MIXER = [
     ["ADC MUX", "AMIC"], ["PGAL Select", "DifferentialL"],
     ["PGAR Select", "DifferentialR"],
-    ["ADCL", "128"], ["ADCR", "128"],       # 128: 底噪比 160 档低 ~20dB
-                                           #   (160 实测 rms 339+脉冲, 128→27);
-                                           #   语音响度由 clean_voice 归一补
+    ["ADCL", "160"], ["ADCR", "160"],       # 160=本单元有声下限附近 (128 实测
+                                           #   全零=静音区, 120→rms27 已哑边缘);
+                                           #   "吵"由 clean_voice 软件治
     ["ADCL PGA", "6"], ["ADCR PGA", "6"],
     ["ADC2DAC Mixer", "0"],
 ]
@@ -500,20 +500,28 @@ def clean_voice(path, target_pk=26000):
             px = x
             py = y
             hp.append(int(max(-32768, min(32767, y))))  # array('h') 溢出即抛
-        # ② 噪声门: 20ms 帧能量 → 帧增益 (线性斜坡防爆音)
+        # ② 噪声门: 20ms 帧能量 → 帧增益 (线性斜坡防爆音).
+        # floor 取 10 分位; 若 p10>p50×0.6 (整段无静音, 如连续说话) → 门限退化
+        # 为弱门, 防全轨误杀 (家庭版 VAD 同坑). 最低增益 0.25.
         win = max(1, sr // 50)
         rms_list = []
         for i in range(0, len(hp) - win + 1, win):
             seg = hp[i:i + win]
             rms_list.append(math.sqrt(sum(v * v for v in seg) / len(seg)))
-        floor = sorted(rms_list)[max(0, len(rms_list) // 10)]
-        thr = floor * 1.6 + 8                  # +8 绝对底: 纯数字噪也压掉
+        if not rms_list:
+            return None
+        s = sorted(rms_list)
+        p10, p50, p80 = (s[len(s) // 10], s[len(s) // 2],
+                         s[min(len(s) - 1, int(len(s) * 0.8))])
+        if p10 > p50 * 0.6:
+            thr = p50 * 0.5 + 8                # 无静音段: 只压最弱的一半
+        else:
+            thr = p10 * 2.2 + 8
         gains = [1.0] * len(rms_list)
         for i, r in enumerate(rms_list):
             if r < thr:
-                # 越深压越狠, 最低 gate_ratio
                 depth = (thr - r) / (thr + 1.0)
-                gains[i] = max(0.12, 1.0 - depth * 1.2)
+                gains[i] = max(0.25, 1.0 - depth * 1.2)
         out = _a.array("h")
         for i, r in enumerate(rms_list):       # 帧内线性斜坡 (与前帧增益插值)
             g0 = gains[i - 1] if i else 1.0
@@ -522,12 +530,14 @@ def clean_voice(path, target_pk=26000):
                 g = g0 + (g1 - g0) * j / win
                 out.append(int(max(-32768, min(32767, v * g))))
         out.extend(hp[len(rms_list) * win:])
-        # ③ 峰值归一
+        # ③ 语音 RMS 归一 (p80 帧): 单击脉冲/削波峰不再毁整体响度;
+        # k 钳 [1,20], 后做峰值安全回缩
+        k = min(20.0, max(1.0, (target_pk / 8.0) / max(1, p80)))
+        out = _a.array("h", [int(max(-32768, min(32767, v * k))) for v in out])
         pk = max(abs(v) for v in out) or 1
-        k = min(8.0, target_pk / pk)           # 最多提 18dB, 防纯底噪爆放
-        if k > 1.02:
-            out = _a.array("h", [int(max(-32768, min(32767, v * k)))
-                                 for v in out])
+        if pk > 32000:
+            kk = 32000.0 / pk
+            out = _a.array("h", [int(v * kk) for v in out])
         w2 = _w.open(path, "wb")
         w2.setnchannels(1)
         w2.setsampwidth(2)
