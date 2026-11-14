@@ -1321,6 +1321,7 @@ class App:
         self.mu_playing = None                # 当前 {"path","title","artist",...}
         self.mu_play_idx = -1                 # mu_playing 在 mu_files 里的序号
         self.mu_proc = None                   # 播放进程 (本机 ffplay)
+        self.mu_ff = None                     # 商店版音乐无 AirPlay → 恒 None (draw 出声锚点判据引用, 勿删)
         self.mu_retries = 0                   # 提前收工重连额度 (每曲 3)
         self.mu_retry_at = 0.0                # 非阻塞重试定时锚
         self.mu_advance = False               # True=自然播完自动连播下一首
@@ -5230,8 +5231,8 @@ class App:
         self.vu_tick(time.monotonic(), lvb, lvm, lvt)
         # 本机出声锚点: VU 首响定位 (2026-11-14) — HTTP 直连预缓冲 1-3s,
         # 旧写法"起进程=出声"使歌词抢跑; pulse monitor 首个过阈帧=真出声,
-        # -0.15s 补监视器链路; 5s 静音曲头/监视器失效兜底回旧值. AirPlay
-        # 不走这 (mu_ff=cons), RAOP-UP 锚点线程不变
+        # -0.15s 补监视器链路; 5s 静音曲头/监视器失效兜底回旧值. 商店版
+        # 音乐仅本机输出 (mu_ff 恒 None), 判据与 zero-dash 保持同构
         if self.mu_aud_up is None and playing and self.mu_ff is None:
             if lvb > 2.0 or lvm > 2.0:
                 self.mu_aud_up = time.monotonic() - 0.15
