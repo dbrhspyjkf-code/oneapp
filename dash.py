@@ -1397,7 +1397,8 @@ class App:
         self.tv_sel = 0                        # 组内光标
         self.tv_sels = {0: 0}                  # 每组光标 {grp_idx: sel}
         self.tv_scroll = 0                     # 列表窗口起点
-        self.tv_playing = None                 # 播放中频道 (name, group, url)
+        self.tv_playing = None                 # 播放中频道 (name, group, urls)
+        self.tv_url_i = 0                      # 当前线路序号 (失败自动 +1 换路)
         self.tv_proc = None                    # ffmpeg 子进程
         self.tv_gen = 0                        # 播放会话号 (读帧线程守卫)
         self.tv_hw = False                     # 本次尝试硬解 (h264_v4l2m2m)
@@ -2911,7 +2912,7 @@ class App:
     #    滤镜顺序/不加 reconnect 旗标均照 panel.py 真机实证 (强加 reconnect
     #    会致 HLS 分段边沿卡顿). ─────────────────────────────────────────
     TV_FPS = 12
-    TV_FIRST_TIMEOUT = 12.0                 # 起播无首帧判死 (慢源留给探测)
+    TV_FIRST_TIMEOUT = 20.0                 # 起播无首帧判死 (白天源拥堵实测 10-17s)
     TV_STALL_TIMEOUT = 8.0                  # 播放中断流判定
 
     def tv_list(self, grp=None):
@@ -2953,9 +2954,18 @@ class App:
         return False
 
     def tv_argv(self, url, hw, audio):
-        """ffmpeg argv: 视频 rgb24 管道 + 音频同进程 pulse (panel.py 同款)."""
+        """ffmpeg argv: 视频 rgb24 管道 + 音频同进程 pulse (panel.py 同款).
+        源 host 在 tv_channels.UA_BY_HOST 表里 (aptv 转发) → 带 -user_agent."""
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
                "-protocol_whitelist", "file,pipe,crypto,http,https,tcp,tls"]
+        try:
+            from urllib.parse import urlparse
+            import tv_channels
+            ua = tv_channels.UA_BY_HOST.get(urlparse(url).netloc.split(":")[0])
+            if ua:
+                cmd += ["-user_agent", ua]
+        except Exception:
+            pass
         if hw:                               # 硬解前缀 (输出前 copy 免回读抢占)
             cmd += ["-c:v", "h264_v4l2m2m", "-num_capture_buffers", "8",
                     "-num_output_buffers", "8", "-pixel_format", "yuv420p"]
@@ -2977,17 +2987,20 @@ class App:
                                 stderr=subprocess.PIPE,
                                 env=_AUDIO_ENV, **_FFPLAY_KW)
 
-    def tv_play(self, ch, hw=None, audio=True, att=0):
-        """起播: 杀旧会话 → spawn → 读帧线程. hw=None 自动探测硬解;
-        att=重试梯级 (0 初试; 看门狗触发 1=软解 2=关音频, 最多 3 次尝试)."""
+    def tv_play(self, ch, hw=None, audio=True, att=0, url_i=0):
+        """起播: 杀旧会话 → spawn → 读帧线程. ch=(name, group, urls);
+        url_i=线路序号 (失败自动换下一路, 全尽才报无法播放);
+        hw=None 自动探测硬解; att=尝试计数 (日志/保险丝)."""
         self.tv_stop()
         if self.playing_key:                  # 音频焦点: 电台/音乐让路
             self.radio_stop()
         if self.mu_proc or self.mu_playing:
             self.mu_stop()
+        urls = ch[2]
+        url_i = max(0, min(url_i, len(urls) - 1))
         if hw is None:
             hw = self.tv_hwdec_available()
-        cmd = self.tv_argv(ch[2], hw, audio)
+        cmd = self.tv_argv(urls[url_i], hw, audio)
         try:
             proc = self._tv_spawn(cmd)
         except Exception:
@@ -2996,6 +3009,7 @@ class App:
             return
         self.tv_gen += 1
         self.tv_playing = ch
+        self.tv_url_i = url_i
         self.tv_hw = hw
         self.tv_audio = audio
         self.tv_att = att
@@ -3007,7 +3021,8 @@ class App:
         now = time.monotonic()
         self.tv_started = self.tv_last_at = self.tv_osd_at = now
         self.tv_proc = proc
-        self._tv_log("play %s att=%d hw=%d audio=%d" % (ch[0], att, hw, audio))
+        self._tv_log("play %s url=%d/%d att=%d hw=%d audio=%d %s" % (
+            ch[0], url_i + 1, len(urls), att, hw, audio, urls[url_i]))
         self.tv_reader = threading.Thread(target=self._tv_read_loop,
                                           args=(self.tv_gen, proc), daemon=True)
         self.tv_reader.start()
@@ -3110,18 +3125,19 @@ class App:
         self.tv_stop()
         self.tv_err = msg
 
-    def _tv_retry(self, why, hw, audio):
-        """换参数重播同频道 (梯级 ≤2: 硬解→软解 / 关音频)."""
+    def _tv_retry(self, why, hw, audio, url_i):
+        """换参数/换线路重播同频道. 保险丝: 尝试数 > 2×线路数+2 强制收."""
         ch = self.tv_playing
-        if ch is None or self.tv_att >= 2:
+        if ch is None or self.tv_att > 2 * len(ch[2]) + 2:
             self._tv_fail("无法播放 · 换台试试")
             return
         self._tv_log("retry " + why)
-        self.tv_play(ch, hw=hw, audio=audio, att=self.tv_att + 1)
+        self.tv_play(ch, hw=hw, audio=audio, att=self.tv_att + 1,
+                     url_i=url_i)
 
     def tv_watchdog(self):
-        """poll_tool 每秒: 进程退出/起播超时 → 零帧分类 (可修则重试);
-        播放中断流 → 信号中断停播 (换台即恢复, 不自动重试)."""
+        """poll_tool 每秒: 进程退出/起播超时/断流 → 零帧分类 (可修先修),
+        修不了换下一路线路; 线路穷尽才报无法播放回列表."""
         if not self.tv_playing:
             return
         now = time.monotonic()
@@ -3131,35 +3147,53 @@ class App:
             self._tv_classify(exited)
             return
         if self.tv_frames and now - self.tv_last_at > self.TV_STALL_TIMEOUT:
-            self._tv_fail("信号中断 · 换台可恢复")
+            self._tv_next_url("信号中断, 换下一路",
+                              "信号中断 · 换台可恢复")   # 断流也换路续播
+
+    def _tv_next_url(self, why, last_msg):
+        """换下一路线路; 已是最后一路 → 报 last_msg 回列表."""
+        ch = self.tv_playing
+        if ch is None or self.tv_url_i + 1 >= len(ch[2]):
+            self._tv_fail(last_msg)
+            return
+        self._tv_retry(why, hw=None, audio=True, url_i=self.tv_url_i + 1)
 
     def _tv_classify(self, exited):
-        """零帧失败分类: stderr 有解则换参重试, 否则报文案回列表."""
-        if self.tv_frames:                    # 出过画再断 = 信号中断
-            self._tv_fail("信号中断 · 换台可恢复")
+        """零帧失败分类: 同线路可修 (关声/软解) 优先, 修不了换下一路,
+        线路穷尽才按 stderr 报文案回列表."""
+        if self.tv_frames:                    # 出过画再断 = 断流换路
+            self._tv_next_url("信号中断, 换下一路", "信号中断 · 换台可恢复")
             return
         dead = self.tv_dead or {}
         low = dead.get("err", "").lower()
         if self.tv_audio and "matches no streams" in low:
-            self._tv_retry("流无音频, 关声重试", hw=self.tv_hw, audio=False)
+            self._tv_retry("流无音频, 关声重试",
+                           hw=self.tv_hw, audio=False, url_i=self.tv_url_i)
             return
         if self.tv_hw and (not exited or "v4l2m2m" in low
                            or "no device" in low
                            or "cannot allocate" in low):
-            self._tv_retry("硬解未出画, 切软解", hw=False, audio=self.tv_audio)
+            self._tv_retry("硬解未出画, 切软解",
+                           hw=False, audio=self.tv_audio, url_i=self.tv_url_i)
             return
         m = re.search(r"(?:server returned|http error)\s*(?:status\s+)?(\d{3})", low)
         code = m.group(1) if m else ""
-        if code == "404":
-            self._tv_fail("源不可用 (404) · 换台试试")
-        elif code in ("401", "403"):
-            self._tv_fail("源拒绝访问 (%s)" % code)
+        # 其余一切 (纯超时/连接错/HTTP 错/退出) = 这一路救不了 → 换下一路;
+        # 线路穷尽按 stderr 报具体文案回列表
+        ch = self.tv_playing
+        if ch is None:
+            return
+        if code in ("404", "401", "403"):
+            last = "源不可用 (%s) · 换台试试" % code
         elif "timed out" in low or "connection" in low:
-            self._tv_fail("连接超时 · 稍后再试")
-        elif exited and dead.get("rc") is not None:
-            self._tv_fail("无法播放 (退出码 %s)" % dead.get("rc"))
+            last = "连接超时 · 稍后再试"
         else:
-            self._tv_fail("无法播放 · 换台试试")
+            last = "无法播放 · 换台试试"
+        if self.tv_url_i + 1 < len(ch[2]):
+            self._tv_retry("本路失败 (%s), 换下一路" % (code or "超时/退出"),
+                           hw=None, audio=True, url_i=self.tv_url_i + 1)
+        else:
+            self._tv_fail(last)
 
     def tv_key(self, k):
         """列表: ←→ 切分组 ↑↓ 选台 Enter 播; 播放态: ↑↓ 换台 (Esc 外层)."""
@@ -3224,7 +3258,7 @@ class App:
             i = r0 + kk
             if i >= len(lst):
                 break
-            name, grp, url = lst[i]
+            name, grp, urls = lst[i]
             y = 44 + kk * 26
             sel = i == self.tv_sel
             rct = pygame.Rect(4, y, W - 8, 24)
@@ -3233,7 +3267,9 @@ class App:
                              2 if sel else 1, border_radius=4)
             text(surf, clip_text(name, 12, W - 130), 12,
                  hi if sel else soft, (12, y + 1))
-            text(surf, urlparse(url).netloc, 9, dim, (12, y + 13))
+            text(surf, urlparse(urls[0]).netloc +
+                 (" +备胎×%d" % (len(urls) - 1) if len(urls) > 1 else ""),
+                 9, dim, (12, y + 13))
             text(surf, "%02d" % (i + 1), 10, acc, (W - 24, y + 7), right=True)
         self.tool_foot(surf, ("←→ 分组", "↑↓ 选台", "Enter 播", "Esc 返回"))
 
@@ -3253,8 +3289,13 @@ class App:
                 surf.blit(bar, (4, 4))
                 text(surf, tag, 11, self.th("hi"), (10, 6))
             return
-        textc(surf, "连接中…", 14, self.th("hi"), W // 2, 60)
-        textc(surf, self.tv_playing[0], 12, self.th("soft"), W // 2, 82)
+        ch = self.tv_playing
+        secs = int(time.monotonic() - self.tv_started)
+        textc(surf, "连接中 %ds" % secs, 14, self.th("hi"), W // 2, 56)
+        if len(ch[2]) > 1:                    # 多线路: 显当前路 (失败自动换)
+            textc(surf, "线路 %d/%d" % (self.tv_url_i + 1, len(ch[2])),
+                  10, self.th("dim"), W // 2, 76)
+        textc(surf, ch[0], 12, self.th("soft"), W // 2, 94)
         textc(surf, "F/X 换台 · Esc 返回", 9, self.th("dim"), W // 2, 136)
 
     def _tv_log(self, line):

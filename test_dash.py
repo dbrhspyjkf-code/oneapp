@@ -1439,17 +1439,22 @@ def test_tv():
     tmp = tempfile.mkdtemp(prefix="oneapp")
     dash.TV_LAST_CACHE = os.path.join(tmp, "tv_last.json")
 
-    # ── 台表: 95 条实测源, 4 组齐全, 无空名/坏协议/短时效 token ──
+    # ── 台表: 95 条实测源, 4 组齐全, 无空名/坏协议/短时效 token;
+    #    每频道 urls 列表 (≥30 台多路备胎), aptv host 挂 UA ──
     assert len(tv_channels.CHANNELS) == 95
     assert tv_channels.GROUPS == ["央视", "卫视", "地方", "国际"]
     for g in tv_channels.GROUPS:
         assert any(c[1] == g for c in tv_channels.CHANNELS), g
     names = [c[0] for c in tv_channels.CHANNELS]
     assert len(set(names)) == len(names), "频道重名"
-    for n, g, u in tv_channels.CHANNELS:
-        assert n and u.startswith(("http://", "https://")), (n, u)
+    for n, g, us in tv_channels.CHANNELS:
+        assert n and isinstance(us, list) and us, n
+        for u in us:
+            assert u.startswith(("http://", "https://")), (n, u)
+            assert "txSecret" not in u and "user_session_id" not in u, n
         assert g in tv_channels.GROUPS
-        assert "txSecret" not in u and "user_session_id" not in u, n
+    assert sum(1 for c in tv_channels.CHANNELS if len(c[2]) > 1) >= 30
+    assert tv_channels.UA_BY_HOST.get("101.35.240.114") == "AptvPlayer-UA"
 
     # ── argv: 硬解 copy 前缀 + 解码器旗标; 软解无; 关音频 -an ──
     app = dash.App(FakeNet())
@@ -1468,6 +1473,10 @@ def test_tv():
     assert a_sw[a_sw.index("-vf") + 1].startswith("fps=12,scale=320:170")
     a_an = app.tv_argv("http://x/live.m3u8", False, False)
     assert a_an[-1] == "-an" and "pulse" not in a_an
+    a_ua = app.tv_argv("http://101.35.240.114:88/live.php?id=CCTV1", False, True)
+    assert a_ua[a_ua.index("-user_agent") + 1] == "AptvPlayer-UA"
+    assert "101.35.240.114" in a_ua[a_ua.index("-i") + 1]
+    assert "-user_agent" not in a_sw
     # 硬解探测: 无 v4l2 的机器 (Mac) 恒 False; True 仅可能出现在有
     # /sys/class/video4linux 的设备 (bcm2835-codec-decode)
     hw_probe = dash.App.tv_hwdec_available()
@@ -1516,7 +1525,7 @@ def test_tv():
         # Enter 起播 → 读帧线程消费管道帧
         app.tv_key(pygame.K_RETURN)
         assert app.tv_playing and app.tv_playing[0] == "CCTV1"
-        assert app.tv_playing[2] in procs[0][1]
+        assert app.tv_playing[2][0] in procs[0][1]       # 首路 URL 进 argv
         frame1 = bytes([64]) * (dash.W * dash.H * 3)
         frame2 = bytes([200]) * (dash.W * dash.H * 3)
         os.write(procs[-1][0].o_w, frame1 + frame2)
@@ -1538,39 +1547,29 @@ def test_tv():
         assert app.tv_playing is None and app.tool == "tv"
         assert len(procs) == 2                 # Esc 不再起新进程
 
-        # ── 看门狗: 起播超时 (钉软解 — 设备会自动探到硬解改走重试分支) ──
+        # ── 看门狗: 起播超时, 单路频道 (钉软解) → 无备胎直接报错 ──
+        one = ("单路台", "央视", ["http://dead/1.m3u8"])
         app.tv_err = ""
-        app.tv_play(lst[0], hw=False, audio=True)
-        app.tv_started = _time.monotonic() - 13.0
+        app.tv_play(one, hw=False)
+        app.tv_started = _time.monotonic() - 21.0
         app.tv_watchdog()
         assert app.tv_playing is None and app.tv_err, app.tv_err
         assert procs[-1][0].returncode is not None
 
-        # ── 看门狗: 硬解零帧退出 (v4l2 报错) → 自动切软解重试 ──
-        app.tv_err = ""
-        ch = app.tv_list()[0]
-        app.tv_play(ch, hw=True, audio=True, att=0)      # 手工指定硬解
-        assert procs[-1][0].returncode is None
-        procs[-1][0].returncode = 1                      # 模拟进程已退
-        app.tv_dead = {"rc": 1, "err": "h264_v4l2m2m: unknown decoder"}
+        # ── failover: 首路失败自动换二路, 全尽才报无法播放 ──
+        two = ("双路台", "央视", ["http://a/1.m3u8", "http://b/2.m3u8"])
+        app.tv_play(two, hw=False)
+        assert "http://a/1.m3u8" in procs[-1][1] and app.tv_url_i == 0
+        app.tv_started = _time.monotonic() - 21.0      # 首路超时
         app.tv_watchdog()
-        assert app.tv_playing and app.tv_att == 1        # 软解重试中
-        assert "h264_v4l2m2m" not in procs[-1][1]
-        # 再挂: 无音频流 → -an 重试 (梯级 2)
-        procs[-1][0].returncode = 1
-        app.tv_dead = {"rc": 1,
-                       "err": "Stream map '0:a:0' matches no streams"}
+        assert app.tv_playing and app.tv_url_i == 1    # 已自动切二路
+        assert "http://b/2.m3u8" in procs[-1][1]
+        app.tv_started = _time.monotonic() - 21.0      # 二路也超时
         app.tv_watchdog()
-        assert app.tv_playing and app.tv_att == 2
-        assert procs[-1][1][-1] == "-an"
-        # 梯级用尽 → 报错回列表
-        procs[-1][0].returncode = 1
-        app.tv_dead = {"rc": 1, "err": "Server returned 404"}
-        app.tv_watchdog()
-        assert app.tv_playing is None
-        assert "404" in app.tv_err, app.tv_err
-        # 播放中断流 (出过帧 + 8s 无新帧) → 信号中断, 不重试
-        app.tv_play(ch)
+        assert app.tv_playing is None and "无法播放" in app.tv_err
+
+        # ── 断流 (出过帧 + 8s 无新帧) → 换二路续播而非直接停 ──
+        app.tv_play(two, hw=False)
         os.write(procs[-1][0].o_w, frame1)
         for _ in range(60):
             if app.tv_frames >= 1:
@@ -1579,7 +1578,38 @@ def test_tv():
         assert app.tv_frames == 1
         app.tv_last_at = _time.monotonic() - 9.0
         app.tv_watchdog()
-        assert app.tv_playing is None and "信号中断" in app.tv_err
+        assert app.tv_playing and app.tv_url_i == 1 \
+            and "http://b/2.m3u8" in procs[-1][1]
+        app.tv_stop()                                    # 清场
+
+        # ── 同线路可修优先: 硬解 v4l2 报错 → 软解 (不换路) ──
+        app.tv_err = ""
+        ch = app.tv_list()[0]                          # CCTV1 (多路)
+        app.tv_play(ch, hw=True, audio=True, att=0)    # 手工指定硬解
+        assert procs[-1][0].returncode is None
+        procs[-1][0].returncode = 1                    # 模拟进程已退
+        app.tv_dead = {"rc": 1, "err": "h264_v4l2m2m: unknown decoder"}
+        app.tv_watchdog()
+        assert app.tv_playing and app.tv_att == 1 and app.tv_url_i == 0
+        assert "h264_v4l2m2m" not in procs[-1][1]
+        # 同路软解再挂: 无音频流 → -an (梯级 2, 仍同路)
+        procs[-1][0].returncode = 1
+        app.tv_dead = {"rc": 1,
+                       "err": "Stream map '0:a:0' matches no streams"}
+        app.tv_watchdog()
+        assert app.tv_playing and app.tv_att == 2 and app.tv_url_i == 0
+        assert procs[-1][1][-1] == "-an"
+        # 同路 -an 也 404 → 换二路 (att 3)
+        procs[-1][0].returncode = 1
+        app.tv_dead = {"rc": 1, "err": "Server returned 404"}
+        app.tv_watchdog()
+        assert app.tv_playing and app.tv_url_i == 1 and app.tv_att == 3
+        # 二路也 404 → 线路穷尽 → 报错回列表
+        procs[-1][0].returncode = 1
+        app.tv_dead = {"rc": 1, "err": "Server returned 404"}
+        app.tv_watchdog()
+        assert app.tv_playing is None
+        assert "404" in app.tv_err, app.tv_err
         app.tv_stop()                                    # 清场
 
         # ── 音频焦点: 电台起播把电视踢停 ──
