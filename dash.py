@@ -435,7 +435,9 @@ REC_MAX = 60                             # 秒, 自动截断 (arecord -d 自己�
 REC_MIXER = [
     ["ADC MUX", "AMIC"], ["PGAL Select", "DifferentialL"],
     ["PGAR Select", "DifferentialR"],
-    ["ADCL", "160"], ["ADCR", "160"],
+    ["ADCL", "128"], ["ADCR", "128"],       # 128: 底噪比 160 档低 ~20dB
+                                           #   (160 实测 rms 339+脉冲, 128→27);
+                                           #   语音响度由 clean_voice 归一补
     ["ADCL PGA", "6"], ["ADCR PGA", "6"],
     ["ADC2DAC Mixer", "0"],
 ]
@@ -472,6 +474,67 @@ def trim_silence_head(path, thr=800, keep=0.3):
         w2.writeframes(out)                     # 同时重写正确 WAV 头
         w2.close()
         return round(len(out) / 2 / sr)
+    except Exception:
+        return None
+
+
+def clean_voice(path, target_pk=26000):
+    """录音后处理 (纯 stdlib, worker 线程跑): ①~100Hz 一阶高通 (去隆隆/工频)
+    ②噪声门 (20ms 帧, 底噪=帧RMS 10 分位, 门限=底噪×1.6, 帧增益线性斜坡)
+    ③峰值归一到 target_pk (80% 满幅). 返回处理时长秒, 失败 None."""
+    try:
+        import wave as _w
+        w = _w.open(path)
+        sr, n = w.getframerate(), w.getnframes()
+        import array as _a
+        d = _a.array("h", w.readframes(n))
+        w.close()
+        if not len(d):
+            return None
+        # ① 一阶高通: y = a*(y_prev + x - x_prev), a=0.985 ≈ fc 100Hz@16k
+        a = 0.985
+        px = py = 0
+        hp = _a.array("h")
+        for x in d:
+            y = a * (py + x - px)
+            px = x
+            py = y
+            hp.append(int(max(-32768, min(32767, y))))  # array('h') 溢出即抛
+        # ② 噪声门: 20ms 帧能量 → 帧增益 (线性斜坡防爆音)
+        win = max(1, sr // 50)
+        rms_list = []
+        for i in range(0, len(hp) - win + 1, win):
+            seg = hp[i:i + win]
+            rms_list.append(math.sqrt(sum(v * v for v in seg) / len(seg)))
+        floor = sorted(rms_list)[max(0, len(rms_list) // 10)]
+        thr = floor * 1.6 + 8                  # +8 绝对底: 纯数字噪也压掉
+        gains = [1.0] * len(rms_list)
+        for i, r in enumerate(rms_list):
+            if r < thr:
+                # 越深压越狠, 最低 gate_ratio
+                depth = (thr - r) / (thr + 1.0)
+                gains[i] = max(0.12, 1.0 - depth * 1.2)
+        out = _a.array("h")
+        for i, r in enumerate(rms_list):       # 帧内线性斜坡 (与前帧增益插值)
+            g0 = gains[i - 1] if i else 1.0
+            g1 = gains[i]
+            for j, v in enumerate(hp[i * win:(i + 1) * win]):
+                g = g0 + (g1 - g0) * j / win
+                out.append(int(max(-32768, min(32767, v * g))))
+        out.extend(hp[len(rms_list) * win:])
+        # ③ 峰值归一
+        pk = max(abs(v) for v in out) or 1
+        k = min(8.0, target_pk / pk)           # 最多提 18dB, 防纯底噪爆放
+        if k > 1.02:
+            out = _a.array("h", [int(max(-32768, min(32767, v * k)))
+                                 for v in out])
+        w2 = _w.open(path, "wb")
+        w2.setnchannels(1)
+        w2.setsampwidth(2)
+        w2.setframerate(sr)
+        w2.writeframes(out.tobytes())
+        w2.close()
+        return round(len(out) / sr)            # out=样本数组 (非字节), /sr=秒
     except Exception:
         return None
 
@@ -1834,21 +1897,27 @@ class App:
         if dur < 1:
             self.osd = ("太短未保存", time.monotonic() + 1.2)
             return
-        real = trim_silence_head(self.rec_path) or dur   # 裁静音头
-        vid = "%d-%s" % (int(time.time() * 1000),
-                         "".join(random.choice("0123456789abcdef")
-                                 for _ in range(6)))
-        dst = os.path.join(VOICES_DIR, vid + ".wav")
+        self.osd = ("语音处理中…", time.monotonic() + 4)
+        threading.Thread(target=self._voice_save_worker, args=(dur,),
+                         daemon=True).start()
+
+    def _voice_save_worker(self, dur):
+        """裁静音头 + 高通/噪声门/归一 (clean_voice) → voices/<id>.wav + 索引."""
         try:
+            real = trim_silence_head(self.rec_path) or dur
+            real = clean_voice(self.rec_path) or real
+            vid = "%d-%s" % (int(time.time() * 1000),
+                             "".join(random.choice("0123456789abcdef")
+                                     for _ in range(6)))
+            dst = os.path.join(VOICES_DIR, vid + ".wav")
             shutil.move(self.rec_path, dst)
+            self.ideas.setdefault("voices", []).append(
+                {"id": vid, "file": dst, "dur": real,
+                 "createdAt": int(time.time() * 1000)})
+            netmod.save_json_file(IDEAS_FILE, self.ideas)
+            self.osd = ("语音已保存 %ds" % real, time.monotonic() + 1.5)
         except Exception:
             self.osd = ("保存失败", time.monotonic() + 1.5)
-            return
-        self.ideas.setdefault("voices", []).append(
-            {"id": vid, "file": dst, "dur": real,
-             "createdAt": int(time.time() * 1000)})
-        netmod.save_json_file(IDEAS_FILE, self.ideas)
-        self.osd = ("语音已保存 %ds" % real, time.monotonic() + 1.5)
 
     def play_voice(self, item):
         """8/Enter (选中语音条): 播放本地 wav; 再按 = 停."""

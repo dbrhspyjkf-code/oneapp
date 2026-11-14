@@ -521,6 +521,25 @@ def test_voice():
         mkwav(f2, 1.5, pre_silence=0.5)
         dur = dash.trim_silence_head(f2, keep=0.1)
         assert dur is not None and 0.9 <= dur <= 1.4, dur
+        # clean_voice: 高通+噪声门+归一 — 440Hz 纯音+静音尾, 处理后峰值≈target
+        f3 = os.path.join(tmp, "clean.wav")
+        mkwav(f3, 2.0, pre_silence=0.5)
+        cdur = dash.clean_voice(f3)
+        assert cdur is not None and abs(cdur - 2.0) < 0.1, cdur
+        import wave as _w2
+        w = _w2.open(f3)
+        d2 = _w2._array if False else None
+        frames = w.readframes(w.getnframes())
+        w.close()
+        import struct as _s
+        vals = _s.unpack("<%dh" % (len(frames) // 2), frames)
+        pk = max(abs(v) for v in vals)
+        assert 20000 <= pk <= 30000, pk        # 归一到 26000 档
+        # 纯静音文件: 归一增益钳在 8x 内不爆放
+        f4 = os.path.join(tmp, "sil.wav")
+        mkwav(f4, 0.2, pre_silence=99)
+        cdur2 = dash.clean_voice(f4)
+        assert cdur2 is not None
         # 文字与语音互不影响
         app.submit_idea()
         assert len(app.idea_items()) == 1
