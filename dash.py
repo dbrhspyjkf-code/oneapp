@@ -258,7 +258,14 @@ async def _s():
     conf = AppleTV(sys.argv[1], sys.argv[1])   # 免 mDNS 扫描直连 (省 ~8s)
     conf.add_service(ManualService(sys.argv[3] or None, Protocol.RAOP,
                                    int(sys.argv[2]), None))
-    atv = await asyncio.wait_for(connect(conf, loop), 20)   # 挂死变快败
+    for _att in range(2):   # 快速切台: 旧会话 TEARDOWN 在途偶发拒连 → 重试一次
+        try:
+            atv = await asyncio.wait_for(connect(conf, loop), 20)  # 挂死变快败
+            break
+        except Exception:
+            if _att:
+                return
+            await asyncio.sleep(3)
     try:                                 # 设备依赖组合下必坏 (srptools 1.0.1)
         print("RAOP-UP", flush=True)     # 出声锚点 (radio 无进度条, 仅日志用)
         md = MediaMetadata(title=title) if title else None
@@ -1969,12 +1976,14 @@ class App:
         self.vu_pk = [3.0] * 12
 
     def radio_toggle(self):
-        if self.playing_key:
-            self.radio_stop()
-            return
         sts = self.stations()
-        if 0 <= self.rsel < len(sts):
-            self.radio_play(sts[self.rsel])
+        if not (0 <= self.rsel < len(sts)):
+            return
+        if self.playing_key == sts[self.rsel]["key"]:
+            self.radio_stop()               # 同台: Enter = 播/停
+            return
+        self.radio_play(sts[self.rsel])     # 异台: 一次 Enter 直接切台
+        # (radio_play 内部先 radio_stop 旧会话; 旧码播放中一律先停, 切台要按两次)
 
     # ── 音乐 app: 本地曲库直读 + QQ/网易直连 ──
     def mu_rescan(self):

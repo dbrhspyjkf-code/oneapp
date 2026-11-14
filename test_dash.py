@@ -631,6 +631,34 @@ def test_radio_out():
         finally:
             dash.App._radio_play_raop = real_raop
 
+        # Enter 切台: 播放中选异台 → 一次 Enter 直接切 (旧码先停后播要按两次);
+        # 同台 → 播/停
+        app3b = dash.App(FakeNet())
+        app3b.page = 2
+        app3b.raop = devs
+        app3b.radio_out = 1
+        played2 = []
+
+        def fake_raop2(self, st, dev):
+            played2.append(st["key"])
+            self.playing_key = st["key"]
+            return True
+
+        dash.App._radio_play_raop = fake_raop2
+        try:
+            sts = app3b.stations()
+            app3b.rsel = 0
+            app3b.key(pygame.K_RETURN)          # 停播起播 A
+            assert app3b.playing_key == sts[0]["key"] and len(played2) == 1
+            app3b.rsel = 2
+            app3b.key(pygame.K_RETURN)          # 播放中切 C: 一次 Enter
+            assert app3b.playing_key == sts[2]["key"], "切台应一次 Enter 直达"
+            assert len(played2) == 2
+            app3b.key(pygame.K_RETURN)          # 同台: Enter = 停
+            assert app3b.playing_key is None and len(played2) == 2
+        finally:
+            dash.App._radio_play_raop = real_raop
+
         # 空设备: O 键提示并保持本机 (顺带触发后台补扫)
         app4 = dash.App(FakeNet())
         app4.page = 2
