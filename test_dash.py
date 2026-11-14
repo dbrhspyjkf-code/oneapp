@@ -720,9 +720,10 @@ def test_radio_out():
         app9.playing_key = None
         assert app9.adjust_volume(115) is None  # Mac 无 pactl → OSD 兜底不崩
 
-        # 内嵌 -c 脚本语法完整性 (三引号截断教训) + PcmSource 全读语义
+        # 内嵌 -c 脚本语法完整性 (三引号截断教训) + PcmSource 全读/字节序语义
         # (miniaudio UNKNOWN 格式探测对无限管道永不返回 → open_source 挂死,
-        # stream_file 从未发声 — PCM 直通绕开整个解码层)
+        # stream_file 从未发声 — PCM 直通绕开整个解码层; readframes 尾须
+        # s16le→大端 L16 交换, 漏交换 = 全频道沙沙声)
         compile(dash._ATVR_SCAN, "atvr_scan", "exec")
         compile(dash._ATVR_PLAY, "atvr_play", "exec")
         ns = {}
@@ -733,15 +734,25 @@ def test_radio_out():
         assert ns["_prefill"](_src, 65536) is False  # 数据够: 存活门通过
         _src2 = _io.BytesIO(b"x" * 50)
         assert ns["_prefill"](_src2, 65536) is True  # 短产端: EOF → 不烧连接
+        _arr = __import__("array")
+
+        def _ref_l16(bs):                            # 参考交换: 同 pyatv 官源
+            a = _arr.array("h", bytes(bs[:len(bs) // 2 * 2]))
+            if __import__("sys").byteorder == "little":
+                a.byteswap()
+            return a.tobytes()
+
+        assert ns["_to_l16"](data[:1000]) == _ref_l16(data[:1000])
+        assert ns["_to_l16"](b"\x01") == b""         # 奇字节截齐不抛
 
         async def _pcm_test():
             src = ns["PcmSource"](_io.BytesIO(data), 44100, 2, 2, "台")
             assert (src.sample_rate, src.channels, src.sample_size) == \
                 (44100, 2, 2)
             got = await src.readframes(250)          # 250 帧 ×4B = 1000B 恒满
-            assert got == data[:1000]
+            assert got == _ref_l16(data[:1000])      # 大端 L16 输出
             got = await src.readframes(40000)        # 160000B > 剩余 152600B
-            assert got == data[1000:]                # 真 EOF 才短读
+            assert got == _ref_l16(data[1000:])      # 真 EOF 才短读
             empty = ns["PcmSource"](_io.BytesIO(b""), 44100, 2, 2, "台")
             assert await empty.readframes(10) == b""
             md = await src.get_metadata()

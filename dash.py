@@ -154,8 +154,14 @@ asyncio.run(_s())
 # 包 (2026-11-14 线程栈+aplog 实证; dash 音乐=有限文件探测会终止所以一直没
 # 事)。绕开 miniaudio: 产端 -f s16le 直出 PCM, open_source patch 成直通
 # AudioSource (readframes 阻塞全读, 真 EOF 才短读), 预读 64KB 作存活门。
+# readframes 尾必须字节交换成大端: RTP L16 净荷是大端 (RFC 3551), pyatv
+# 三个官源 (Buffered/Internet/File) 全以 _to_audio_samples 收尾做此交换;
+# 直通版漏掉 = 全频道"沙沙声" (小端字节被当大端解读, 2026-11-14 真机听感
+# 实证 — 帧流/握手全正常但内容全噪)。
 _ATVR_PCM_LIB = r'''
+import array
 import asyncio
+import sys
 import pyatv.protocols.raop.audio_source as _as
 from pyatv.interface import MediaMetadata
 
@@ -168,6 +174,13 @@ def _prefill(raw, target):
             return True
         n += len(chunk)
     return False
+
+def _to_l16(data):
+    # s16le → RTP L16 大端; 同 pyatv _to_audio_samples 小端分支 (奇字节截齐)
+    a = array.array("h", bytes(data[:len(data) // 2 * 2]))
+    if sys.byteorder == "little":
+        a.byteswap()
+    return a.tobytes()
 
 class PcmSource(_as.AudioSource):
     def __init__(self, raw, rate, ch, width, title):
@@ -187,7 +200,7 @@ class PcmSource(_as.AudioSource):
             if not chunk:
                 break
             buf.extend(chunk)
-        return bytes(buf)
+        return _to_l16(buf)
 
     async def get_metadata(self):
         return MediaMetadata(title=self.title or None)
