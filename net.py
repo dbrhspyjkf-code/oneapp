@@ -66,6 +66,19 @@ def http_json(url, timeout=8, post=None, headers=None):
         return None, None
 
 
+def _pub_json_direct(url, timeout=10, headers=None):
+    """无代理 GET JSON (Net._do_pub direct=True 用)."""
+    hdrs = {"User-Agent": _UA}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with Net._OPENER_DIRECT.open(req, timeout=timeout) as r:
+            return json.loads(r.read(2097152).decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
 class Net:
     """后台单线程 worker; UI 线程经 pub()/pub_text()/bin()/job() 投递,
     从 results 拿. mode: probing | online | offline."""
@@ -83,9 +96,10 @@ class Net:
         self.probe()                            # 启动即探测链路
 
     # ── UI 线程接口 ──
-    def pub(self, url, tag, ttl=600, timeout=10, headers=None):
-        """公网 JSON 请求 (天气/行情等); 结果 ('data', tag, obj|None)."""
-        self._reqs.put(("pub", url, tag, ttl, timeout, headers))
+    def pub(self, url, tag, ttl=600, timeout=10, headers=None, direct=False):
+        """公网 JSON 请求 (天气/行情等); 结果 ('data', tag, obj|None).
+        direct=True 绕过系统代理 (IP 定位/天气须设备真实出口)."""
+        self._reqs.put(("pub", url, tag, ttl, timeout, headers, direct))
 
     def pub_text(self, url, tag, ttl=15):
         """公网文本请求 (腾讯行情 GBK 文本); 结果 ('text', tag, str|None)."""
@@ -170,7 +184,10 @@ class Net:
         finally:
             self._inflight.discard(key)
 
-    def _do_pub(self, url, tag, ttl, timeout=10, headers=None):
+    _OPENER_DIRECT = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}))   # 直连 opener (见 pub direct=True)
+
+    def _do_pub(self, url, tag, ttl, timeout=10, headers=None, direct=False):
         key = ("pub", url)
         now = time.monotonic()
         hit = self._cache.get(key)
@@ -180,7 +197,10 @@ class Net:
             return
         self._inflight.add(key)
         try:
-            j, _ = http_json(url, timeout=timeout, headers=headers)
+            if direct:                      # 强制直连: 绕过系统代理
+                j = _pub_json_direct(url, timeout=timeout, headers=headers)
+            else:
+                j, _ = http_json(url, timeout=timeout, headers=headers)
             if j is not None:
                 self._cache[key] = (now + ttl, j)
                 self.results.put(("data", tag, j))

@@ -109,9 +109,18 @@ STATE_DIR = os.path.expanduser("~/.local/share/oneapp")
 THEME_FILE = os.path.join(STATE_DIR, "theme.json")
 
 # 天气: 默认坐标 (Open-Meteo 公网直连)
-WX_HOME = {"lat": 22.5629, "lon": 114.1207, "city": "深圳"}
-WX_URL = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f"
-          "&longitude=%.4f&current_weather=true" % (WX_HOME["lat"], WX_HOME["lon"]))
+WX_HOME = {"lat": 22.5629, "lon": 114.1207, "city": "深圳"}   # 定位失败回落
+WX_LOC_FILE = os.path.join(STATE_DIR, "wx_loc.json")   # IP 归属地快照
+
+
+def wx_url(loc):
+    """按归属地坐标拼 Open-Meteo URL (loc 缺坐标 → 回落深圳)."""
+    lat = loc.get("lat") if loc else None
+    lon = loc.get("lon") if loc else None
+    if lat is None or lon is None:
+        lat, lon = WX_HOME["lat"], WX_HOME["lon"]
+    return ("https://api.open-meteo.com/v1/forecast?latitude=%.4f"
+            "&longitude=%.4f&current_weather=true" % (lat, lon))
 
 FONT_CANDIDATES = [
     "/usr/share/APPLaunch/share/font/AlibabaPuHuiTi-3-55-Regular.ttf",   # 设备
@@ -762,6 +771,7 @@ class App:
         # 想法 (本地 json) / 自选股 (本地 json, 种子兜底)
         self.ideas = netmod.load_json_file(IDEAS_FILE, {"texts": []})
         self.watch = netmod.load_json_file(WATCH_FILE, WATCH_SEED)
+        self.wx_loc = netmod.load_json_file(WX_LOC_FILE, None) or dict(WX_HOME)
         # 想法页状态
         self.in_input = False                 # 输入模式
         self.buf = ""
@@ -872,6 +882,15 @@ class App:
             self.data.clear()
         elif kind == "data":
             self.data[a] = b
+            if a == "wxloc" and isinstance(b, dict) and b.get("lat") is not None:
+                old = self.wx_loc or {}
+                if b.get("city") != old.get("city") \
+                        or abs(float(b["lat"]) - float(old.get("lat") or 0)) > 0.05:
+                    self.wx_loc = b          # 归属地变了 → 下轮 poll 按新坐标拉
+                    try:
+                        netmod.save_json_file(WX_LOC_FILE, b)
+                    except Exception:
+                        pass
             if a.startswith("mulyr:") and isinstance(b, dict):
                 self.mu_lyr = self._pl_lrc_parse(b.get("synced") or "")
         elif kind == "text":
@@ -894,7 +913,8 @@ class App:
                 self.net.job("ipo", fetchers.ipo_fetch, 1800)
                 self.net.job("hitokoto", fetchers.hitokoto_fetch, 3600)
                 self.net.job("news", news_rss.news_fetch_all, 600)   # 主页新闻卡
-                self.net.pub(WX_URL, "wx", 600)
+                self.net.job("wxloc", fetchers.wx_locate, 1800)      # IP 归属地 30min 重探
+                self.net.pub(wx_url(self.wx_loc), "wx", 600, direct=True)
             if self.page == 2:
                 pass                          # 站台表内置 (radio_stations.STATIONS)
             if self.page == 3:
@@ -2521,7 +2541,8 @@ class App:
         if cw.get("temperature") is not None:
             temp = "%d°" % round(cw["temperature"])
             cond = wx_code_zh(cw.get("weathercode", -1)) or "—"
-            textc(surf, clip_text(temp + " " + cond + " · " + WX_HOME["city"],
+            textc(surf, clip_text(temp + " " + cond + " · "
+                                  + (self.wx_loc.get("city") or WX_HOME["city"]),
                                   BODY, 104), BODY, hi, ccx, rows_y[2])
         else:
             textc(surf, "天气获取中" if self.net.mode != "offline" else "离线",

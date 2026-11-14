@@ -20,12 +20,28 @@ _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
        " (KHTML, like Gecko) Chrome/120.0 Safari/537.36 ONEAPP/1.0")
 
 
+_OPENER_DIRECT = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}))       # 绕过系统代理 (设备无代理; 开发机
+                                           #   代理出口会污染 IP 定位)
+
+
 def _get_json(url, headers=None, timeout=12):
     hdrs = {"User-Agent": _UA}
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, headers=hdrs)
     with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read(1048576).decode("utf-8", "replace"))
+
+
+def _get_json_direct(url, headers=None, timeout=12):
+    """同 _get_json 但强制无代理 (IP 定位/天气: 必须用设备真实出口 IP;
+    open-meteo 直连可达, 走开发机代理反而失败)."""
+    hdrs = {"User-Agent": _UA}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    with _OPENER_DIRECT.open(req, timeout=timeout) as r:
         return json.loads(r.read(1048576).decode("utf-8", "replace"))
 
 
@@ -90,6 +106,39 @@ def hitokoto_fetch():
         pass
     return _snap_read("hitokoto.json") or {
         "ok": True, "text": "机不可失,时不再来。", "from": "旧唐书"}
+
+
+# ── IP 归属地 (天气定位; 1800s TTL) ────────────────────────────────────────
+def wx_locate():
+    """出口 IP → {"lat","lon","city","src"}; 全源失败返回 None (UI 回落深圳).
+    ① ip-api.com (免费 http, 中文城市+经纬度一步到位; 2026-11-14 家宽实测通)
+    ② api.ip.sb/geoip (备用; 英文城市)
+    热点/CGNAT 下归属地=运营商出口, 省市级精度, 对天气够用."""
+    try:
+        j = _get_json_direct(
+            "http://ip-api.com/json/?lang=zh-CN&fields=status,city,lat,lon",
+            timeout=4)
+        if str(j.get("status")).lower() == "success" \
+                and j.get("lat") is not None:
+            out = {"lat": float(j["lat"]), "lon": float(j["lon"]),
+                   "city": (j.get("city") or "").strip() or "定位",
+                   "src": "ip-api"}
+            _snap_write("wx_loc.json", out)
+            return out
+    except Exception:
+        pass
+    try:
+        j = _get_json_direct("https://api.ip.sb/geoip", timeout=4)
+        if j.get("latitude") is not None:
+            out = {"lat": float(j["latitude"]), "lon": float(j["longitude"]),
+                   "city": (j.get("city") or "").strip() or "定位",
+                   "src": "ip.sb"}
+            _snap_write("wx_loc.json", out)
+            return out
+    except Exception:
+        pass
+    snap = _snap_read("wx_loc.json")           # 断网: 沿用上次归属地
+    return snap
 
 
 # ── 双色球 (中彩官网; 参考 hermes _ssq.py 同源移植) ─────────────────────────

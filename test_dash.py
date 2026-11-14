@@ -6,6 +6,7 @@
 在线链路 (RSS 真抓 / 音乐搜索 / 歌词) 用 RUN_NET=1 额外跑 test_net_live.
 """
 
+import json
 import os
 import tempfile
 import time as _time
@@ -204,6 +205,16 @@ def test_render():
     app.sel = 0
     app.delete_selected()
     assert app.ideas["texts"] == []
+    # 天气定位: wx_url 拼接 / wxloc 落位换城
+    assert "latitude=22.5629" in dash.wx_url({})
+    assert "latitude=31.0000" in dash.wx_url({"lat": 31.0, "lon": 121.0})
+    app.wx_loc = dict(dash.WX_HOME)
+    app.on_net("data", "wxloc", {"lat": 31.23, "lon": 121.47, "city": "上海"})
+    assert app.wx_loc["city"] == "上海"        # 归属地更新
+    app.on_net("data", "wxloc", {"lat": 31.24, "lon": 121.48, "city": "上海"})
+    assert abs(app.wx_loc["lat"] - 31.23) < 0.01   # 同城小漂移不更新
+    app.on_net("data", "wxloc", None)
+    assert app.wx_loc["city"] == "上海"        # 坏数据忽略
     # 输入模式渲染
     app.in_input = True
     app.buf = "hello oneapp"
@@ -523,6 +534,16 @@ def test_net_live():
     fx = fetchers.fx_fetch()
     assert fx["ok"] and "CNY" in fx["rates"]
     print("  fx %s CNY=%.3f (%s)" % (fx["ok"], fx["rates"]["CNY"], fx["source"]))
+    loc = fetchers.wx_locate()
+    assert loc and loc.get("lat") is not None
+    print("  wx_loc %s (%.3f,%.3f src=%s)" % (loc["city"], loc["lat"], loc["lon"], loc["src"]))
+    import dash as _dash
+    import urllib.request as _ur
+    op = _ur.build_opener(_ur.ProxyHandler({}))   # 天气链=无代理直连 (同 app)
+    with op.open(_dash.wx_url(loc), timeout=10) as r:
+        wx = json.loads(r.read().decode())
+    assert wx and (wx.get("current_weather") or {}).get("temperature") is not None
+    print("  wx %.1f°C @%s" % (wx["current_weather"]["temperature"], loc["city"]))
     ssq = fetchers.ssq_fetch()
     assert ssq["ok"] and ssq["latest"]["code"]
     print("  ssq latest", ssq["latest"]["code"])
