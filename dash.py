@@ -1259,7 +1259,7 @@ class App:
         self.buf = ""
         self.fin_sync = False
         if not key:
-            self.osd = ("API-KEY 为空", time.monotonic() + 1.5)
+            self.osd = ("东财 API-KEY 为空", time.monotonic() + 1.5)
             return
         try:
             netmod.save_json_file(EM_KEY_FILE, {"key": key})
@@ -3387,9 +3387,10 @@ class App:
             pygame.draw.rect(surf, self.th("track"), r, border_radius=5)
             pygame.draw.rect(surf, acc, r, 2, border_radius=5)
             ty = r.y + (27 - 13) // 2
-            text(surf, "KEY", 11, acc, (r.x + 8, ty + 1))
-            shown = clip_text(self.buf, BODY, 140)
-            text(surf, shown, BODY, hi, (r.x + 38, ty))
+            text(surf, "东财API-KEY", 11, acc, (r.x + 8, ty + 1))
+            lx = r.x + 8 + textw("东财API-KEY", 11) + 8
+            shown = clip_text(self.buf, BODY, max(60, r.right - 8 - 130 - lx))
+            text(surf, shown, BODY, hi, (lx, ty))
             if int(time.monotonic() * 2) % 2 == 0:
                 cx2 = r.x + 38 + textw(shown, BODY) + 1
                 pygame.draw.rect(surf, acc, (cx2, ty + 2, 7, 13))
