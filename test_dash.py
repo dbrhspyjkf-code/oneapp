@@ -9,6 +9,8 @@
 import json
 import os
 import tempfile
+import subprocess
+import sys
 import time as _time
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -661,7 +663,25 @@ def test_radio_out():
         app6.key(pygame.K_5)
         assert (app6.rsel, app6.playing_key) == mark
         assert app6.page == 2                 # 5 不再被电台占用 → 跳页 (5=电台)
-        print("radio out OK (filter/restore/cycle/fallback/keys)")
+
+        # 设备 ffmpeg SIGTERM 会卡死 futex (真机实证) → radio_stop 必须
+        # 补刀 SIGKILL: 产端/消费端都是忽略 SIGTERM 的替身, 停播后 2s 内死透
+        stubborn = "import signal,time; signal.signal(signal.SIGTERM," \
+                   " signal.SIG_IGN); time.sleep(30)"
+        app7 = dash.App(FakeNet())
+        app7.page = 2
+        prod = subprocess.Popen([sys.executable, "-c", stubborn])
+        cons = subprocess.Popen([sys.executable, "-c", stubborn])
+        app7.player, app7.raop_cons = prod, cons
+        app7.playing_key = "k"
+        app7.radio_stop()
+        deadline = _time.monotonic() + 2.5
+        while _time.monotonic() < deadline \
+                and (prod.poll() is None or cons.poll() is None):
+            _time.sleep(0.05)
+        assert prod.poll() is not None and cons.poll() is not None, \
+            "radio_stop 未杀掉忽略 SIGTERM 的进程 (futex 僵尸复现)"
+        print("radio out OK (filter/restore/cycle/fallback/keys/kill)")
     finally:
         _sh.rmtree(tmp, ignore_errors=True)
 

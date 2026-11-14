@@ -180,8 +180,12 @@ def raop_scan(timeout=12):
         import importlib.util
         if importlib.util.find_spec("pyatv") is None:
             return []
-        p = subprocess.Popen([sys.executable, "-c", _ATVR_SCAN, str(timeout)],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        base = [sys.executable, "-c", _ATVR_SCAN, str(timeout)]
+        # nice: pyatv 导入+zeroconf 扫描 ~15s 吃满一核, 降优先级保 UI/音频顺滑
+        if shutil.which("nice"):
+            base = ["nice", "-n", "15"] + base
+        p = subprocess.Popen(base, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
         # 设备实测: 子进程扫完打印 JSON 后退出阶段挂死 (zeroconf 收尾不解) —
         # subprocess.run(timeout) 超时会把结果一起扔掉; 改读行即杀
         watchdog = threading.Timer(timeout + 20, p.kill)
@@ -1343,8 +1347,10 @@ class App:
                 self.player = None             # 语音播完自动收
                 self.playing_voice = None
             if self.playing_key:
-                if self.player is not None and self.player.poll() is not None:
-                    self.radio_stop()          # ffplay 已退出 (断流/出错)
+                if (self.player is not None and self.player.poll() is not None) \
+                        or (self.raop_cons is not None
+                            and self.raop_cons.poll() is not None):
+                    self.radio_stop()          # ffplay 已退出 / RAOP 会话已断
                     self.osd = ("流已断", time.monotonic() + 1.5)
 
     def poll_tool(self):
@@ -1702,14 +1708,38 @@ class App:
         except Exception:
             pass
 
-    def radio_stop(self):
-        self.stop_player()
-        if self.raop_cons:                    # RAOP 消费端随产端一起断
+    @staticmethod
+    def _radio_kill(proc, grace=0.4):
+        """后台补刀: terminate → grace 秒 → SIGKILL. 设备 ffmpeg 7.1.5 收
+        SIGTERM 会卡死在 futex (双输出 muxer 优雅退出互锁, 2026-11-14 实证:
+        僵死进程 hold 直播流+fifo 写端, 每次换台泄漏一个 → 越用越卡), 必须
+        SIGKILL; 线程化不阻塞 UI, wait() 顺带收尸防僵尸."""
+        if not proc:
+            return
+
+        def _fin():
             try:
-                self.raop_cons.terminate()
+                proc.terminate()
+            except Exception:
+                return
+            try:
+                proc.wait(timeout=grace)
+                return
             except Exception:
                 pass
-            self.raop_cons = None
+            try:
+                proc.kill()
+                proc.wait(timeout=1.5)
+            except Exception:
+                pass
+
+        threading.Thread(target=_fin, daemon=True).start()
+
+    def radio_stop(self):
+        self._radio_kill(self.player)         # 产端 (ffplay 本机 / ffmpeg AirPlay)
+        self.player = None
+        self._radio_kill(self.raop_cons)      # RAOP 消费端随产端一起断
+        self.raop_cons = None
         self.playing_key = None
         self.lvl.stop()                       # 电平源随播放进程一起断
         self.vu = [3.0] * 12
