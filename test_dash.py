@@ -294,6 +294,35 @@ def test_render():
     app.key(pygame.K_RETURN)
     assert [i["code"] for i in app.watch["items"]] == ["sh600519"]
     app.draw(canvas)                              # 顶部跑马灯渲染
+    # 东财妙想自选股同步: 响应解析 (纯函数) + s 设置流 + job 投递
+    import fetchers
+    sample = {"code": 0, "message": "ok", "data": {"allResults": [
+        {"result": {"dataList": [
+            {"SECURITY_CODE": "600519", "SECURITY_SHORT_NAME": "贵州茅台",
+             "MARKET_SHORT_NAME": "SH"},
+            {"SECURITY_CODE": "000001", "SECURITY_SHORT_NAME": "平安银行",
+             "MARKET_SHORT_NAME": "SZ"},
+            {"SECURITY_CODE": "hk00700", "SECURITY_SHORT_NAME": "腾讯",
+             "MARKET_SHORT_NAME": "HK"}]}}]}}
+    pr = fetchers.em_watchlist_parse(sample)
+    assert pr["ok"] and [i["code"] for i in pr["items"]] == \
+        ["sh600519", "sz000001"], pr
+    assert pr["items"][0]["name"] == "贵州茅台"
+    assert not fetchers.em_watchlist_parse({"code": -1})["ok"]
+    dash.EM_KEY_FILE = os.path.join(tmp, "em_key.json")
+    app.key(pygame.K_s)
+    assert app.fin_sync and app.ime_mode is False
+    for chr_ in "testkey123":
+        app.key(0, chr_)
+    app.key(pygame.K_RETURN)
+    assert not app.fin_sync
+    import json as _jj
+    assert _jj.load(open(dash.EM_KEY_FILE))["key"] == "testkey123"
+    assert ("job", "emwatch") in app.net.got, app.net.got[-3:]
+    app.on_net("data", "emwatch", pr)
+    assert [i["code"] for i in app.watch["items"]] == \
+        ["sh600519", "sz000001"]                     # 替换 + 港股剔除
+    app.draw(canvas)                                 # 同步框渲染
     # 每日一句: 内置 CSV 本地轮换 (与 hermes 同算法, 车机/ONEAPP 同句)
     ds = dash.daily_sentence()
     assert ds["ok"] and ds["text"] and ds["from"], ds

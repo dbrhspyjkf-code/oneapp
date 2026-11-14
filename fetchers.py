@@ -141,6 +141,59 @@ def wx_locate():
     return snap
 
 
+# ── 东方财富妙想 Skills 自选股同步 (MX_APIKEY) ─────────────────────────────
+_EM_SEL_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/self-select/get"
+
+
+def em_watchlist_parse(j):
+    """妙想 mx_selfselect 响应 → {"ok", "items":[{code,name}], "err"?}
+    (纯函数便于离线测试). code 统一补 sh/sz/bj 前缀."""
+    try:
+        if str(j.get("code")) not in ("0", "200") \
+                and j.get("status") not in (0, "0", "success", 200):
+            return {"ok": False,
+                    "err": str(j.get("message") or j.get("status"))[:30]}
+    except Exception:
+        return {"ok": False, "err": "bad resp"}
+    items = []
+    for block in (j.get("data") or {}).get("allResults") or []:
+        res = block.get("result") or {}
+        for row in res.get("dataList") or []:
+            code = str(row.get("SECURITY_CODE") or "").strip().lower()
+            if not code:
+                continue
+            if code[:2] not in ("sh", "sz", "bj"):
+                mkt = str(row.get("MARKET_SHORT_NAME") or "").strip().lower()
+                if mkt in ("sh", "sz", "bj"):
+                    code = mkt + code
+                elif code[:1].isdigit():
+                    code = ("sh" if code[0] in "569"
+                            else ("bj" if code[0] in "48" else "sz")) + code
+                else:
+                    continue                     # 港美股等跳过
+            items.append({"code": code,
+                          "name": str(row.get("SECURITY_SHORT_NAME") or "")})
+    if not items:
+        return {"ok": False, "err": "empty · 去东财App确认"}
+    return {"ok": True, "items": items}
+
+
+def em_watchlist_fetch(apikey):
+    """拉取通行证账户自选股 (POST, apikey 放 header). → parse 结果."""
+    if not apikey:
+        return {"ok": False, "err": "未配置 API-KEY"}
+    try:
+        req = urllib.request.Request(
+            _EM_SEL_URL, data=b"{}", method="POST",
+            headers={"apikey": apikey, "Content-Type": "application/json",
+                     "User-Agent": _UA})
+        with _OPENER_DIRECT.open(req, timeout=12) as r:
+            return em_watchlist_parse(
+                json.loads(r.read().decode("utf-8", "replace")))
+    except Exception as e:
+        return {"ok": False, "err": repr(e)[:40]}
+
+
 # ── 双色球 (中彩官网; 参考 hermes _ssq.py 同源移植) ─────────────────────────
 _SSQ_URL = ("https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/"
             "findDrawNotice?name=ssq&issueCount=100")

@@ -464,6 +464,7 @@ def daily_sentence():
 # 主页卡缓存标签: 进 app 秒显上次数据, 后台刷新后再覆盖 (用户要求免"获取中")
 HOME_CACHE_TAGS = ("wx", "news", "ipo")   # hitokoto 已内置本地文件
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")        # 自选股 (本地)
+EM_KEY_FILE = os.path.join(STATE_DIR, "em_key.json")      # 东财妙想 API-KEY
 # 自选股种子 (qt.gtimg.cn 代码; watch.json 存在则整体覆盖)
 WATCH_SEED = {"items": [
     {"code": "sh600519", "name": "贵州茅台"},
@@ -1025,6 +1026,7 @@ class App:
         # 行情页状态
         self.fin_view = 0                     # 0 自选 1 指数 2 商品
         self.fin_input = False                # 添加自选股输入态 (n 键)
+        self.fin_sync = False                 # 东财 API-KEY 设置态 (s 键)
         self._hk_at = 0.0                     # 每日一句跑马灯相位
         self._tk_at = 0.0                     # 行情顶部跑马灯相位
         self.fsel = 0
@@ -1136,6 +1138,16 @@ class App:
                         os.path.join(CACHE_DIR, a + ".json"), b)
                 except Exception:
                     pass
+            if a == "emwatch" and isinstance(b, dict):
+                if b.get("ok"):
+                    self.watch = {"items": b.get("items") or []}
+                    netmod.save_json_file(WATCH_FILE, self.watch)
+                    self.fsel = self.fscroll = 0
+                    self.osd = ("已同步 %d 只 (替换)" % len(self.watch["items"]),
+                                time.monotonic() + 2)
+                else:
+                    self.osd = ("同步失败 %s" % (b.get("err") or "")[:24],
+                                time.monotonic() + 2.5)
             if a == "wxloc" and isinstance(b, dict) and b.get("lat") is not None:
                 old = self.wx_loc or {}
                 if b.get("city") != old.get("city") \
@@ -1240,6 +1252,22 @@ class App:
         self.watch.setdefault("items", []).append({"code": code, "name": ""})
         netmod.save_json_file(WATCH_FILE, self.watch)
         self.osd = ("已添加 " + code, time.monotonic() + 1.5)
+
+    def fin_sync_commit(self):
+        """KEY 输入框 Enter: 保存 → 异步同步东财自选股 (结果 on_net 落表)."""
+        key = self.buf.strip()
+        self.buf = ""
+        self.fin_sync = False
+        if not key:
+            self.osd = ("API-KEY 为空", time.monotonic() + 1.5)
+            return
+        try:
+            netmod.save_json_file(EM_KEY_FILE, {"key": key})
+        except Exception:
+            pass
+        self.osd = ("同步中…", time.monotonic() + 6)
+        self.net.job("emwatch", lambda k=key: fetchers.em_watchlist_fetch(k),
+                     0)
 
     def watch_del(self, code):
         """删除自选股 (dialog 确认后调, 按 code) → 落 watch.json."""
@@ -2131,6 +2159,40 @@ class App:
                 self.dialog = None
             return True
 
+        if self.page == 3 and self.fin_sync:
+            # 东财 API-KEY 输入 (默认英文; Enter=保存并同步)
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.fin_sync_commit()
+                return True
+            if k == pygame.K_ESCAPE:
+                self.fin_sync = False
+                self.buf = ""
+                self.ime_clear()
+                return True
+            if k == pygame.K_SLASH:
+                self.ime_mode = not self.ime_mode
+                self.ime_clear()
+                return True
+            if self.ime_mode:
+                act = self.ime_key(k, ch)
+                if act is None:
+                    return True
+                tag, val = act
+                if tag == "del":
+                    self.buf = self.buf[:-1]
+                elif tag == "submit":
+                    self.ime_clear()
+                    self.fin_sync_commit()
+                else:
+                    self.buf = (self.buf + val)[:64]
+                return True
+            if k == pygame.K_BACKSPACE:
+                self.buf = self.buf[:-1]
+            elif ch and 0x20 <= ord(ch) < 0x7F:
+                if len(self.buf) < 64:
+                    self.buf += ch
+            return True
+
         if self.page == 3 and self.fin_input:
             # 添加自选股输入框 (想法页同款 IME 交互)
             if k == pygame.K_SLASH:
@@ -2263,7 +2325,8 @@ class App:
                 self.move_sel(-2 if k == pygame.K_UP else -1)
             elif self.page == 2:
                 self.move_rsel(-1)
-            elif self.page == 3 and not self.fdetail and not self.fin_input:
+            elif self.page == 3 and not self.fdetail and not self.fin_input \
+                        and not self.fin_sync:
                 self._move_fsel(-3 if k == pygame.K_UP else -1)
             elif self.page == 4:
                 if k == pygame.K_LEFT:
@@ -2282,7 +2345,8 @@ class App:
                 self.move_sel(2 if k == pygame.K_DOWN else 1)
             elif self.page == 2:
                 self.move_rsel(1)
-            elif self.page == 3 and not self.fdetail and not self.fin_input:
+            elif self.page == 3 and not self.fdetail and not self.fin_input \
+                        and not self.fin_sync:
                 self._move_fsel(3 if k == pygame.K_DOWN else 1)
             elif self.page == 4:
                 if k == pygame.K_RIGHT:
@@ -2301,8 +2365,8 @@ class App:
             elif self.fdetail:                # 图表详情 → 关图表
                 self.fdetail = None
             elif self.page != 0:
-                if self.fin_input:            # 输入态: Esc 先退输入
-                    self.fin_input = False
+                if self.fin_input or self.fin_sync:   # 输入态: Esc 先退输入
+                    self.fin_input = self.fin_sync = False
                     self.buf = ""
                     self.ime_clear()
                     return True
@@ -2385,8 +2449,16 @@ class App:
                 if k == pygame.K_n and self.fin_view == 0:   # 添加自选股
                     self.ime_clear()
                     self.fin_input = True
+                    self.fin_sync = False
                     self.buf = ""
                     self.cv_armed = False
+                elif k == pygame.K_s and self.fin_view == 0:  # 东财同步设置
+                    self.ime_clear()
+                    self.fin_sync = True
+                    self.fin_input = False
+                    self.ime_mode = False     # API-KEY 英文直输
+                    self.buf = netmod.load_json_file(EM_KEY_FILE, {})\
+                        .get("key", "")
                 elif (k == pygame.K_d or k == pygame.K_x) \
                         and self.fin_view == 0 and self.fin_items():
                     items = self.fin_items()
@@ -3306,7 +3378,23 @@ class App:
         text(surf, "ENTER 日线", 13, soft, (6 + textw("4 切换行情", 13)
                                             + textw("我我", 13), y))
         if view == 0:
-            text(surf, "n 添加 · d 删", 13, soft, (W - 6, y), right=True)
+            text(surf, "n 添加 · d 删 · s 同步", 13, soft, (W - 6, y),
+                 right=True)
+
+        # 东财 API-KEY 设置框 (同步自选股)
+        if self.fin_sync:
+            r = pygame.Rect(M, 116, W - 2 * M, 27)
+            pygame.draw.rect(surf, self.th("track"), r, border_radius=5)
+            pygame.draw.rect(surf, acc, r, 2, border_radius=5)
+            ty = r.y + (27 - 13) // 2
+            text(surf, "KEY", 11, acc, (r.x + 8, ty + 1))
+            shown = clip_text(self.buf, BODY, 140)
+            text(surf, shown, BODY, hi, (r.x + 38, ty))
+            if int(time.monotonic() * 2) % 2 == 0:
+                cx2 = r.x + 38 + textw(shown, BODY) + 1
+                pygame.draw.rect(surf, acc, (cx2, ty + 2, 7, 13))
+            text(surf, "Enter 存并同步 · Esc 退", 9, dim,
+                 (r.right - 8, ty + 3), right=True)
 
         # 添加自选股输入框 (第 2 排卡片之上浮层)
         if self.fin_input:
