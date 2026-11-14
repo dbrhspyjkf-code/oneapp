@@ -583,6 +583,172 @@ def test_music():
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def test_mu_airplay():
+    """音乐 AirPlay: 输出恢复/7 键循环+持久化/起播产端命令与消费端 argv/
+    mu_tick 双判据 (消费端退=曲终)/音量路由."""
+    import shutil as _sh
+    import dash
+
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    tmp = tempfile.mkdtemp(prefix="onemuap")
+    real_last, real_out = dash.MU_LAST_CACHE, dash.MU_OUT_CACHE
+    real_cache = dash.RAOP_CACHE
+    dash.MU_LAST_CACHE = os.path.join(tmp, "mu_last.json")
+    dash.MU_OUT_CACHE = os.path.join(tmp, "mu_out.json")
+    dash.RAOP_CACHE = os.path.join(tmp, "raop.json")
+    devs = [{"ip": "1.1.1.4", "port": 7000, "name": "A音箱", "id": "ida"},
+            {"ip": "1.1.1.8", "port": 7000, "name": "B音箱", "id": "idb"}]
+    netmod.save_json_file(dash.RAOP_CACHE, devs)
+
+    class _Stdin:                          # 产端接 cons.stdin 的存根
+        def write(self, b):
+            pass
+
+        def close(self):
+            pass
+
+    class _P:                              # 假进程: 录命令, poll 恒活
+        def __init__(self, argv, tag):
+            self.argv, self.tag = argv, tag
+            self.stdin = _Stdin()
+            self._rc = None
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self._rc = 0
+
+        def kill(self):
+            self._rc = -9
+
+        def wait(self, timeout=None):
+            return self._rc
+
+    spawns = []
+
+    def fake_popen(cmd, **kw):
+        p = _P(cmd if isinstance(cmd, list) else [str(cmd)],
+               "cons" if cmd[1:2] == ["-c"] else "prod")
+        spawns.append(p)
+        return p
+
+    try:
+        # 恢复: 按设备 id → mu_out=2; 未知 id → 0
+        netmod.save_json_file(dash.MU_OUT_CACHE, {"id": "idb"})
+        app = dash.App(FakeNet())
+        assert app.mu_out == 2, app.mu_out
+        assert app.mu_out_name() == "AirPlay·B音箱"
+        netmod.save_json_file(dash.MU_OUT_CACHE, {"id": "gone"})
+        app2 = dash.App(FakeNet())
+        assert app2.mu_out == 0 and app2.mu_out_name() == "本机"
+
+        # 7 键循环 (播放页) + 持久化: 0→1→2→0
+        app.page = 5
+        app.tool_open("music")
+        app.mu_view = "play"
+        app.raop = devs
+        app.mu_out = 0
+        played = []
+
+        def fake_raop(self, idx, f, target, pos, dur, dev):
+            played.append((idx, round(pos, 1), dev["id"]))
+            self.mu_proc = _P(["ffmpeg"], "prod")
+            self.mu_ff = _P([sys.executable, "-c"], "cons")
+            self.mu_aud_up = None
+            return True
+
+        real_raop = dash.App._mu_play_raop
+        dash.App._mu_play_raop = fake_raop
+        try:
+            app.key(pygame.K_7)
+            assert app.mu_out == 1 and played == []
+            app.key(pygame.K_7)
+            assert app.mu_out == 2 and played == []
+            app.key(pygame.K_7)
+            assert app.mu_out == 0
+            assert netmod.load_json_file(dash.MU_OUT_CACHE, {}) == {"id": ""}
+            # 播放中切输出 = 同曲同位续播
+            app.mu_out = 0
+            app.mu_playing = {"path": "/x.wav", "title": "T", "dur": 90}
+            app.mu_play_idx = 0
+            app.mu_files = [app.mu_playing]
+            app.mu_paused = False
+            app.mu_pos0, app.mu_t0 = 30.0, _time.monotonic() - 5
+            app.mu_aud_up = _time.monotonic() - 5
+            app.mu_proc = _P(["ffplay"], "prod")
+            app.key(pygame.K_7)
+            assert app.mu_out == 1 and played and played[-1][2] == "ida"
+            assert abs(played[-1][1] - 35.0) < 1.5, played  # 墙钟同位续播
+        finally:
+            dash.App._mu_play_raop = real_raop
+
+        # 真起播链: 产端命令 (s16le/-re/-ss/http 重连) + 消费端 argv (歌名/歌手)
+        app.mu_out = 1
+        app.raop = devs
+        app.mu_playing = None
+        app.mu_files = [{"path": "http://x/y.mp3", "title": "晴天",
+                         "artist": "周杰伦", "dur": 60}]
+        real_pop = dash.subprocess.Popen
+        dash.subprocess.Popen = fake_popen
+        try:
+            app.mu_play(0, 12.0)
+            cons = [p for p in spawns if p.tag == "cons"]
+            prod = [p for p in spawns if p.tag == "prod"]
+            assert cons and prod, "双进程未起"
+            cargv = cons[-1].argv
+            assert cargv[1] == "-c" and "PcmSource" in cargv[2], cargv[:3]
+            assert cargv[3:6] == ["1.1.1.4", "7000", "ida"], cargv
+            assert cargv[6] == "晴天" and cargv[7] == "周杰伦", cargv
+            assert cargv[8].startswith("/tmp/oneapp_muvol_"), cargv
+            p = prod[-1].argv
+            assert p[:5] == ["ffmpeg", "-y", "-loglevel", "error", "-vn"]
+            assert "-re" in p and "-ss" in p and "12.0" in p
+            i = p.index("-f")
+            assert p[i:i + 6] == ["-f", "s16le", "-ar", "44100", "-ac", "2"]
+            assert p[i + 6] == "-"
+            assert app.mu_ff is not None and app.mu_proc is not None
+            assert app.mu_out == 1                      # 成功不回落
+            # mu_tick: 消费端退 (rc0) 且墙钟近尾声 → 曲终停播
+            app.mu_aud_up = _time.monotonic() - 59
+            app.mu_dur = 60
+            app.mu_ff._rc = 0
+            app.mu_proc._rc = 224                       # 产端 EPIPE 正常竞态
+            app.mu_advance = True
+            app.mu_view = "play"
+            for _ in range(4):
+                app.mu_tick()
+                _time.sleep(0.05)
+            assert app.mu_playing is None and app.mu_advance is False
+            assert app.mu_ff is None and app.mu_proc is None
+        finally:
+            dash.subprocess.Popen = real_pop
+
+        # 音量路由: 音乐 AirPlay 会话 → _raop_volume (OSD 带音乐输出名)
+        routed = []
+        real_vol = dash.App._raop_volume
+        dash.App._raop_volume = lambda self, code, out_name=None: \
+            routed.append((code, out_name))
+        try:
+            app.raop = devs
+            app.mu_out = 1
+            app.mu_ff = _P([sys.executable, "-c"], "cons")
+            app.tool = "music"
+            app.adjust_volume(115)                      # Fn+S
+            assert routed == [(115, "AirPlay·A音箱")], routed
+            app.mu_ff._rc = 0                           # 会话已死 → 不再劫持
+            app.adjust_volume(115)
+            assert len(routed) == 1
+        finally:
+            dash.App._raop_volume = real_vol
+        print("mu airplay OK (restore/cycle/cmd/argv/tick/vol)")
+    finally:
+        dash.MU_LAST_CACHE, dash.MU_OUT_CACHE = real_last, real_out
+        dash.RAOP_CACHE = real_cache
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 def test_radio_out():
     """电台输出: 设备过滤/缓存恢复 + O 键循环续播 + 失败回落 + 无序号键位."""
     import shutil as _sh
@@ -767,40 +933,47 @@ def test_radio_out():
         # s16le→大端 L16 交换, 漏交换 = 全频道沙沙声)
         compile(dash._ATVR_SCAN, "atvr_scan", "exec")
         compile(dash._ATVR_PLAY, "atvr_play", "exec")
+        try:
+            import pyatv  # noqa: F401
+        except ImportError:
+            pyatv = None
         ns = {}
-        exec(dash._ATVR_PCM_LIB, ns)
-        _io = __import__("io")
-        data = bytes(range(256)) * 600              # 153600B
-        _src = _io.BytesIO(data)
-        assert ns["_prefill"](_src, 65536) is False  # 数据够: 存活门通过
-        _src2 = _io.BytesIO(b"x" * 50)
-        assert ns["_prefill"](_src2, 65536) is True  # 短产端: EOF → 不烧连接
-        _arr = __import__("array")
+        if pyatv is not None:
+            exec(dash._ATVR_PCM_LIB, ns)
+        if pyatv is not None:
+            _io = __import__("io")
+            data = bytes(range(256)) * 600              # 153600B
+            _src = _io.BytesIO(data)
+            assert ns["_prefill"](_src, 65536) is False  # 数据够: 存活门通过
+            _src2 = _io.BytesIO(b"x" * 50)
+            assert ns["_prefill"](_src2, 65536) is True  # 短产端: EOF → 不烧连接
+            _arr = __import__("array")
 
-        def _ref_l16(bs):                            # 参考交换: 同 pyatv 官源
-            a = _arr.array("h", bytes(bs[:len(bs) // 2 * 2]))
-            if __import__("sys").byteorder == "little":
-                a.byteswap()
-            return a.tobytes()
+            def _ref_l16(bs):                            # 参考交换: 同 pyatv 官源
+                a = _arr.array("h", bytes(bs[:len(bs) // 2 * 2]))
+                if __import__("sys").byteorder == "little":
+                    a.byteswap()
+                return a.tobytes()
 
-        assert ns["_to_l16"](data[:1000]) == _ref_l16(data[:1000])
-        assert ns["_to_l16"](b"\x01") == b""         # 奇字节截齐不抛
+            assert ns["_to_l16"](data[:1000]) == _ref_l16(data[:1000])
+            assert ns["_to_l16"](b"\x01") == b""         # 奇字节截齐不抛
 
-        async def _pcm_test():
-            src = ns["PcmSource"](_io.BytesIO(data), 44100, 2, 2, "台")
-            assert (src.sample_rate, src.channels, src.sample_size) == \
-                (44100, 2, 2)
-            got = await src.readframes(250)          # 250 帧 ×4B = 1000B 恒满
-            assert got == _ref_l16(data[:1000])      # 大端 L16 输出
-            got = await src.readframes(40000)        # 160000B > 剩余 152600B
-            assert got == _ref_l16(data[1000:])      # 真 EOF 才短读
-            empty = ns["PcmSource"](_io.BytesIO(b""), 44100, 2, 2, "台")
-            assert await empty.readframes(10) == b""
-            md = await src.get_metadata()
-            assert md.title == "台"
+            async def _pcm_test():
+                src = ns["PcmSource"](_io.BytesIO(data), 44100, 2, 2, "台")
+                assert (src.sample_rate, src.channels, src.sample_size) == \
+                    (44100, 2, 2)
+                got = await src.readframes(250)          # 250 帧 ×4B = 1000B 恒满
+                assert got == _ref_l16(data[:1000])      # 大端 L16 输出
+                got = await src.readframes(40000)        # 160000B > 剩余 152600B
+                assert got == _ref_l16(data[1000:])      # 真 EOF 才短读
+                empty = ns["PcmSource"](_io.BytesIO(b""), 44100, 2, 2, "台")
+                assert await empty.readframes(10) == b""
+                md = await src.get_metadata()
+                assert md.title == "台"
 
-        asyncio = __import__("asyncio")
-        asyncio.run(_pcm_test())
+            asyncio = __import__("asyncio")
+            asyncio.run(_pcm_test())
+
 
         # 设备 ffmpeg SIGTERM 会卡死 futex (真机实证) → radio_stop 必须
         # 补刀 SIGKILL: 产端/消费端都是忽略 SIGTERM 的替身, 停播后 2s 内死透
@@ -1265,6 +1438,7 @@ if __name__ == "__main__":
     test_render()
     test_tools()
     test_music()
+    test_mu_airplay()
     test_radio_out()
     test_voice()
     test_ime()

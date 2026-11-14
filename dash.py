@@ -253,6 +253,7 @@ async def _s():
     except Exception:
         return
     title = sys.argv[4] if len(sys.argv) > 4 else ""
+    artist = sys.argv[5] if len(sys.argv) > 5 else ""   # 音乐: 歌手 (电台="")
     _as.open_source = _patch_open_source(title)   # PCM 直通 (绕开 miniaudio)
     _raop.open_source = _as.open_source           # raop 模块全局引用同步换
     conf = AppleTV(sys.argv[1], sys.argv[1])   # 免 mDNS 扫描直连 (省 ~8s)
@@ -268,9 +269,10 @@ async def _s():
             await asyncio.sleep(3)
     try:                                 # 设备依赖组合下必坏 (srptools 1.0.1)
         print("RAOP-UP", flush=True)     # 出声锚点 (radio 无进度条, 仅日志用)
-        md = MediaMetadata(title=title) if title else None
-        if len(sys.argv) > 5 and sys.argv[5]:
-            def _vol_ctl(path=sys.argv[5]):
+        md = MediaMetadata(title=title or None, artist=artist or None) \
+            if (title or artist) else None
+        if len(sys.argv) > 6 and sys.argv[6]:
+            def _vol_ctl(path=sys.argv[6]):
                 # 音量命令线程: SETVOL <0-100> → atv.audio.set_volume
                 # (同 RTSP 会话 SET_PARAMETER = iPhone 播放条同款会话音量,
                 # 直达音箱); 落盘成功回执 RAOPVOL <pyatv 视角音量>.
@@ -672,6 +674,7 @@ MUSIC_EXTS = (".mp3", ".flac", ".wav")
 MUSIC_SRCS = [("local", "本地曲库", ""), ("qq", "QQ 音乐", ""),
               ("ne", "网易云", "")]
 MU_LAST_CACHE = os.path.join(STATE_DIR, "mu_last.json")  # 上次播放会话 (跨重启)
+MU_OUT_CACHE = os.path.join(STATE_DIR, "mu_out.json")   # 音乐输出 (按设备 id)
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
 CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
 _SENT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1320,8 +1323,8 @@ class App:
         self.mu_scan_at = 0.0                 # 进列表页重扫节流 (60s)
         self.mu_playing = None                # 当前 {"path","title","artist",...}
         self.mu_play_idx = -1                 # mu_playing 在 mu_files 里的序号
-        self.mu_proc = None                   # 播放进程 (本机 ffplay)
-        self.mu_ff = None                     # 商店版音乐无 AirPlay → 恒 None (draw 出声锚点判据引用, 勿删)
+        self.mu_proc = None                   # 播放进程 (本机 ffplay / AirPlay 产端 ffmpeg)
+        self.mu_ff = None                     # AirPlay 消费端 (电台链同款; draw 锚点判据)
         self.mu_retries = 0                   # 提前收工重连额度 (每曲 3)
         self.mu_retry_at = 0.0                # 非阻塞重试定时锚
         self.mu_advance = False               # True=自然播完自动连播下一首
@@ -1350,6 +1353,15 @@ class App:
         self.mu_saved_at = 0.0                # 会话落盘节流 (mu_tick 15s)
         self.mu_aud_up = None                 # 出声时刻 (VU 首响锚点; None=起播期)
         self.mu_sess = 0                      # 播放会话号 (锚点线程守卫)
+        # 音乐输出: 0=本机, ≥1 → raop[idx-1] (MU_OUT_CACHE 按设备 id 恢复;
+        # 电台/音乐共用 raop 设备表, 输出选择各自独立)
+        self.mu_out = 0
+        _mo = netmod.load_json_file(MU_OUT_CACHE, {})
+        _moid = _mo.get("id") if isinstance(_mo, dict) else ""
+        if _moid:
+            self.mu_out = next(
+                (i + 1 for i, d in enumerate(self.raop) if d.get("id") == _moid), 0)
+        self.mu_prod_dead_at = None           # AirPlay 产端死而消费端未退的起始
         self.news_src_i = 0                   # 新闻源索引
         self.news_sel = 0
         self.news_scroll = 0
@@ -1818,7 +1830,7 @@ class App:
             cons = subprocess.Popen(
                 [sys.executable, "-c", _ATVR_PLAY, dev["ip"],
                  str(dev.get("port", 7000)), dev.get("id", ""),
-                 (st.get("name") or "")[:120], volfifo],
+                 (st.get("name") or "")[:120], "", volfifo],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=apfh or subprocess.DEVNULL, env=_AUDIO_ENV,
                 preexec_fn=_FFPLAY_KW.get("preexec_fn"), close_fds=True)
@@ -1896,10 +1908,10 @@ class App:
         except Exception:
             pass
 
-    def _raop_volume(self, code):
-        """AirPlay 会话内音量: SETVOL 走控制 FIFO → 消费端 atv.audio.set_volume
-        (同 RTSP 会话直达音箱, iPhone 播放条同款). 不新连会话 — 频繁重连触发
-        音箱冷却拒连 (dash 实证). 音量记忆落盘, 重启沿用."""
+    def _raop_volume(self, code, out_name=None):
+        """AirPlay 会话内音量 (电台/音乐共用): SETVOL 走控制 FIFO → 消费端
+        atv.audio.set_volume (同 RTSP 会话直达音箱, iPhone 播放条同款).
+        不新连会话 — 频繁重连触发音箱冷却拒连 (dash 实证). 音量记忆落盘."""
         if code == 113:                       # Fn+A 静音 ↔ 恢复
             if self.raop_mute_prev is None:
                 self.raop_mute_prev = max(self.raop_vol, 20)
@@ -1920,7 +1932,7 @@ class App:
             except Exception:
                 pass
         self.osd = ("%s %d%% · %s" % ("静音" if v == 0 else "音量",
-                                      v, self.radio_out_name()),
+                                      v, out_name or self.radio_out_name()),
                     time.monotonic() + 1.2)
 
     @staticmethod
@@ -2034,6 +2046,14 @@ class App:
             dur = mu_probe_dur(target)        # 起播前探: 无 ffplay 抢 CPU
         if f.get("preview"):
             dur = min(dur, 30) or 30          # TRY 试听: 进度条按 30s 计
+        if self.mu_out >= 1:
+            dev = self.raop[min(self.mu_out - 1, len(self.raop) - 1)] \
+                if self.raop else None
+            if dev and self._mu_play_raop(idx, f, target, pos, dur, dev):
+                return
+            self.mu_out = 0                   # 无设备/起播失败 → 回落本机
+            if dev is None:
+                self.osd = ("无 AirPlay 设备, 已切本机", time.monotonic() + 2.0)
         cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-vn"]
         if target.startswith("http"):
             cmd += ["-infbuf", "-reconnect", "1", "-reconnect_streamed", "1",
@@ -2049,9 +2069,112 @@ class App:
         except Exception:
             self.osd = ("播放失败", time.monotonic() + 1.2)
             return
+        self.mu_ff = None                     # 本机路径 (锚点交给 VU 首响)
         self.mu_proc_at = time.monotonic()    # 出声锚点交给 VU 首响
         self.lvl.start_parec()                # pulse monitor 采电平
         self._mu_common(idx, f, pos, dur)
+
+    def _mu_play_raop(self, idx, f, target, pos, dur, dev):
+        """音乐 AirPlay 播放 (电台链同款): ffmpeg -re 节流 (有限文件必须,
+        否则整曲秒读进管道) → s16le PCM → _ATVR_PLAY 消费端 (PcmSource 大端
+        直通 + RAOP 元数据带歌名/歌手 + 音量 FIFO 同会话直达)。
+        成功置 mu_proc(产端)/mu_ff(消费端) 返回 True; 失败 False (回落本机)."""
+        vufifo = "/tmp/oneapp_muvu_%d.fifo" % int(time.monotonic() * 1000)
+        self._vol_fifo_close()                # 上一会话残留 (异常退出兜底)
+        try:
+            os.unlink(vufifo)
+        except Exception:
+            pass
+        os.mkfifo(vufifo, 0o600)
+        volfifo = "/tmp/oneapp_muvol_%d.fifo" % int(time.monotonic() * 1000)
+        try:
+            os.unlink(volfifo)
+        except Exception:
+            pass
+        os.mkfifo(volfifo, 0o600)
+        self.vol_fifo = volfifo
+        self.vol_w = os.open(volfifo, os.O_RDWR | os.O_NONBLOCK)
+        apfh = None
+        try:                                  # stderr 落盘: 无声/失败可回查
+            aplog = "/tmp/oneapp_mu_ap.log"
+            if os.path.exists(aplog) and os.path.getsize(aplog) > 200 * 1024:
+                os.truncate(aplog, 0)
+            apfh = open(aplog, "ab")
+            apfh.write(("\n==== %s idx=%d pos=%.1f dev=%s %s ====\n" % (
+                time.strftime("%m-%d %H:%M:%S"),
+                idx, pos, dev.get("name"), dev["ip"])).encode())
+        except Exception:
+            apfh = None
+        try:
+            cons = subprocess.Popen(
+                [sys.executable, "-c", _ATVR_PLAY, dev["ip"],
+                 str(dev.get("port", 7000)), dev.get("id", ""),
+                 (f.get("title") or "")[:120],
+                 (f.get("artist") or "")[:120], volfifo],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=apfh or subprocess.DEVNULL, env=_AUDIO_ENV,
+                preexec_fn=_FFPLAY_KW.get("preexec_fn"), close_fds=True)
+        except Exception:
+            self._vol_fifo_close()
+            self._raop_cleanup(vufifo, apfh)
+            self.osd = ("AirPlay 启动失败 (pip install pyatv==0.18.0)",
+                        time.monotonic() + 2.0)
+            return False
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-vn", "-re"]
+        # -y: FIFO 路径已存在时 ffmpeg 默认交互询问后退出 (无声坑); -re:
+        # 有限文件必须按原速读 (家庭版实证: 缺失=响几声即断, 管道须时钟节流)
+        if pos > 0.5:
+            cmd += ["-ss", "%.1f" % pos]
+        if target.startswith("http"):
+            cmd += ["-reconnect", "1", "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5"] + _ff_slow_net_flags()
+        cmd += ["-i", target, "-f", "s16le", "-ar", "44100", "-ac", "2",
+                "-", "-f", "wav", vufifo]
+        try:
+            self.mu_proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=cons.stdin,
+                stderr=apfh or subprocess.DEVNULL, env=_AUDIO_ENV,
+                preexec_fn=_FFPLAY_KW.get("preexec_fn"), close_fds=True)
+        except Exception:
+            self._radio_kill(cons)
+            self._vol_fifo_close()
+            self._raop_cleanup(vufifo, apfh)
+            self.osd = ("AirPlay 解码启动失败", time.monotonic() + 1.5)
+            return False
+        try:
+            cons.stdin.close()                # 父端 stdin 副本即关 — ffmpeg
+        except Exception:                     # 死=真 EOF, 消费端不再无限等流
+            pass
+        if apfh:
+            try:
+                apfh.close()                  # 子进程持有副本, 父端即关
+            except Exception:
+                pass
+        self.mu_ff = cons
+        sess = self.mu_sess
+        threading.Thread(target=self._mu_raop_watch, args=(cons, sess),
+                         daemon=True).start()
+        self.lvl.start_fifo(vufifo)           # 读端 NONBLOCK 开, 不与写端互等
+        self._mu_common(idx, f, pos, dur)
+        return True
+
+    def _mu_raop_watch(self, proc, sess):
+        """消费端 stdout: RAOP-UP → 出声锚点 (+1.2s: stream 启动+RTSP setup
+        实测 ~1-1.5s, mu_wall_pos 冻结到锚点过); RAOPVOL → 采纳会话音量."""
+        try:
+            for line in proc.stdout:
+                line = line.decode(errors="replace").strip()
+                if line.startswith("RAOP-UP"):
+                    if self.mu_sess == sess and self.mu_aud_up is None:
+                        self.mu_aud_up = time.monotonic() + 1.2
+                elif line.startswith("RAOPVOL "):
+                    try:
+                        self.raop_vol = max(0,
+                            min(100, int(float(line.split()[1]))))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _mu_common(self, idx, f, pos, dur=0.0):
         """起播状态落位 + 封面/歌词懒取."""
@@ -2243,14 +2366,17 @@ class App:
             self.mu_view = "src"
 
     def mu_kill(self):
-        """只杀子进程, 不清状态 (暂停/seek/续播走这里)."""
+        """只杀子进程, 不清状态 (暂停/seek/续播走这里). 产端走 _radio_kill
+        (AirPlay 时是 ffmpeg 双输出 — SIGTERM futex 僵死须补刀 SIGKILL,
+        765d0d2 实证); 消费端长宽限: SIGTERM → 优雅取消 stream → finally 真
+        RTSP TEARDOWN (暴力拆连让音箱进冷却拒连 — 实测退净须 ~2s)."""
         self.lvl.stop()                       # 电平源随播放进程一起断
-        if self.mu_proc:
-            try:
-                self.mu_proc.terminate()
-            except Exception:
-                pass
+        self._radio_kill(self.mu_proc)        # ffplay 本机 / ffmpeg AirPlay 产端
         self.mu_proc = None
+        self._radio_kill(self.mu_ff, grace=2.5)   # AirPlay 消费端 (本机=None)
+        self.mu_ff = None
+        self._vol_fifo_close()                # 音量命令通道随会话关
+        self.mu_prod_dead_at = None
 
     def mu_stop(self):
         """x 键/切换曲目/退出连播末尾: 全停 (状态清空, 回列表)."""
@@ -2323,6 +2449,45 @@ class App:
         self.mu_kill()
         self.mu_play(self.mu_play_idx, pos)
 
+    def mu_out_name(self):
+        """音乐输出名: 本机 / AirPlay·<设备名> (电台共用设备表, 选择独立)."""
+        if self.mu_out == 0 or not self.raop:
+            return "本机"
+        d = self.raop[min(self.mu_out - 1, len(self.raop) - 1)]
+        return "AirPlay·%s" % d.get("name", "?")
+
+    def _mu_out_save(self):
+        """输出选择持久化 (按设备 id; 重启恢复上次输出)."""
+        try:
+            did = (self.raop[self.mu_out - 1].get("id")
+                   if 1 <= self.mu_out <= len(self.raop) else "")
+            netmod.save_json_file(MU_OUT_CACHE, {"id": did})
+        except Exception:
+            pass
+
+    def mu_out_cycle(self):
+        """7 键: 本机 → 各 AirPlay 设备 → 本机 循环; 播放中换输出 = 停旧
+        进程 + 同曲同位续播 (暂停中只切路由, 恢复时才起新进程)."""
+        if not self.raop:
+            self._raop_scan_lazy()            # 空表: 触发一次后台补扫
+            self.osd = ("无 AirPlay 设备 (扫描中…, 稍后再按)",
+                        time.monotonic() + 2.0)
+            return
+        self.mu_out = (self.mu_out + 1) % (len(self.raop) + 1)
+        self._mu_out_save()
+        if self.mu_playing is None:
+            self.osd = ("输出: %s" % self.mu_out_name(),
+                        time.monotonic() + 1.5)
+            return
+        if self.mu_paused or self.mu_proc is None:
+            self.osd = ("输出: %s (恢复时生效)" % self.mu_out_name(),
+                        time.monotonic() + 1.5)
+            return                           # 暂停/无进程: 状态原样
+        self.osd = ("AirPlay 连接中… (~15s)", time.monotonic() + 3.0)
+        pos = self.mu_wall_pos()
+        self.mu_kill()
+        self.mu_play(self.mu_play_idx, pos)
+
     def mu_tick(self):
         """连播/出错检测 (poll 每秒 + 播放页每帧都调). 判据进程退出 = 流结束:
         rc=0 自然播完 → 连播下一首; 提前退出 (源流断/假EOF) → 额度内同位续流."""
@@ -2343,35 +2508,58 @@ class App:
                     self.mu_play(self.mu_play_idx, self.mu_pos0)
                     self.mu_retries = r
             return
-        rc = self.mu_proc.poll()
+        is_raop = self.mu_ff is not None
+        if is_raop and self.mu_proc.poll() is not None \
+                and self.mu_ff.poll() is None:
+            # 产端先死而消费端未退: 正常收尾时消费端应 ~1s 内随 EOF 退;
+            # >3s = 流断裂挂死 (家庭版实证: ffmpeg 死成僵尸, 消费端无限等
+            # EOF, 判据永不触发) → 杀掉让下一拍走中断/续流
+            if self.mu_prod_dead_at is None:
+                self.mu_prod_dead_at = time.monotonic()
+                return
+            if time.monotonic() - self.mu_prod_dead_at > 3.0:
+                self.mu_prod_dead_at = None
+                self.osd = ("AirPlay 推流中断, 续流…", time.monotonic() + 1.5)
+                try:
+                    self.mu_ff.kill()
+                except Exception:
+                    pass
+            return
+        self.mu_prod_dead_at = None
+        rc = (self.mu_ff if is_raop else self.mu_proc).poll()
         if rc is None:
+            if is_raop:
+                self.mu_proc.poll()           # 产端收尸 (防 defunct 堆积)
             return
         wall = self.mu_wall_pos()             # 死亡时刻的真实进度 (kill 前取)
         life = (time.monotonic() - self.mu_proc_at
                 if self.mu_proc_at else 0.0)
         self.mu_kill()
         dur = self.mu_dur
-        # 声音未锚定 (静音曲头/无监视器环境): 墙钟冻结在 0, 假EOF判据会误杀
-        # → 退化为进程寿命判据: 寿命≥85% 时长=真播完, 否则=早死走重试/失败
-        if self.mu_aud_up is None:
+        # 本机声音未锚定 (静音曲头/无监视器环境): 墙钟冻结在 0, 假EOF判据会
+        # 误杀 → 退化为进程寿命判据: 寿命≥85% 时长=真播完, 否则=早死走重试
+        if not is_raop and self.mu_aud_up is None:
             done = dur > 0 and life >= dur * 0.85
         else:
             done = dur == 0 or wall >= dur * 0.85
         if rc != 0 and done:
             done = True                       # 尾段崩 (差几秒) → 按播完算
         if not done and self.mu_retries > 0:
-            # 提前收工统一重连: 中途源流断 (QQ URL 断流实测) — 同位续播不假推进
+            # 提前收工统一重连: 中途源流断 (QQ URL 断流实测) / AirPlay 会话
+            # 掉 — 同位续播不假推进 (消费端 connect 自带拒连重试)
             self.mu_retries -= 1
             self.mu_pos0 = min(wall, dur) if dur else wall
             self.mu_retry_at = time.monotonic() + \
                 (2.0 if time.monotonic() - self.mu_t0 >= 15.0 else 3.0)
-            self.osd = ("重连…", time.monotonic() + 1.5)
+            self.osd = ("AirPlay 续流…" if is_raop else "重连…",
+                        time.monotonic() + 1.5)
             return
         if rc != 0 or not done:
             self.mu_playing = None
             self.mu_play_idx = -1
             self.mu_advance = False
-            self.osd = ("播放失败 (格式不支持?)", time.monotonic() + 1.5)
+            self.osd = ("AirPlay 中断/失败" if is_raop
+                        else "播放失败 (格式不支持?)", time.monotonic() + 1.5)
             self.mu_view = "list"
             return
         nxt = self.mu_play_idx + 1
@@ -2402,6 +2590,8 @@ class App:
                     self._mu_open_qq()
                 else:
                     self._mu_open_ne()
+            elif k == pygame.K_7:
+                self.mu_out_cycle()              # 7=输出 (源选择页也可切)
             return True
         if self.mu_view == "qr":
             if k in (pygame.K_q, pygame.K_BACKSPACE):
@@ -2472,13 +2662,17 @@ class App:
                 self.mu_sel = max(0, min(len(self.mu_files) - 1,
                                          self.mu_sel + d))
             elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_4):
-                self._mu_play_item()             # 4=播放 (实体键 4)
+                self._mu_play_item()             # 4=播放 (对齐实体键 4)
+            elif k == pygame.K_7:
+                self.mu_out_cycle()              # 7=输出
             elif k == pygame.K_6:
                 self._mu_open_search()           # 6=回搜索 (实体键 6)
             elif k == pygame.K_0:
                 self.mu_view = "src"             # 0=选源 (跨页统一)
             elif k == pygame.K_8:
                 self.mu_stop()                   # 8=停止 (实体键 8)
+            elif k == pygame.K_7:
+                self.mu_out_cycle()              # 7=输出
             elif k == pygame.K_r and not self.mu_busy:
                 self._mu_open_fav()              # r=重拉收藏
             return True
@@ -2490,6 +2684,8 @@ class App:
             elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 if self.mu_files:
                     self.mu_play(self.mu_sel)
+            elif k == pygame.K_7:
+                self.mu_out_cycle()              # 7=输出
             elif k == pygame.K_r:
                 self.mu_scan_at = 0.0          # r 强制重扫
                 self.mu_rescan()
@@ -2498,15 +2694,15 @@ class App:
             elif k == pygame.K_0:
                 self.mu_view = "src"           # 0=选源 (跨页统一)
             return True
-        # play 视图: 4/Enter/P 暂停切换, 0 选源, x/8 停 + 回源选择
+        # play 视图: 4/Enter/P 暂停切换, 7 输出, 0 选源, x/8 停 + 回源选择
         if k in (pygame.K_4, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_p):
             self.mu_pause_toggle()        # 4=暂停 (2026-11-14 用户定版, 对齐
                                           #   实体键 4; P 保留)
         elif k in (pygame.K_x, pygame.K_8):
             self.mu_stop()
             self.mu_view = "src"          # 8=停止 (跨页统一)
-        elif k == pygame.K_p:
-            self.mu_pause_toggle()
+        elif k == pygame.K_7:
+            self.mu_out_cycle()           # 7=输出 (家庭版音乐同款键位)
         elif k == pygame.K_0:
             self.mu_view = "src"          # 0=选源 (跨页统一; 播放后台继续)
         elif k == pygame.K_LEFT:
@@ -3814,8 +4010,12 @@ class App:
     def adjust_volume(self, code):
         if self.playing_key and self.raop_cons is not None \
                 and self.raop_cons.poll() is None:
-            self._raop_volume(code)           # AirPlay 会话内: 音量直达音箱
+            self._raop_volume(code)           # 电台 AirPlay 会话内: 音量直达音箱
             return
+        if self.tool == "music" and self.mu_ff is not None \
+                and self.mu_ff.poll() is None:
+            self._raop_volume(code, self.mu_out_name())
+            return                            # 音乐 AirPlay 会话内: 同款直达
         try:
             env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/1000")
             if code == 113:                   # Fn+A 静音
@@ -5226,15 +5426,19 @@ class App:
         track = self.th("track")
         warn = self.th("warn")
         p = self.mu_playing or {}
-        self.tool_head(surf, "音乐", "♪ 播放页 · 0 选源 · 长按Esc退出")
+        sub = "♪ 播放页 · 0 选源 · 长按Esc退出"
+        if self.mu_out >= 1 and self.raop:
+            sub = "♪ %s · 0 选源 · 长按Esc退出" % self.mu_out_name()
+        self.tool_head(surf, "音乐", sub)
         playing = bool(self.mu_proc) and not self.mu_paused
         # VU 电平 (播放=pulse monitor / ffmpeg fd3; 暂停=回落静默衰减)
         lvb, lvm, lvt = self.lvl.lvl if playing else (0.0, 0.0, 0.0)
         self.vu_tick(time.monotonic(), lvb, lvm, lvt)
         # 本机出声锚点: VU 首响定位 (2026-11-14) — HTTP 直连预缓冲 1-3s,
         # 旧写法"起进程=出声"使歌词抢跑; pulse monitor 首个过阈帧=真出声,
-        # -0.15s 补监视器链路; 5s 静音曲头/监视器失效兜底回旧值. 商店版
-        # 音乐仅本机输出 (mu_ff 恒 None), 判据与 zero-dash 保持同构
+        # -0.15s 补监视器链路; 5s 静音曲头/监视器失效兜底回旧值.
+        # AirPlay 路径不用 VU (fifo 是产端时序) — _mu_raop_watch 用
+        # RAOP-UP+1.2s 定锚
         if self.mu_aud_up is None and playing and self.mu_ff is None:
             if lvb > 2.0 or lvm > 2.0:
                 self.mu_aud_up = time.monotonic() - 0.15
@@ -5295,7 +5499,7 @@ class App:
             frac = min(1.0, (time.monotonic() - self.esc_hold_at) / 1.0)
             self.draw_exit_bar(surf, frac)
         else:
-            self.tool_foot(surf, ("4 播放/暂停", "←→ ±10s", "↑↓ 切曲",
+            self.tool_foot(surf, ("4 播/停", "7 输出", "←→ ±10s", "↑↓ 切曲",
                                   "8 停止"))   # 0 选源见头部
 
     def draw_tabs(self, surf):
