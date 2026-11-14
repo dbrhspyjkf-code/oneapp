@@ -160,14 +160,14 @@ def _encode_imap_utf7(name):
 
 
 # 跳过的文件夹: 垃圾/广告/订阅/草稿 (2026-10-28 用户口径, utf7 名与中文名双判);
-# QQ 的垃圾夹是英文名 Junk (Sent Messages/Drafts/Deleted Messages 保留显示)
+# QQ 是英文夹名: Junk=垃圾, Drafts=草稿 (Sent Messages/Deleted Messages 保留显示)
 _SKIP_FOLDERS = frozenset({
     "&V4NXPpCuTvY-",  # 垃圾邮件
     "&Xn9USpCuTvY-",  # 广告邮件
     "&i6KWBZCuTvY-",  # 订阅邮件
     "&g0l6P3ux-",     # 草稿箱
 })
-_SKIP_NAMES = ("垃圾邮件", "广告邮件", "订阅邮件", "草稿箱", "Junk")
+_SKIP_NAMES = ("垃圾邮件", "广告邮件", "订阅邮件", "草稿箱", "Junk", "Drafts")
 
 
 def should_skip(name):
