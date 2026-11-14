@@ -12,7 +12,7 @@ M5Stack CardputerZero (320×170) 的 pygame 工具箱 app。**零本地服务依
 |---|---|---|
 | 主页 | 时钟+农历 / 天气 / 每日一句 / 新闻跑马灯 | Open-Meteo / hitokoto / RSS×7 |
 | 想法 | 键盘速记 (拼音 IME 本地词表), 本地存储 | — |
-| 电台 | 20 台内置直连流 (中/英), 12 条频谱 VU | qingting.fm / cnr.cn / BBC / NPR… |
+| 电台 | 20 台内置直连流 (中/英), 12 条频谱 VU, 输出 O 键循环 (本机 / 局域网 AirPlay 音箱) | qingting.fm / cnr.cn / BBC / NPR… |
 | 行情 | 自选股+指数+贵金属, 分时/250日K | 腾讯 qt.gtimg.cn |
 | 新闻 | 7 个中文 RSS 源 | IT之家 / 少数派 / Solidot… |
 | 工具 | 汇率 / 单位换算 / 万年历 / 双色球 / 计时器 / 音乐 | open.er-api.com / 中彩官网 / QQ·网易直连 |
@@ -20,10 +20,14 @@ M5Stack CardputerZero (320×170) 的 pygame 工具箱 app。**零本地服务依
 音乐 app: 本地曲库 (mp3/flac/wav) + QQ 音乐 / 网易云**直连协议**
 (musrc.py 自实现 weapi/eapi, 扫码绑定, 歌词走 LRCLIB+网易兜底), 输出仅本机。
 
+电台 AirPlay 输出: O 键循环 本机→局域网 AirPlay 音箱 (mDNS 自动发现,
+pyatv RAOP 直推, 台名进音箱元数据)。设备需 `pip install --user --break-system-packages
+pyatv==0.18.0 srptools==1.0.1`; 缺库/无设备时自动回落本机播放。
+
 ## 运行
 
 ```bash
-# 设备 (Debian, 需 pygame/ffmpeg/cryptography/segno/qqmusic-api)
+# 设备 (Debian, 需 pygame/ffmpeg/cryptography/segno/qqmusic-api/pyatv)
 python3 dash.py            # 直写 /dev/fb_lcd + evdev
 # Mac 预览
 python3 dash.py --window

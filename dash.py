@@ -113,6 +113,98 @@ THEME_FILE = os.path.join(STATE_DIR, "theme.json")
 WX_HOME = {"lat": 22.5629, "lon": 114.1207, "city": "深圳"}   # 定位失败回落
 WX_LOC_FILE = os.path.join(STATE_DIR, "wx_loc.json")   # IP 归属地快照
 
+# 电台输出: 本机 (ffplay→pulse) / AirPlay (pyatv RAOP 直推, dash 音乐 app
+# 同款移植 — zero-dash 真机全链验证过)。设备音频服务器无 raop sink 模块
+# (libspa-0.2-raop 不在 RPi OS 仓库), 走进程内发送: ffmpeg 解码电台流 →
+# flac 管道 → atvremote stream=- → 音箱。依赖 pyatv==0.18.0 (设备 --user,
+# Dash 已装); 缺库/无设备时 O 键回落本机。局域网自动发现 (mDNS 扫描)。
+RAOP_CACHE = os.path.join(STATE_DIR, "raop_devs.json")
+RADIO_OUT_FILE = os.path.join(STATE_DIR, "radio_out.json")
+_RAOP_SKIP = re.compile(r"电视|tv|macbook|ipad|iphone", re.I)
+
+
+def _raop_ok(d):
+    """输出循环只留音箱: 滤电视/电脑/手机 (每按一次 O=杀进程重连 ~10s,
+    中间噪音设备既慢又易触发会话冷却拒连)."""
+    return bool(d.get("ip") and d.get("id")
+                and not _RAOP_SKIP.search(d.get("name") or ""))
+
+
+# 子进程入口统一走 -c 包装: pyatv CLI 用 asyncio.get_event_loop(), py3.14
+# 已移除隐式建环 (Mac 模拟 3.14 崩, 设备 3.13 也统一走这条, 一份代码两端跑)。
+_ATVR_SCAN = r'''
+import asyncio, json, sys
+async def _s():
+    from pyatv import scan
+    from pyatv.const import Protocol
+    loop = asyncio.get_event_loop()
+    devs = []
+    for atv in await scan(loop, timeout=float(sys.argv[1])):
+        for s in atv.services:
+            if s.protocol == Protocol.RAOP:
+                devs.append({"ip": str(atv.address), "port": s.port,
+                             "name": atv.name, "id": str(atv.identifier)})
+    print(json.dumps(devs, ensure_ascii=False))
+asyncio.run(_s())
+'''
+_ATVR_PLAY = r"""
+import asyncio, sys
+async def _s():
+    from pyatv import connect
+    from pyatv.conf import AppleTV, ManualService
+    from pyatv.const import Protocol
+    from pyatv.interface import MediaMetadata
+    loop = asyncio.get_event_loop()
+    conf = AppleTV(sys.argv[1], sys.argv[1])   # 免 mDNS 扫描直连 (省 ~8s)
+    conf.add_service(ManualService(sys.argv[3] or None, Protocol.RAOP,
+                                   int(sys.argv[2]), None))
+    atv = await connect(conf, loop)     # 仅 RAOP 服务: Companion SRP 链在
+    try:                                 # 设备依赖组合下必坏 (srptools 1.0.1)
+        print("RAOP-UP", flush=True)     # 出声锚点 (radio 无进度条, 仅日志用)
+        md = None                        # 台名进 RAOP 元数据 (HomePod 显示真台名)
+        if len(sys.argv) > 4 and sys.argv[4]:
+            md = MediaMetadata(title=sys.argv[4])
+        await atv.stream.stream_file(sys.stdin.buffer, metadata=md,
+                                     override_missing_metadata=True)
+    finally:
+        atv.close()
+asyncio.run(_s())
+"""
+
+
+def raop_scan(timeout=12):
+    """pyatv 子进程扫 RAOP 设备 → [{"ip","port","name","id"}]; 无 pyatv/
+    无设备/超时 → []. Mac 模拟同样可扫 (发现 HomePod/Mac 接收器)."""
+    p = None
+    try:
+        import importlib.util
+        if importlib.util.find_spec("pyatv") is None:
+            return []
+        p = subprocess.Popen([sys.executable, "-c", _ATVR_SCAN, str(timeout)],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        # 设备实测: 子进程扫完打印 JSON 后退出阶段挂死 (zeroconf 收尾不解) —
+        # subprocess.run(timeout) 超时会把结果一起扔掉; 改读行即杀
+        watchdog = threading.Timer(timeout + 20, p.kill)
+        watchdog.daemon = True
+        watchdog.start()
+        line = p.stdout.readline()        # 扫完 (~timeout+导入) 即回, 不等退程
+        watchdog.cancel()
+        p.kill()
+        if not line.strip():
+            return []
+        devs = json.loads(line.strip().splitlines()[-1])
+        return [d for d in devs if _raop_ok(d)]
+    except Exception:
+        return []
+    finally:
+        if p:
+            try:
+                p.kill()
+                p.stdout.close()
+            except Exception:
+                pass
+
+
 
 def wx_url(loc):
     """按归属地坐标拼 Open-Meteo URL (loc 缺坐标 → 回落深圳)."""
@@ -1021,6 +1113,16 @@ class App:
         self.rscroll = 0
         self.playing_key = None               # 播放中电台 key
         self.play_at = 0.0                    # 本次开播时刻
+        self.raop_cons = None                 # AirPlay 消费端 (atvremote stream=-)
+        # 电台输出 (0=本机, ≥1 → raop[idx-1]); 缓存须带 id, 旧格式无 id → 重扫
+        self.raop = [d for d in netmod.load_json_file(RAOP_CACHE, [])
+                     if isinstance(d, dict) and _raop_ok(d)]
+        self.radio_out = 0
+        _oid = netmod.load_json_file(RADIO_OUT_FILE, "")
+        if _oid:
+            self.radio_out = next(
+                (i + 1 for i, d in enumerate(self.raop) if d.get("id") == _oid), 0)
+        self._raop_scanned = bool(self.raop)  # 空缓存: 进电台页后台补扫一次
         self.vu = [3.0] * 12                  # VU 条 (car-dash vuTick 同款)
         self.vu_pk = [3.0] * 12
         self._vu_at = 0.0
@@ -1215,7 +1317,7 @@ class App:
                 self.net.job("wxloc", fetchers.wx_locate, 1800)      # IP 归属地 30min 重探
                 self.net.pub(wx_url(self.wx_loc), "wx", 600, direct=True)
             if self.page == 2:
-                pass                          # 站台表内置 (radio_stations.STATIONS)
+                self._raop_scan_lazy()        # 空缓存时进电台页后台补扫一次
             if self.page == 3:
                 self.net.job("ipo", fetchers.ipo_fetch, 1800)   # 顶部跑马灯
                 self.net.pub_text(QT_BASE + ",".join(
@@ -1444,13 +1546,69 @@ class App:
         return [s for s in radio_stations.STATIONS
                 if self._st_lang(s) == self.radio_lang]
 
+    def radio_out_name(self):
+        """输出名: 本机 / AirPlay·<设备名>."""
+        if self.radio_out == 0 or not self.raop:
+            return "本机"
+        d = self.raop[min(self.radio_out - 1, len(self.raop) - 1)]
+        return "AirPlay·%s" % d.get("name", "?")
+
+    def _raop_dev(self):
+        """当前输出对应的 RAOP 设备 (越界回落 None=本机)."""
+        if self.radio_out >= 1 and self.raop:
+            return self.raop[min(self.radio_out - 1, len(self.raop) - 1)]
+        return None
+
+    def radio_out_cycle(self):
+        """O 键: 输出 本机→AirPlay 设备循环; 播放中换输出 = 旧输出停 +
+        新输出续播同台 (dash 电台 o 键同款). 无设备时提示并保持本机."""
+        if not self.raop:
+            self._raop_scan_lazy()            # 首按 O 顺带触发一次后台补扫
+            self.osd = ("无 AirPlay 设备", time.monotonic() + 1.5)
+            return
+        prev = self.playing_key
+        if prev:
+            self.radio_stop()                 # 先停旧输出 (必须在改 radio_out 前)
+        self.radio_out = (self.radio_out + 1) % (len(self.raop) + 1)
+        netmod.save_json_file(RADIO_OUT_FILE,
+                              self.raop[self.radio_out - 1].get("id", "")
+                              if self.radio_out >= 1 else "")
+        self.osd = ("输出: %s" % self.radio_out_name(),
+                    time.monotonic() + 1.5)
+        if prev:
+            st = next((s for s in self.stations() if s["key"] == prev), None)
+            if st:
+                self.radio_play(st)
+
+    def _raop_scan_lazy(self):
+        """电台页按需补扫一次 (空缓存才扫; 结果落 RAOP_CACHE). 不阻塞 UI."""
+        if self._raop_scanned:
+            return
+        self._raop_scanned = True
+
+        def _run():
+            try:
+                devs = raop_scan(12)
+            except Exception:
+                devs = []
+            if devs:
+                self.raop = devs
+                netmod.save_json_file(RAOP_CACHE, devs)
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def radio_play(self, st):
         self.radio_stop()
         if self.mu_proc or self.mu_playing:   # 音频焦点: 音乐让路
             self.mu_stop()
-        # 直连公开流 URL. -reconnect*: WiFi 停顿导致 TCP 断时 ffplay 自动
-        # 重拉同 URL (<5s 退避) 恢复播放, 而不是死掉报"流已断"; -infbuf 不限
-        # 输入缓冲, 吸收直播上游的突发空窗 (HLS 几秒一批).
+        dev = self._raop_dev()
+        if dev:                               # AirPlay 输出: RAOP 直推
+            if self._radio_play_raop(st, dev):
+                return
+            self.radio_out = 0                # 起播失败回落本机 (继续往下走)
+        # 本机: 直连公开流 URL. -reconnect*: WiFi 停顿导致 TCP 断时 ffplay
+        # 自动重拉同 URL (<5s 退避) 恢复播放, 而不是死掉报"流已断"; -infbuf
+        # 不限输入缓冲, 吸收直播上游的突发空窗 (HLS 几秒一批).
         cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
                "-vn", "-infbuf"] + _ff_slow_net_flags() + \
               ["-reconnect", "1", "-reconnect_streamed", "1",
@@ -1466,8 +1624,92 @@ class App:
         except Exception:
             self.osd = ("播放失败", time.monotonic() + 1.2)
 
+    def _radio_play_raop(self, st, dev):
+        """AirPlay 播放: ffmpeg (-re 节流) → flac 管道 → atvremote stream=-.
+        成功置 playing_key 返回 True; 失败返回 False (radio_play 回落本机).
+        VU 旁路 FIFO wav (AirPlay 不走本地 pulse, monitor 采不到)."""
+        vufifo = "/tmp/oneapp_vu_%d.fifo" % int(time.monotonic() * 1000)
+        try:
+            os.unlink(vufifo)
+        except Exception:
+            pass
+        os.mkfifo(vufifo, 0o600)
+        apfh = None
+        try:                                  # stderr 落盘: 无声/失败可回查
+            aplog = "/tmp/oneapp_radio_ap.log"
+            if os.path.exists(aplog) and os.path.getsize(aplog) > 200 * 1024:
+                os.truncate(aplog, 0)
+            apfh = open(aplog, "ab")
+            apfh.write(("\n==== %s dev=%s %s ====\n" % (
+                time.strftime("%m-%d %H:%M:%S"),
+                dev.get("name"), dev["ip"])).encode())
+        except Exception:
+            apfh = None
+        try:
+            cons = subprocess.Popen(
+                [sys.executable, "-c", _ATVR_PLAY, dev["ip"],
+                 str(dev.get("port", 7000)), dev.get("id", ""),
+                 (st.get("name") or "")[:120]],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=apfh or subprocess.DEVNULL, env=_AUDIO_ENV,
+                preexec_fn=_FFPLAY_KW.get("preexec_fn"), close_fds=True)
+        except Exception:
+            self._raop_cleanup(vufifo, apfh)
+            self.osd = ("AirPlay 启动失败 (pip install pyatv==0.18.0)",
+                        time.monotonic() + 2.0)
+            return False
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-vn", "-re"]
+        # -y: FIFO 路径已存在时 ffmpeg 默认交互询问后退出 (无声坑); -re:
+        # 直播流按原速读, 不限速会把上游突发全缓冲 → 延迟无限增大
+        cmd += ["-reconnect", "1", "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5"] + _ff_slow_net_flags()
+        cmd += ["-i", st["url"], "-f", "flac", "-", "-f", "wav", vufifo]
+        try:
+            self.player = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=cons.stdin,
+                stderr=apfh or subprocess.DEVNULL, env=_AUDIO_ENV,
+                preexec_fn=_FFPLAY_KW.get("preexec_fn"), close_fds=True)
+        except Exception:
+            cons.kill()
+            self._raop_cleanup(vufifo, apfh)
+            self.osd = ("AirPlay 解码启动失败", time.monotonic() + 1.5)
+            return False
+        try:
+            cons.stdin.close()                # 父端 stdin 副本即关 — ffmpeg
+        except Exception:                     # 死=真 EOF, 消费端不再无限等流
+            pass
+        if apfh:
+            try:
+                apfh.close()                  # 子进程持有副本, 父端即关
+            except Exception:
+                pass
+        self.raop_cons = cons
+        self.lvl.start_fifo(vufifo)           # 读端 NONBLOCK 开, 不与写端互等
+        self.playing_key = st["key"]
+        self.play_at = time.monotonic()
+        self.osd = (st["name"], time.monotonic() + 1.5)
+        return True
+
+    @staticmethod
+    def _raop_cleanup(vufifo, apfh):
+        if apfh:
+            try:
+                apfh.close()
+            except Exception:
+                pass
+        try:
+            os.unlink(vufifo)
+        except Exception:
+            pass
+
     def radio_stop(self):
         self.stop_player()
+        if self.raop_cons:                    # RAOP 消费端随产端一起断
+            try:
+                self.raop_cons.terminate()
+            except Exception:
+                pass
+            self.raop_cons = None
         self.playing_key = None
         self.lvl.stop()                       # 电平源随播放进程一起断
         self.vu = [3.0] * 12
@@ -2348,10 +2590,11 @@ class App:
             self.tool_key(k, ch)
             return True
 
-        # 各页动作键占用: 想法(4新增/5录音/7删除/8播放语音) 电台(1-8直播)
+        # 各页动作键占用: 想法(4新增/5录音/7删除/8播放语音)
         # 行情(3商品/4自选/5指数/8图表) 新闻(1-7选条, 源切换走←→)
         # 工具网格页: 数字 1-9/0 全部留给 app 直开
-        page_keys = {1: (4, 5, 7, 8), 2: tuple(range(1, 9)),
+        # 电台页无数字占用 (列表无序号, 换台走 ↑↓+Enter, 输出走 O)
+        page_keys = {1: (4, 5, 7, 8),
                      3: (4, 5, 6, 8), 4: tuple(range(1, 8)),
                      5: tuple(range(0, 10))}
         digit = k - pygame.K_0                # pygame 常量值 → 数字序号
@@ -2436,20 +2679,14 @@ class App:
                     and items[self.sel]["kind"] == "voice":
                 self.play_voice(items[self.sel])          # 播放/停止
         elif self.page == 2:
-            digit = k - pygame.K_0
-            if pygame.K_1 <= k <= pygame.K_8:
-                sts_all = self.stations()
-                if digit - 1 < len(sts_all):
-                    self.rsel = digit - 1
-                    self.move_rsel(0)
-                    self.radio_play(sts_all[self.rsel])
-                    return True
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.radio_toggle()              # Enter = 播放/暂停
             elif k == pygame.K_e:
                 self.radio_lang = "en" if self.radio_lang == "zh" else "zh"
                 self.rsel = 0
                 self.rscroll = 0
+            elif k == pygame.K_o:
+                self.radio_out_cycle()           # O = 输出 本机→AirPlay 循环
         elif self.page == 5:
             # 工具入口网格: 数字 1-9/0 直开, Enter 打开
             # (方向键已在上方分支转入 tool_grid_key; Esc 全局分支 → 回主页)
@@ -3412,11 +3649,11 @@ class App:
         # 头部
         text(surf, "电台", 14, hi, (6, 2))
         tab = "EN" if self.radio_lang == "en" else "中文"
-        text(surf, "· %s %d 台 · e 切换" % (tab, len(sts)), 11, dim,
+        text(surf, "· %s %d 台 · E 切换" % (tab, len(sts)), 11, dim,
              (6 + textw("电台", 14) + 6, 4))
-        text(surf, "1-8 换台 · Enter 播/停 · e 中/英 · Fn+S/D 音量", 13, soft, (6, 151))
+        text(surf, "Enter 播/停 · E 中/英 · O 输出", 13, soft, (6, 151))
 
-        # 电台列表 (左)
+        # 电台列表 (左, 无序号 — 换台走 ↑↓+Enter)
         rows = 8
         y0, rh = 20, 15
         for i in range(rows):
@@ -3434,9 +3671,7 @@ class App:
                 pygame.draw.polygon(surf, acc, [(LX + 8, y + 4), (LX + 8, y + 12),
                                                 (LX + 15, y + 8)])
             name_col = hi if (on or idx == self.rsel) else soft
-            text(surf, str(idx + 1), 11, acc if sel else dim,
-                 (LX + 4, y + 2))
-            tx = LX + (20 if on else 16)
+            tx = LX + (20 if on else 8)
             text(surf, clip_text(st.get("name", ""), BODY, LW - 48 - tx),
                  BODY, name_col, (tx, y + 1))
             fq = st.get("freq") or 0
@@ -3459,6 +3694,8 @@ class App:
             pygame.draw.rect(surf, border, r, 1, border_radius=5)
             text(surf, "播放中" if playing else "未播放", 10,
                  acc if playing else dim, (r.x + 8, r.y + 4))
+            text(surf, clip_text("输出:%s" % self.radio_out_name(), 10, RW - 60),
+                 10, dim, (r.x + RW - 8, r.y + 4), right=True)
             text(surf, clip_text(cur if cur else "—", 13, RW - 16), 13,
                  hi if cur else dim, (r.x + 8, r.y + 17))
             nb, bw2, bgap = 12, 9, 2.2

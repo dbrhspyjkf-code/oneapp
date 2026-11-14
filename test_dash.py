@@ -568,6 +568,104 @@ def test_music():
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def test_radio_out():
+    """电台输出: 设备过滤/缓存恢复 + O 键循环续播 + 失败回落 + 无序号键位."""
+    import shutil as _sh
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.RAOP_CACHE = os.path.join(tmp, "raop.json")
+    dash.RADIO_OUT_FILE = os.path.join(tmp, "radio_out.json")
+    try:
+        # 过滤: 只留音箱 (电视/电脑/手机剔除, 缺 ip/id 剔除)
+        assert dash._raop_ok({"ip": "1.2.3.4", "id": "x", "name": "起居室HOMEPOD"})
+        assert not dash._raop_ok({"ip": "1.2.3.4", "id": "x", "name": "客厅电视"})
+        assert not dash._raop_ok({"ip": "1.2.3.4", "id": "x", "name": "MacBook"})
+        assert not dash._raop_ok({"ip": "1.2.3.4", "id": "x", "name": "iPhone"})
+        assert not dash._raop_ok({"ip": "1.2.3.4", "name": "音箱"})   # 无 id
+        assert not dash._raop_ok({"id": "x", "name": "音箱"})         # 无 ip
+
+        # 缓存恢复: radio_out.json 按设备 id 对位 → radio_out=2; 未知 id → 0
+        devs = [{"ip": "1.2.3.4", "port": 7000, "name": "A音箱", "id": "ida"},
+                {"ip": "5.6.7.8", "port": 7000, "name": "B音箱", "id": "idb"}]
+        netmod.save_json_file(dash.RAOP_CACHE, devs)
+        netmod.save_json_file(dash.RADIO_OUT_FILE, "idb")
+        app = dash.App(FakeNet())
+        assert app.radio_out == 2, app.radio_out
+        assert app.radio_out_name() == "AirPlay·B音箱"
+        netmod.save_json_file(dash.RADIO_OUT_FILE, "gone")
+        assert dash.App(FakeNet()).radio_out == 0
+
+        # O 键: 本机→A→B→本机 循环 + 持久化; 播放中换输出 = 停旧+续播同台
+        netmod.save_json_file(dash.RADIO_OUT_FILE, "")
+        app3 = dash.App(FakeNet())
+        app3.page = 2
+        app3.raop = devs
+        played = []
+
+        def fake_raop(self, st, dev):
+            played.append((st["key"], dev["id"]))
+            self.playing_key = st["key"]
+            return True
+
+        real_raop = dash.App._radio_play_raop
+        dash.App._radio_play_raop = fake_raop
+        try:
+            st = app3.stations()[0]
+            app3.playing_key = st["key"]
+            app3.key(pygame.K_o)              # 本机→A (停旧 + 续播同台)
+            assert app3.radio_out == 1 and played[-1] == (st["key"], "ida")
+            assert app3.playing_key == st["key"]
+            assert netmod.load_json_file(dash.RADIO_OUT_FILE, None) == "ida"
+            app3.key(pygame.K_o)              # A→B
+            assert app3.radio_out == 2 and played[-1] == (st["key"], "idb")
+            app3.key(pygame.K_o)              # B→本机
+            assert app3.radio_out == 0
+            assert netmod.load_json_file(dash.RADIO_OUT_FILE, None) == ""
+            app3.playing_key = None
+            app3.draw(canvas)                 # 输出角标渲染不崩
+        finally:
+            dash.App._radio_play_raop = real_raop
+
+        # 空设备: O 键提示并保持本机 (顺带触发后台补扫)
+        app4 = dash.App(FakeNet())
+        app4.page = 2
+        app4.raop = []
+        app4.key(pygame.K_o)
+        assert app4.radio_out == 0 and app4.osd[0] == "无 AirPlay 设备"
+
+        # RAOP 起播失败 → 回落本机 (radio_out 归零, 本机 Popen 也败 → 播放失败)
+        class Boom:
+            def __init__(self, *a, **k):
+                raise OSError("no pyatv")
+
+        real_pop = dash.subprocess.Popen
+        dash.subprocess.Popen = Boom
+        try:
+            app5 = dash.App(FakeNet())
+            app5.page = 2
+            app5.raop = [devs[0]]
+            app5.radio_out = 1
+            app5.radio_play({"key": "k", "url": "http://x/stream", "name": "台"})
+            assert app5.radio_out == 0 and app5.playing_key is None
+        finally:
+            dash.subprocess.Popen = real_pop
+
+        # 数字键不再换台 (列表无序号, 1-8 直播已废): 按 3/5 不起播不选中
+        app6 = dash.App(FakeNet())
+        app6.page = 2
+        mark = (app6.rsel, app6.playing_key)
+        app6.key(pygame.K_3)
+        app6.key(pygame.K_5)
+        assert (app6.rsel, app6.playing_key) == mark
+        assert app6.page == 2                 # 5 不再被电台占用 → 跳页 (5=电台)
+        print("radio out OK (filter/restore/cycle/fallback/keys)")
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 def test_voice():
     """语音想法: 索引合并 / 本地播放 / 删除连文件 / 静音裁剪 (录音本体设备实测)."""
     import shutil as _sh
@@ -1009,6 +1107,7 @@ if __name__ == "__main__":
     test_render()
     test_tools()
     test_music()
+    test_radio_out()
     test_voice()
     test_ime()
     test_mail_parse()
