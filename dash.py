@@ -432,54 +432,76 @@ VOICES_DIR = os.path.join(STATE_DIR, "voices")   # 语音想法 (本地 wav)
 # 驱动默认态=错误路由, 底噪 RMS 2767, 配置后 258; 每次录音前重置, 默认会漂)
 REC_DEV = "plughw:CARD=ES8389Audio,DEV=0"
 REC_MAX = 60                             # 秒, 自动截断 (arecord -d 自己停)
-# 控制名必须用 amixer contents 的精确全名 — 短名靠 amixer 模糊匹配时灵时
-# 不灵且失败被 2>/dev/null 吞掉 (2026-11-14 "没声音"根因: Capture Volume 漂回
-# 50/-70dB → 全零). 录前 rec_mixer_apply 逐项回读取证, 不符即拒录并报哪项漂了.
+# 数值控制必须 cset numid 直写 — 本机 sset 对全名报 "Unable to find simple
+# control", 短名靠模糊匹配时灵时不灵 (2026-11-14 "没声音"根因: Capture
+# Volume 漂回 50/-70dB 全零, sset 160 静默失败). numid 由驱动固定枚举顺序,
+# ES8389 同内核版本稳定. 录前 rec_mixer_apply 回读取证, 不符即拒录报项.
+# 条目: ("num", numid, 值) | ("str", 控制名, 值) — 枚举/开关 sset 名字可靠.
 REC_MIXER = [
-    ["ADC MUX", "AMIC"],
-    ["PGAL Select", "DifferentialL"],
-    ["PGAR Select", "DifferentialR"],
-    ["ADCL Capture Volume", "160"],      # 0-255, ≈-15.5dB (50=-70dB=全零)
-    ["ADCR Capture Volume", "160"],
-    ["ADCL PGA Volume", "6"],            # 0-14, ×3dB 前级
-    ["ADCR PGA Volume", "6"],
-    ["ADC Mixer DACL ADCL Mixer", "off"],   # 防 DAC→ADC 回环
-    ["ADC Mixer DACR ADCR Mixer", "off"],
-    ["ADC2DAC Mixer Volume", "0"],
+    ("str", "ADC MUX", "AMIC"),
+    ("str", "PGAL Select", "DifferentialL"),
+    ("str", "PGAR Select", "DifferentialR"),
+    ("num", 2, 160),                     # ADCL Capture Volume 0-255
+    ("num", 3, 160),                     # ADCR Capture Volume
+    ("num", 4, 6),                       # ADCL PGA Volume 0-14 ×3dB
+    ("num", 5, 6),                       # ADCR PGA Volume
+    ("num", 19, 0),                      # ADC2DAC Mixer Volume
+    ("str", "ADC Mixer DACL ADCL Mixer", "off"),   # 防 DAC→ADC 回环
+    ("str", "ADC Mixer DACR ADCR Mixer", "off"),
 ]
 
 
 def rec_mixer_apply():
-    """应用录音 mixer 配置并逐项回读验证. → (ok, 失败项描述)."""
-    for k, v in REC_MIXER:
-        subprocess.run(["amixer", "-c", "1", "sset", k, v],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=4, check=False)
-    bad = []
-    for k, v in REC_MIXER:
-        cur = None
-        try:
-            out = subprocess.run(["amixer", "-c", "1", "sget", k],
-                                 capture_output=True, text=True,
-                                 timeout=4).stdout
-            for ln in out.splitlines():
-                ln = ln.strip()
-                if ln.startswith(": values="):
-                    cur = ln[len(": values="):].strip()
-                    break
-        except Exception:
-            cur = None
-        if v in ("on", "off"):
-            ok = cur == v
-        elif cur and cur[0].isdigit():
-            try:
-                ok = float(cur.split(",")[0]) >= float(v)
-            except ValueError:
-                ok = False
+    """应用录音 mixer 配置并逐项回读验证. → (ok, 失败项描述).
+
+    回读走 amixer contents 全表 (numid 与 name= 同行, enum 的 values= 是
+    索引需经 items 表映射成名字)."""
+    for kind, ident, v in REC_MIXER:
+        if kind == "num":
+            subprocess.run(["amixer", "-c", "1", "cset", "numid=%d" % ident,
+                            "--", str(v)],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=4, check=False)
         else:
-            ok = cur == v                # enum
+            subprocess.run(["amixer", "-c", "1", "sset", ident, v],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=4, check=False)
+    try:
+        out = subprocess.run(["amixer", "-c", "1", "contents"],
+                             capture_output=True, text=True,
+                             timeout=6).stdout
+    except Exception:
+        return False, "amixer contents 回读失败"
+    vals, enum_items, name, numid = {}, {}, None, None
+    for ln in out.splitlines():
+        s = ln.strip()
+        if "name='" in s:
+            name = s.split("name='", 1)[1].rsplit("'", 1)[0]
+            numid = None
+            if s.startswith("numid="):
+                numid = int(s.split("numid=", 1)[1].split(",")[0])
+        elif s.startswith("; Item #") and name and "'" in s:
+            enum_items.setdefault(name, []).append(s.split("'")[1])
+        elif s.startswith(": values=") and name:
+            v0 = s[len(": values="):].strip()
+            vals[name] = v0
+            if numid is not None:
+                vals[numid] = v0
+    bad = []
+    for kind, ident, v in REC_MIXER:
+        if kind == "num":
+            cur = vals.get(ident)
+            ok = cur is not None                 and cur.split(",")[0][:1].isdigit()                 and float(cur.split(",")[0]) >= float(v)
+            label = "numid%d" % ident
+        else:
+            cur = vals.get(ident)
+            if cur and ident in enum_items and cur.split(",")[0][:1].isdigit():
+                idx = int(cur.split(",")[0])
+                cur = enum_items[ident][idx]                     if idx < len(enum_items[ident]) else cur
+            ok = cur is not None and cur.split(",")[0] == v
+            label = ident
         if not ok:
-            bad.append("%s=%s≠%s" % (k, cur, v))
+            bad.append("%s=%s≠%s" % (label, cur, v))
     return (not bad), ";".join(bad)
 
 

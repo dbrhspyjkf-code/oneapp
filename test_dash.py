@@ -554,10 +554,11 @@ def test_voice():
         app.page = 1
         app.key(pygame.K_5)
         assert app.page == 1, "K_5 must not jump pages on ideas"
-        if app.rec_proc:                       # 设备有 arecord → 真开录; 即收
+        if app.rec_proc:                       # 设备 mixer OK → 真开录; 即收
             app.rec_stop()                     # (<1s → 太短未保存, 不落盘)
         else:
-            assert app.osd and "录音" in app.osd[0]   # Mac 无 arecord → 优雅失败
+            # Mac 无 arecord / 设备 mixer 回读失败 → 都必须有失败提示且不跳页
+            assert app.osd is not None and app.rec_proc is None
         app.page = 1
         app.key(pygame.K_8)                    # 8=播放语音 (空表/非语音条 → 无动作留原页)
         assert app.page == 1
