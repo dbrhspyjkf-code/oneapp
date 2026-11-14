@@ -435,8 +435,34 @@ MUSIC_SRCS = [("local", "本地曲库", ""), ("qq", "QQ 音乐", ""),
 MU_LAST_CACHE = os.path.join(STATE_DIR, "mu_last.json")  # 上次播放会话 (跨重启)
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
 CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
+_SENT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "data", "daily_sentences.csv")   # 内置 1440 句 (217KB)
+_SENTENCES = None
+
+
+def daily_sentence():
+    """内置每日一句 (替代 hitokoto 网络): 按日期序号轮换, 零加载等待,
+    与车机/网页版 (hermes _daily_sentence.py 同算法) 每天同一句."""
+    global _SENTENCES
+    if _SENTENCES is None:
+        import csv
+        rows = []
+        try:
+            with open(_SENT_CSV, encoding="utf-8") as f:
+                for row in csv.reader(f):
+                    if len(row) >= 2 and row[0].strip() and row[1].strip():
+                        if rows or row[0].strip().lower() != "en":
+                            rows.append((row[0].strip(), row[1].strip()))
+        except Exception:
+            rows = []
+        _SENTENCES = rows
+    if not _SENTENCES:
+        return {"ok": True, "text": "机不可失,时不再来。", "from": "旧唐书"}
+    import datetime
+    en, cn = _SENTENCES[datetime.date.today().toordinal() % len(_SENTENCES)]
+    return {"ok": True, "text": cn, "from": en}
 # 主页卡缓存标签: 进 app 秒显上次数据, 后台刷新后再覆盖 (用户要求免"获取中")
-HOME_CACHE_TAGS = ("wx", "hitokoto", "news", "ipo")
+HOME_CACHE_TAGS = ("wx", "news", "ipo")   # hitokoto 已内置本地文件
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")        # 自选股 (本地)
 # 自选股种子 (qt.gtimg.cn 代码; watch.json 存在则整体覆盖)
 WATCH_SEED = {"items": [
@@ -1088,12 +1114,13 @@ class App:
         return hex2rgb(THEMES[self.theme_idx]["cards"][i])
 
     def _load_home_cache(self):
-        """主页卡数据磁盘缓存 → self.data (天气/每日一句/新闻/新股)."""
+        """主页卡数据磁盘缓存 → self.data (天气/新闻/新股); 每日一句内置."""
         for tag in HOME_CACHE_TAGS:
             j = netmod.load_json_file(os.path.join(CACHE_DIR, tag + ".json"),
                                       None)
             if j is not None:
                 self.data[tag] = j
+        self.data["hitokoto"] = daily_sentence()
 
     # ── 网络结果 ──
     def on_net(self, kind, a, b):
@@ -1137,7 +1164,6 @@ class App:
         self.mu_tick()                        # 音乐连播: 任意页/离线都要走 (本地曲库)
         if self.net.mode == "online":
             if self.page == 0:
-                self.net.job("hitokoto", fetchers.hitokoto_fetch, 3600)
                 self.net.job("news", news_rss.news_fetch_all, 600)   # 主页新闻卡
                 self.net.job("wxloc", fetchers.wx_locate, 1800)      # IP 归属地 30min 重探
                 self.net.pub(wx_url(self.wx_loc), "wx", 600, direct=True)

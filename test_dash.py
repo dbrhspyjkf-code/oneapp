@@ -292,17 +292,27 @@ def test_render():
     app.key(pygame.K_RETURN)
     assert [i["code"] for i in app.watch["items"]] == ["sh600519"]
     app.draw(canvas)                              # 顶部跑马灯渲染
+    # 每日一句: 内置 CSV 本地轮换 (与 hermes 同算法, 车机/ONEAPP 同句)
+    ds = dash.daily_sentence()
+    assert ds["ok"] and ds["text"] and ds["from"], ds
+    assert dash.daily_sentence() == ds              # 同日稳定
+    app2 = dash.App(FakeNet())
+    assert app2.data.get("hitokoto", {}).get("text") == ds["text"]
+    app2.on_net("mode", "online", None)
+    assert app2.data.get("hitokoto", {}).get("text") == ds["text"]
     # 主页数据磁盘缓存: 收到即落盘, 新 App 实例 (模拟重启) 秒显
     # (CACHE_DIR 指 tmp, 防污染真实缓存)
     import json as _j
     dash.CACHE_DIR = os.path.join(tmp, "cache")
-    cachef = os.path.join(dash.CACHE_DIR, "hitokoto.json")
-    app.on_net("data", "hitokoto", {"ok": True, "text": "缓存测试", "from": "t"})
-    assert _j.load(open(cachef))["text"] == "缓存测试"
+    cachef = os.path.join(dash.CACHE_DIR, "wx.json")
+    app.on_net("data", "wx", {"current_weather": {"temperature": 24.6}})
+    assert _j.load(open(cachef))["current_weather"]["temperature"] == 24.6
     app2 = dash.App(FakeNet())
-    assert app2.data.get("hitokoto", {}).get("text") == "缓存测试"
+    assert app2.data.get("wx", {}).get("current_weather", {})\
+        .get("temperature") == 24.6
     app2.on_net("mode", "online", None)            # 模式切换也不丢
-    assert app2.data.get("hitokoto", {}).get("text") == "缓存测试"
+    assert app2.data.get("wx", {}).get("current_weather", {})\
+        .get("temperature") == 24.6
     # 快捷键 4-8 → 页 1-5 (主页触发; 新闻/电台页数字为功能键)
     pg = pygame
     for key, page in [(pg.K_4, 1), (pg.K_5, 2), (pg.K_6, 3),
