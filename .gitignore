@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+shots/
+screenshots/
+research/
+*.bmp
+*.raw
+dist_deb/
+pkg/
+.DS_Store
+._*

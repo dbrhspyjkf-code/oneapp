@@ -1,0 +1,3880 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ONEAPP — 工具箱 for M5Stack CardputerZero (320×170).
+
+pygame 直写 /dev/fb_lcd + 裸 evdev 键盘 (与 sudokuzero 同款基建);
+零本地服务依赖, 全部数据源为公网直连:
+  天气 Open-Meteo · 行情 腾讯 qt.gtimg.cn · 新闻 RSS×7 (news_rss.py)
+  汇率 open.er-api.com · 双色球 中彩官网 cwl.gov.cn · 新股 东方财富
+  电台 内置站台直连流 · 音乐 QQ/网易云 直连 (musrc.py) + 本地曲库
+  歌词 LRCLIB + 网易兜底 (musrc.lrc_fetch)
+
+键位:  1-5 切页   Z/C/F/X(丝印←→↑↓) 翻页   t 换主题(仅主页)
+       Fn+S/Fn+D 音量±  Fn+A 静音        主页长按 Esc 1s 退出
+"""
+
+import glob
+import io
+import json
+import mmap
+import os
+import math
+import random
+import re
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import threading
+import sys
+import time
+
+import pygame
+
+import fetchers
+import ime
+import lunar
+import musrc
+import net as netmod
+import news_rss
+
+W, H = 320, 170
+
+
+def _ffplay_pre():
+    """Linux: ffplay 随父进程死 (PR_SET_PDEATHSIG/SIGKILL), 防孤儿音频."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 9)
+    except Exception:
+        pass
+
+
+_FFPLAY_KW = ({"preexec_fn": _ffplay_pre}
+              if sys.platform.startswith("linux") else {})
+_AUDIO_ENV = dict(os.environ,
+                  XDG_RUNTIME_DIR=os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"))
+
+
+def hex2rgb(s):
+    return (int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16))
+
+
+_FF_RE_EXT = None
+
+
+def _ff_reconnect_ext():
+    """-reconnect_on_network_error 需 ffmpeg ≥4.4 (版本探测一次缓存; 老版
+    给未知旗标会直接拒启, 不可盲加)."""
+    global _FF_RE_EXT
+    if _FF_RE_EXT is None:
+        try:
+            out = subprocess.run(["ffmpeg", "-version"], capture_output=True,
+                                 timeout=5).stdout.decode(errors="replace")
+            m = re.search(r"ffmpeg version (\d+)\.(\d+)", out)
+            _FF_RE_EXT = bool(m) and (int(m.group(1)),
+                                      int(m.group(2))) >= (4, 4)
+        except Exception:
+            _FF_RE_EXT = False
+    return _FF_RE_EXT
+
+
+def _ff_slow_net_flags():
+    """慢网/热点断流自愈旗标: 15s 读写超时防无限挂 + 网络错自动重连."""
+    flags = ["-rw_timeout", "15000000"]
+    if _ff_reconnect_ext():
+        flags += ["-reconnect_on_network_error", "1"]
+    return flags
+
+
+DARK_TXT = {"hi": "#F2F7F3", "soft": "#C7D6CB", "dim": "#7E9486"}
+DARK_SEM = {"ok": "#34D399", "warn": "#FBBF24", "danger": "#EF4444"}
+THEMES = [
+    {"name": "松绿", "hero": "#204234", "accent": "#34D399", "press": "#2F8066",
+     "cards": ["#1B362C", "#173024", "#13291F", "#0F221A"], "border": "#2C4433",
+     "track": "#0A1811", "page": "#000000", **DARK_TXT, **DARK_SEM},
+    {"name": "暖橙", "hero": "#6E3A16", "accent": "#F5A263", "press": "#B3661F",
+     "cards": ["#3A2412", "#30200F", "#271A0C", "#1D1309"], "border": "#5C3A1C",
+     "track": "#160D04", "page": "#000000", **DARK_TXT, **DARK_SEM},
+    {"name": "海蓝", "hero": "#1C4258", "accent": "#4FA3FF", "press": "#2F6FA8",
+     "cards": ["#16334A", "#122B40", "#0E2233", "#0A1A28"], "border": "#2A4A6A",
+     "track": "#081522", "page": "#000000", **DARK_TXT, **DARK_SEM},
+    {"name": "岩紫", "hero": "#3A2C55", "accent": "#B08CFF", "press": "#6A4FA0",
+     "cards": ["#2B213F", "#251C37", "#1E162C", "#171022"], "border": "#453663",
+     "track": "#120D1E", "page": "#000000", **DARK_TXT, **DARK_SEM},
+]
+
+STATE_DIR = os.path.expanduser("~/.local/share/oneapp")
+THEME_FILE = os.path.join(STATE_DIR, "theme.json")
+
+# 天气: 默认坐标 (Open-Meteo 公网直连)
+WX_HOME = {"lat": 22.5629, "lon": 114.1207, "city": "深圳"}
+WX_URL = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f"
+          "&longitude=%.4f&current_weather=true" % (WX_HOME["lat"], WX_HOME["lon"]))
+
+FONT_CANDIDATES = [
+    "/usr/share/APPLaunch/share/font/AlibabaPuHuiTi-3-55-Regular.ttf",   # 设备
+    "/System/Library/Fonts/PingFang.ttc",                                # Mac 模拟
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "font.ttf"),
+]
+
+WEEK_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+# ── 字体 ────────────────────────────────────────────────────────────────────
+_ft = None
+def load_font():
+    global _ft
+    if _ft is not None:
+        return _ft
+    try:
+        from pygame import freetype as ft
+    except Exception:
+        from pygame import _freetype as ft
+    ft.init()
+    for p in FONT_CANDIDATES:
+        try:
+            _ft = ft.Font(p)
+            _ft.origin = False
+            return _ft
+        except Exception:
+            continue
+    raise RuntimeError("no CJK font found: %s" % FONT_CANDIDATES)
+
+
+_cache = {}
+def _render(s, size, color):
+    key = (s, size, color)
+    r = _cache.get(key)
+    if r is None:
+        if len(_cache) > 600:               # 动态文本防膨胀
+            _cache.clear()
+        f = load_font()
+        f.size = size
+        r = f.render(s, fgcolor=color)[0]
+        _cache[key] = r
+    return r
+
+
+def textw(s, size):
+    return _render(str(s), size, (255, 255, 255)).get_width()
+
+
+def texth(s, size):
+    return _render(str(s), size, (255, 255, 255)).get_height()
+
+
+_glyph_vbox = {}                          # (s, size) → 墨迹上下沿 (行框内)
+def glyph_vbox(s, size):
+    """渲染 s 取 alpha 包围盒的上下沿 — 行框垂直居中用 (字面框≠墨迹框, 同 _ball_glyph_cy)."""
+    key = (s, size)
+    b = _glyph_vbox.get(key)
+    if b is None:
+        r = _render(s, size, (255, 255, 255))
+        w, h = r.get_size()
+        ys = [y for y in range(h) for x in range(w)
+              if r.get_at((x, y))[3] > 40]
+        b = (min(ys), max(ys)) if ys else (0, h - 1)
+        _glyph_vbox[key] = b
+    return b
+
+
+def text(surf, s, size, color, xy, right=False):
+    r = _render(str(s), size, color)
+    x, y = xy
+    if right:
+        x -= r.get_width()
+    surf.blit(r, (x, y))
+
+
+def textc(surf, s, size, color, cx, y):
+    r = _render(str(s), size, color)
+    surf.blit(r, (cx - r.get_width() // 2, y))
+
+
+_ball_glyph = {}                          # fs → 数字字形在行框内的垂直中心
+def _ball_glyph_cy(fs):
+    """渲染 "05" 扫 alpha 包围盒求字形垂直中心 (球内数字居中用), 按字号缓存."""
+    cy = _ball_glyph.get(fs)
+    if cy is None:
+        r = _render("05", fs, (255, 255, 255))
+        w, h = r.get_size()
+        ys = [y for y in range(h) for x in range(w)
+              if r.get_at((x, y))[3] > 40]
+        cy = (min(ys) + max(ys)) / 2 if ys else h / 2
+        _ball_glyph[fs] = cy
+    return cy
+
+
+_clip_cache = {}
+def clip_text(s, size, maxw):
+    """截断到 maxw 像素宽, 超出加省略号.
+    邮件 preview 是 800 字符全文, 逐字符回退测宽是 O(n²) 渲染
+    (每帧上千次 render → 主循环冻结 CPU 110%), 改预截断+二分, 结果按参数缓存."""
+    s0 = str(s)
+    key = (s0, size, maxw)
+    hit = _clip_cache.get(key)
+    if hit is not None:
+        return hit
+    if textw(s0, size) <= maxw:
+        out = s0
+    else:
+        cap = int(maxw * 2) + 4             # 预截断上界按最窄字形 ≥0.5px 算
+        if len(s0) > cap:                   # (CJK=size px, 拉丁约半宽, cap 截太紧会少留字)
+            s0 = s0[:cap]
+        lo, hi = 0, len(s0)
+        while lo < hi:                      # 最长能放下 "…" 的前缀
+            mid = (lo + hi + 1) // 2
+            if textw(s0[:mid] + "…", size) <= maxw:
+                lo = mid
+            else:
+                hi = mid - 1
+        out = s0[:lo] + "…"
+    if len(_clip_cache) > 2000:
+        _clip_cache.clear()
+    _clip_cache[key] = out
+    return out
+
+
+_wrap_cache = {}
+def _wrap_lines_impl(s_, size, maxw, n):
+    """贪心折行: 每行二分找最长可放前缀 (输出与旧逐字符实现一致)."""
+    s = str(s_)
+    all_lines = []
+    while s:
+        if textw(s, size) <= maxw:
+            all_lines.append(s)
+            break
+        lo, hi = 1, len(s)
+        while lo < hi:                      # 最大 k 使 s[:k] 放得下 (k≥1, 超宽单字独占一行)
+            mid = (lo + hi + 1) // 2
+            if textw(s[:mid], size) <= maxw:
+                lo = mid
+            else:
+                hi = mid - 1
+        all_lines.append(s[:lo])
+        s = s[lo:]
+    if len(all_lines) <= n:
+        return all_lines
+    out = all_lines[:n - 1]
+    rest = "".join(all_lines[n - 1:])
+    out.append(clip_text(rest, size, maxw))
+    return out
+
+
+# ── 行情: 腾讯 qt 文本解析 / 指数表 (与 car-dash 同源) ──────────────────────
+IDX_LIST = [
+    ("上证指数", "sh000001"), ("深证成指", "sz399001"), ("创业板指", "sz399006"),
+    ("科创综指", "sh000688"), ("沪深300", "sh000300"), ("恒生指数", "r_hkHSI"),
+    ("道琼斯", "usDJI"), ("纳斯达克", "usIXIC"),
+]
+QT_BASE = "https://qt.gtimg.cn/q="
+IFZQ_BASE = "https://web.ifzq.gtimg.cn/appstock/app/"
+HF_CODES = ["hf_XAU", "hf_XAG", "hf_AHD", "hf_CAD",
+            "hf_NID", "hf_SND", "hf_CL"]
+CMD_LIST = [("比特币", None), ("伦敦金", "hf_XAU"), ("伦敦银", "hf_XAG"),
+            ("伦铝", "hf_AHD"), ("伦铜", "hf_CAD"), ("伦镍", "hf_NID"),
+            ("伦锡", "hf_SND"), ("纽约原油", "hf_CL")]
+GATE_URL = "https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BTC_USDT"
+
+
+def qt_code(code):
+    return ("sh" if str(code)[0] == "6" else "sz") + str(code)
+
+
+def parse_qt_text(txt):
+    """v_code="f0~f1~..." → {code: [fields]}, GBK 已在 net 层解码."""
+    import re as _re
+    out = {}
+    for m in _re.finditer(r'v_([a-zA-Z0-9_]+)="([^"]*)"', txt or ""):
+        out[m.group(1)] = m.group(2).split("~")
+    return out
+
+
+def parse_hf_text(txt):
+    """外盘期货 v_hf_XAU="价,涨跌%,..." → {code: [fields]} (逗号分隔)."""
+    import re as _re
+    out = {}
+    for m in _re.finditer(r'v_(hf_[A-Za-z0-9_]+)="([^"]*)"', txt or ""):
+        out[m.group(1)] = m.group(2).split(",")
+    return out
+
+
+def qt_ok(f):
+    try:
+        return f is not None and float(f[3]) > 0 and float(f[4]) > 0
+    except (ValueError, IndexError):
+        return False
+
+
+def qt_num(f, i):
+    try:
+        return float(f[i])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def parse_minute(j, code):
+    """ifzq 分时 → 价格序列 (港美指无分时返回 [])."""
+    try:
+        node = j["data"][code]["data"]
+        rows = node.get("data") or []
+        out = []
+        for r in rows:
+            p = str(r).split(" ")
+            if len(p) > 1:
+                try:
+                    out.append(float(p[1]))
+                except ValueError:
+                    pass
+        return out
+    except (KeyError, TypeError, AttributeError):
+        return []
+
+
+def parse_day(j, code):
+    """ifzq 日K(qfq) → [(date, open, close, high, low), ...]."""
+    try:
+        node = j["data"][code]
+        arr = node.get("qfqday") or node.get("day") or []
+        out = []
+        for r in arr:
+            if isinstance(r, list) and len(r) >= 5:
+                try:
+                    out.append((r[0], float(r[1]), float(r[2]),
+                                float(r[3]), float(r[4])))
+                except ValueError:
+                    pass
+        return out
+    except (KeyError, TypeError, AttributeError):
+        return []
+
+
+# ── 电池 (bq27220 电量计, 30s 缓存) ─────────────────────────────────────────
+_BATT_DIR = "/sys/class/power_supply/bq27220-0"
+_batt_cache = (0.0, (None, ""))
+
+
+def battery_state():
+    """→ (pct 0-100|None, status)."""
+    global _batt_cache
+    import time as _t
+    now = _t.monotonic()
+    if now - _batt_cache[0] < 30:
+        return _batt_cache[1]
+    pct, st = None, ""
+    try:
+        pct = int(open(_BATT_DIR + "/capacity").read().strip())
+        st = open(_BATT_DIR + "/status").read().strip()
+    except Exception:
+        pass
+    _batt_cache = (now, (pct, st))
+    return pct, st
+
+
+# ── 天气 WMO code → 中文 (与 car-dash wxCodeZh 一致) ────────────────────────
+def wx_code_zh(c):
+    m = {0: "晴", 1: "晴", 2: "多云", 3: "阴", 45: "雾", 48: "雾",
+         51: "小雨", 53: "小雨", 55: "小雨", 56: "冻雨", 57: "冻雨",
+         61: "小雨", 63: "中雨", 65: "大雨", 66: "冻雨", 67: "冻雨",
+         71: "小雪", 73: "中雪", 75: "大雪", 77: "雪粒",
+         80: "阵雨", 81: "阵雨", 82: "强阵雨", 85: "阵雪", 86: "阵雪",
+         95: "雷阵雨", 96: "雷雨", 99: "雷雨"}
+    return m.get(c, "")
+
+
+# ── 应用 ────────────────────────────────────────────────────────────────────
+PAGES = [("主页", ""), ("想法", ""), ("电台", ""), ("行情", ""), ("新闻", ""), ("工具", "")]
+MODE_LABEL = {"online": ("在线", "ok"), "offline": ("离线", "danger"),
+              "probing": ("…", "dim")}
+NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派"),
+                ("solidot", "Solidot"), ("ifanr", "爱范儿"),
+                ("leiphone", "雷峰网"), ("wscn", "华尔街见闻")]
+
+# ── 工具页: app 卡片入口 (卡片=名字+快捷键, 5×2 网格, Z/C/F/X(←→↑↓) 移动
+#    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
+TOOL_APPS = [("fx", "汇率"), ("unit", "单位换算"),
+             ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
+             ("music", "音乐")]
+TOOL_GRID = 5                            # 每行卡片数
+
+# 音乐 app: 本地曲库 (mp3/flac/wav 直读) + QQ/网易云直连 provider (musrc.py,
+# 扫码绑定后走同一播放页), 输出仅本机 (商店版无 AirPlay/音箱遥控)。
+MUSIC_DIR = os.path.expanduser("~/music")
+MUSIC_EXTS = (".mp3", ".flac", ".wav")
+MUSIC_SRCS = [("local", "本地曲库", ""), ("qq", "QQ 音乐", ""),
+              ("ne", "网易云", "")]
+MU_LAST_CACHE = os.path.join(STATE_DIR, "mu_last.json")  # 上次播放会话 (跨重启)
+IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
+WATCH_FILE = os.path.join(STATE_DIR, "watch.json")        # 自选股 (本地)
+# 自选股种子 (qt.gtimg.cn 代码; watch.json 存在则整体覆盖)
+WATCH_SEED = {"items": [
+    {"code": "sh600519", "name": "贵州茅台"},
+    {"code": "sz000001", "name": "平安银行"},
+    {"code": "sh601318", "name": "中国平安"},
+    {"code": "sz300750", "name": "宁德时代"},
+    {"code": "sh688981", "name": "中芯国际"},
+]}
+
+# 换算表 (与 car-dash 换算 / tab5 app_settings 同表)
+FX_CODES = ["USD", "CNY", "EUR", "JPY", "GBP", "HKD", "KRW", "AUD"]
+FX_NAMES = {"USD": "美元", "CNY": "人民币", "EUR": "欧元", "JPY": "日元",
+            "GBP": "英镑", "HKD": "港元", "KRW": "韩元", "AUD": "澳元"}
+FX_FALLBACK = {"USD": 1.0, "CNY": 7.25, "EUR": 0.92, "JPY": 157.0,
+               "GBP": 0.79, "HKD": 7.81, "KRW": 1380.0, "AUD": 1.51}
+UCATS = [
+    ("长度", [("mm", 0.001), ("cm", 0.01), ("m", 1), ("km", 1000),
+             ("in", 0.0254), ("ft", 0.3048), ("yd", 0.9144), ("mi", 1609.344)]),
+    ("重量", [("mg", 0.001), ("g", 1), ("kg", 1000), ("t", 1e6),
+             ("oz", 28.3495), ("lb", 453.592)]),
+    ("温度", [("°C", 0), ("°F", 1), ("K", 2)]),
+    ("面积", [("mm²", 1e-6), ("cm²", 1e-4), ("m²", 1), ("km²", 1e6),
+             ("ha", 1e4), ("亩", 666.6667), ("acre", 4046.86), ("ft²", 0.092903)]),
+    ("体积", [("mL", 0.001), ("L", 1), ("m³", 1000), ("gal", 3.78541),
+             ("cup", 0.236588)]),
+    ("速度", [("m/s", 1), ("km/h", 0.277778), ("mph", 0.44704), ("kn", 0.514444)]),
+    ("数据", [("B", 1), ("KB", 1024), ("MB", 1048576), ("GB", 1073741824),
+             ("TB", 1099511627776)]),
+]
+TM_PRESETS = [1, 3, 5, 10, 30, 60]       # 计时器预设 (分钟, 数字键 1-6)
+
+
+def fmt_num(v):
+    """结果格式化: 整数去尾零, 其余 %.6g, 千位分隔."""
+    if abs(v) >= 1e12 or (abs(v) < 1e-6 and v != 0):
+        return "%.4g" % v
+    if v == int(v) and abs(v) < 1e10:
+        return "{:,d}".format(int(v))
+    return "{:,}".format(float("%.6g" % v))
+
+
+def mmss(t):
+    """秒 → m:ss (播放器进度标签)."""
+    t = max(0, int(t))
+    return "%d:%02d" % (t // 60, t % 60)
+
+
+def temp_convert(v, frm, to):
+    """温度 → °C 中转 (UCATS 温度表无系数)."""
+    c = v if frm == "°C" else ((v - 32) * 5 / 9 if frm == "°F" else v - 273.15)
+    return c if to == "°C" else (c * 9 / 5 + 32 if to == "°F" else c + 273.15)
+
+
+def mu_parse_name(path):
+    """文件路径 → (artist, title, ext)。'歌手 - 标题' 惯例; QQ 音乐下载的
+    '歌手-标题' (无空格) 也识别 — 首段 ≤30 字才当歌手, 防劈开带连字符曲名."""
+    name = os.path.basename(path)
+    stem, ext = os.path.splitext(name)
+    a, t = "", stem
+    if " - " in stem:
+        a, t = stem.split(" - ", 1)
+    elif "-" in stem:
+        a, t = stem.split("-", 1)
+        if not a.strip() or not t.strip() or len(a.strip()) > 30:
+            a, t = "", stem
+    return (a.strip(), t.strip(), ext.lower())
+
+
+def scan_music_dir(root):
+    """递归扫曲库 → [{path, artist, title, ext}] (按相对路径排序, ≤500 首).
+    展示名不带目录层级, 同名靠 artist/title 区分; 空/无权限目录静默返回 []."""
+    out = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for fn in sorted(filenames):
+                if fn.lower().endswith(MUSIC_EXTS):
+                    artist, title, ext = mu_parse_name(fn)
+                    out.append({"path": os.path.join(dirpath, fn),
+                                "artist": artist, "title": title, "ext": ext})
+                    if len(out) >= 500:
+                        return out
+    except Exception:
+        pass
+    return out
+
+
+def mu_probe_dur(path):
+    """ffprobe 时长 (秒); 无 ffprobe/解析失败 → 0 (进度条整条隐藏, tab5 规则)."""
+    if shutil.which("ffprobe") is None:
+        return 0.0
+    try:
+        r = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries",
+                            "format=duration", "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=12)
+        return float(r.stdout.strip().splitlines()[0])
+    except Exception:
+        return 0.0
+
+
+
+
+def mu_extract_cover(path):
+    """内嵌封面字节 (mp3 ID3v2 APIC / flac PICTURE 块); wav/无图 → None.
+    只读头部区域不解整文件; 解出的 jpg/png 字节交 jpg_surf (设备 SDL_image
+    可解; Mac 模拟无 PNG 支持会静默回 None → 无封面占位)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+            if head[:3] == b"ID3":                     # mp3 ID3v2
+                ver = head[3]
+                if ver == 4:                           # v2.4 帧长/标签长 syncsafe
+                    size = ((head[6] & 0x7F) << 21) | ((head[7] & 0x7F) << 14) \
+                        | ((head[8] & 0x7F) << 7) | (head[9] & 0x7F)
+                else:                                  # v2.2/2.3 普通 int32
+                    size = int.from_bytes(head[6:10], "big")
+                size = min(size, 2 * 1024 * 1024)
+                body = f.read(size)
+                i = 0
+                while i + 10 <= len(body):
+                    fid = body[i:i + 4]
+                    if not fid.strip(b"\x00 "):        # padding → 到头
+                        break
+                    if ver == 4:
+                        fsz = ((body[i + 4] & 0x7F) << 21) \
+                            | ((body[i + 5] & 0x7F) << 14) \
+                            | ((body[i + 6] & 0x7F) << 7) | (body[i + 7] & 0x7F)
+                    else:
+                        fsz = int.from_bytes(body[i + 4:i + 8], "big")
+                    if fid == b"APIC" and 14 <= fsz <= len(body) - i - 10:
+                        d = body[i + 10:i + 10 + fsz]
+                        enc, d = d[0], d[1:]
+                        z = d.find(b"\x00")            # mime
+                        mime = d[:z].decode("ascii", "ignore").lower()
+                        d = d[z + 1:][1:]              # 跳 picture type
+                        if enc in (1, 2):              # utf-16 描述双零结尾
+                            d = d[d.find(b"\x00\x00") + 2:]
+                        else:
+                            d = d[d.find(b"\x00") + 1:]
+                        if ("jpg" in mime or "jpeg" in mime or "png" in mime
+                                or "bmp" in mime) and len(d) > 100:
+                            return d
+                    i += 10 + fsz
+                return None
+            if head[:4] == b"fLaC":                    # flac 元数据块链
+                f.seek(4)
+                while True:
+                    bh = f.read(4)
+                    if len(bh) < 4:
+                        return None
+                    typ, last = bh[0] & 0x7F, bh[0] & 0x80
+                    bsz = int.from_bytes(bh[1:4], "big")
+                    if typ == 6:                       # PICTURE
+                        d = f.read(min(bsz, 2 * 1024 * 1024))
+                        ml = int.from_bytes(d[4:8], "big")
+                        mime = d[8:8 + ml].decode("ascii", "ignore").lower()
+                        dl = int.from_bytes(d[8 + ml:12 + ml], "big")
+                        # w/h/depth/colors 16B + data_len 4B
+                        base = 12 + ml + dl + 16
+                        dln = int.from_bytes(d[base:base + 4], "big")
+                        img = d[base + 4:base + 4 + dln]
+                        if ("jpg" in mime or "jpeg" in mime
+                                or "png" in mime) and len(img) > 50:
+                            return img
+                        return None
+                    f.seek(bsz, 1)                     # 跳过其余块
+                    if last:
+                        return None
+    except Exception:
+        return None
+    return None
+
+
+class MusicLvl:
+    """本地音乐电平源 → vu_tick 三带输入 (电台 lvs 同标度 0..100).
+    本机 = parec 监听默认 sink monitor (ffplay→pulse 混音后波形);
+    AirPlay = ffmpeg FIFO wav 旁路 (AirPlay 不走本地 pulse, monitor 采不到).
+    三带 = 两条单极 IIR 分频 (低/中/高), 逐块 RMS + EMA 平滑."""
+
+    def __init__(self):
+        self.lvl = (0.0, 0.0, 0.0)
+        self._p = None                         # parec 子进程
+        self._fp = None                        # 读端 (fifo 模式 fdopen)
+        self._fifo = None                      # 旁路 fifo 路径 (stop 时清理)
+        self._th = None
+
+    def start_parec(self):
+        self.stop()
+        if shutil.which("parec") is None or shutil.which("pactl") is None:
+            return
+        try:
+            info = subprocess.run(["pactl", "info"], capture_output=True,
+                                  text=True, timeout=3).stdout
+            sn = [l.split(":", 1)[1].strip() for l in info.splitlines()
+                  if l.startswith("Default Sink")]
+            if not sn:
+                return
+            self._p = subprocess.Popen(
+                ["parec", "-d", sn[0] + ".monitor", "--raw",
+                 "--format=s16le", "--rate=8000", "--channels=1",
+                 "--latency-msec=40"],     # 小预缓冲: VU 贴拍 (默认慢半拍)
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._th = threading.Thread(target=self._run,
+                                        args=(self._p.stdout, 1, 1024, 0.35),
+                                        daemon=True)   # 1024B=64ms 窗 (原 256ms)
+            self._th.start()
+        except Exception:
+            self.stop()
+
+    def start_fifo(self, path):
+        """AirPlay: 读 ffmpeg FIFO 旁路 wav (44.1k s16 立体声, 隔 12 取样).
+        FIFO 替代 fd3 直传 (pass_fds+preexec 的 fd 号跨版本不定, 2026-11-14
+        实测 fd3 没落进 ffmpeg → wav muxer EBADF 秒死 = 无声根因). 读端
+        O_NONBLOCK 打开避免与 ffmpeg 的写端 open 互等."""
+        self.stop()
+        self._fifo = path
+
+        def _open():
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                head = b""
+                for _ in range(150):      # 等 ffmpeg 开写端 (nonblock 无 writer
+                    head = os.read(fd, 4096)   #   时 read 立刻 EOF, 须轮询)
+                    if head:
+                        break
+                    time.sleep(0.2)
+                if not head:
+                    os.close(fd)
+                    return
+                os.set_blocking(fd, True)  # 转阻塞: BufferedReader 不吃 EAGAIN
+                fp = os.fdopen(fd, "rb")
+                self._fp = fp
+                self._run(fp, 12, head=head)
+            except Exception:
+                pass
+
+        self._th = threading.Thread(target=_open, daemon=True)
+        self._th.start()
+
+    def _run(self, fp, step, chunk=4096, ema=0.25, head=b""):
+        """chunk=读窗字节 (parec 1024=64ms / fifo 4096=23ms@44.1k); ema=块间平滑."""
+        try:
+            if step > 1:                       # wav 管道: 跳 RIFF 头找 data
+                if not head:
+                    head = fp.read(4096)
+                j = head.find(b"data")
+                if j < 0:
+                    return
+            s0 = s1 = 0.0
+            lv = [0.0, 0.0, 0.0]
+            while True:
+                buf = fp.read(chunk)
+                if not buf:
+                    break
+                n = len(buf) // 2
+                if n < 16:
+                    continue
+                a = struct.unpack("<%dh" % n, buf[:n * 2])
+                acc = [0.0, 0.0, 0.0]
+                cnt = 0
+                for i in range(0, n - 1, step):  # fd3 立体声取偶=左声道
+                    v = a[i] / 32768.0
+                    s0 += 0.28 * (v - s0)        # 浅低通
+                    s1 += 0.06 * (v - s1)        # 深低通
+                    lo, mid, hi = s1, s0 - s1, v - s0
+                    acc[0] += lo * lo
+                    acc[1] += mid * mid
+                    acc[2] += hi * hi
+                    cnt += 1
+                if not cnt:
+                    continue
+                lv = [min(100.0, lv[k] + ((acc[k] / cnt) ** 0.5 * 400.0
+                                          - lv[k]) * ema)
+                      for k in range(3)]
+                self.lvl = tuple(lv)
+        except Exception:
+            pass
+
+    def stop(self):
+        p, self._p = self._p, None
+        if p:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        fp, self._fp = self._fp, None
+        if fp:
+            try:
+                fp.close()                     # 读端关闭 → 线程 read 抛错退出
+            except Exception:
+                pass
+        fifo, self._fifo = self._fifo, None
+        if fifo:
+            try:
+                os.unlink(fifo)                # 旁路 fifo 用完即清
+            except Exception:
+                pass
+        self._th = None
+        self.lvl = (0.0, 0.0, 0.0)
+
+
+def jpg_surf(data, w=0, h=0):
+    """JPEG 字节 → Surface (设备 SDL_image 2.8.5 实测可解; 失败回 None).
+    注意 smoothscale 只吃 24/32 位, 原样加载缩放, 位深交给 blit 时转换."""
+    try:
+        s = pygame.image.load(io.BytesIO(data))
+        if w and h:
+            s = pygame.transform.smoothscale(s, (w, h))
+        return s
+    except Exception:
+        return None
+
+
+def gen_beep(path="/tmp/dz_beep.wav"):
+    """计时结束提示音: 3 声 880Hz 短蜂 (纯 Python 生成, ffplay 播)."""
+    try:
+        import wave
+        sr = 16000
+        frames = bytearray()
+        for k in range(3):
+            for i in range(int(sr * 0.30)):
+                env = min(1.0, i / (sr * 0.01)) * max(0.0, 1 - i / (sr * 0.28))
+                v = int(22000 * env * math.sin(2 * math.pi * 880 * i / sr))
+                frames += struct.pack("<hh", v, v)
+            for i in range(int(sr * 0.15)):
+                frames += struct.pack("<hh", 0, 0)
+        w = wave.open(path, "wb")
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(bytes(frames))
+        w.close()
+        return True
+    except Exception:
+        return False
+
+
+class App:
+    def __init__(self, netins):
+        self.net = netins
+        self.page = 0
+        self.data = {}                        # tag → json
+        self.theme_idx = 0
+        try:
+            self.theme_idx = json.load(open(THEME_FILE)).get("idx", 0) % len(THEMES)
+        except Exception:
+            pass
+        self.osd = None                       # (label, until)
+        self.dialog = None                    # ("exit",) | ("del", item)
+        # 想法 (本地 json) / 自选股 (本地 json, 种子兜底)
+        self.ideas = netmod.load_json_file(IDEAS_FILE, {"texts": []})
+        self.watch = netmod.load_json_file(WATCH_FILE, WATCH_SEED)
+        # 想法页状态
+        self.in_input = False                 # 输入模式
+        self.buf = ""
+        self.sel = 0
+        self.scroll = 0
+        self.player = None                    # ffplay 子进程 (电台)
+        # 电台页状态
+        self.radio_lang = "zh"                # zh | en (名字首字符拉丁 → en)
+        self.rsel = 0
+        self.rscroll = 0
+        self.playing_key = None               # 播放中电台 key
+        self.play_at = 0.0                    # 本次开播时刻
+        self.vu = [3.0] * 12                  # VU 条 (car-dash vuTick 同款)
+        self.vu_pk = [3.0] * 12
+        self._vu_at = 0.0
+        self.autoplay_key = None              # 设备测试: DASH_PLAY=<key>
+        # 行情页状态
+        self.fin_view = 0                     # 0 自选 1 指数 2 商品
+        self.fsel = 0
+        self.fscroll = 0
+        self.fdetail = None                   # None | {"code","name","view"}
+        self.fin_ts = ""                      # 行情时间戳
+        # 工具页: 卡片入口网格 + 子应用 (Esc 回网格; 参照 tab5 驾驶舱工具页)
+        self.cal_ym = None                    # (y, m) 万年历当前月
+        self.tool = None                      # None=网格 | TOOL_APPS id
+        self.tsel = 0                         # 网格光标
+        # 汇率 / 单位换算 (字段: 0 金额 1 源 2 目标 3 类别)
+        self.fx_amt = "1"
+        self.fx_from = 0                      # FX_CODES 索引
+        self.fx_to = 1
+        self.u_cat = 0                        # UCATS 索引
+        self.u_amt = "1"
+        self.u_from = 0
+        self.u_to = 1
+        self.cv_field = 0
+        self.cv_armed = False                 # 首键替换默认 1, 之后追加 (car-dash 同款)
+        # 双色球 / 计时器
+        self.ssq_scroll = 0                   # 选中期索引 (顶部卡片跟随)
+        self.ssq_view = 0                     # 历史列表窗口起点
+        self.tm_dur = 300                     # 秒
+        self.tm_left = 300.0
+        self.tm_run = False
+        self.tm_done = False
+        self.tm_end = 0.0                     # monotonic 结束时刻
+        self.beep_proc = None
+        # 音乐 (本地曲库; QQ/网易直连)
+        self.mu_view = "src"                  # src 源选择 | list 本地列表 | play 播放
+        self.mu_src = "local"
+        self.mu_sel = 0                       # 列表光标
+        self.mu_files = []                    # scan_music_dir 结果
+        self.mu_scan_at = 0.0                 # 进列表页重扫节流 (60s)
+        self.mu_playing = None                # 当前 {"path","title","artist",...}
+        self.mu_play_idx = -1                 # mu_playing 在 mu_files 里的序号
+        self.mu_proc = None                   # 播放进程 (本机 ffplay)
+        self.mu_retries = 0                   # 提前收工重连额度 (每曲 3)
+        self.mu_retry_at = 0.0                # 非阻塞重试定时锚
+        self.mu_advance = False               # True=自然播完自动连播下一首
+        self.mu_pos0 = 0.0                    # 本段起点秒 (-ss 值)
+        self.mu_t0 = 0.0                      # mu_pos0 对应的 monotonic 锚
+        self.mu_dur = 0.0                     # ffprobe 时长 (0=未知 → 条隐藏)
+        self.mu_paused = False
+        self.lvl = MusicLvl()                 # 电平源 (parec/fd3 → vu_tick; 电台/音乐共用)
+        self.mu_pic = None                    # 封面 Surface 84×84 (内嵌图)
+        self.mu_pic_raw = None                # 待主线程转 Surface 的字节
+        self.mu_pic_path = None
+        self.mu_pic_seq = 0                   # 网络封面请求序号 (防换曲串图)
+        self.mu_lyr = []                      # [(秒, 文本)] relay lrclib
+        self.mu_lyr_key = None
+        self.mu_q = ""                        # QQ 搜索词
+        self.mu_input = False                 # 软键盘输入态 (搜索)
+        self.mu_busy = False                  # 线程取数中 (搜索/收藏/解析)
+        self.mu_lists = {"local": [], "qq": [],
+                         "ne": []}            # 每源播放队列 (会话内)
+        self.mu_busy_at = 0.0                 # busy 起始 (30s 看门狗)
+        self.mu_qr = None                     # 扫码会话 (QQLogin/NeLogin)
+        self.mu_qr_kind = "qq"               # 当前扫码源
+        self.esc_hold_at = None               # 长按 Esc 起始 (播放页退音乐/主页退 dash)
+        self.esc_exit = False                 # esc_hold_poll 满时长 → 主循环退出
+        self.mu_proc_at = None                # 本机 ffplay 起始 (VU 首响兜底)
+        self.mu_saved_at = 0.0                # 会话落盘节流 (mu_tick 15s)
+        self.mu_aud_up = None                 # 出声时刻 (VU 首响锚点; None=起播期)
+        self.mu_sess = 0                      # 播放会话号 (锚点线程守卫)
+        self.news_src_i = 0                   # 新闻源索引
+        self.news_sel = 0
+        self.news_scroll = 0
+        self.news_detail = None               # 选中的新闻条目 (详情视图)
+        self.news_detail_scroll = 0           # 详情滚动行数
+        self.news_i = 0                       # 主页新闻跑马灯条目轮换
+        self._news_at = 0.0
+        self.esc_t = None                      # Esc 按下时刻 (长按回主页)
+        # 拼音 IME (中文输入; '/' 切中英; 两处输入框共用一套状态)
+        self.ime_mode = True                   # True=拼音 False=英文直输
+        self.ime_buf = ""                      # 当前拼音串
+        self.ime_cands = []                    # 候选 (词组+单字, ≤24)
+        self.ime_assoc = None                  # 联想词 (上次提交后, None=无)
+        self.ime_page = 0                      # 候选页 (每页 8)
+        # 链路探测由 net 层启动时自发
+
+    def th(self, key):
+        return hex2rgb(THEMES[self.theme_idx][key])
+
+    def card(self, i):
+        return hex2rgb(THEMES[self.theme_idx]["cards"][i])
+
+    # ── 网络结果 ──
+    def on_net(self, kind, a, b):
+        if kind == "mode":
+            self.data.clear()
+        elif kind == "data":
+            self.data[a] = b
+            if a.startswith("mulyr:") and isinstance(b, dict):
+                self.mu_lyr = self._pl_lrc_parse(b.get("synced") or "")
+        elif kind == "text":
+            self.data[a] = b
+            if b and a in ("quotes", "idx"):
+                self.fin_ts = time.strftime("%H:%M:%S")
+        elif kind == "bin":
+            if b:
+                self.data[a] = b                 # 封面字节
+                if a.startswith("mupic:"):       # 音乐在线封面 (换曲防串图)
+                    if a == "mupic:%d" % self.mu_pic_seq:
+                        self.mu_pic = jpg_surf(b, 84, 84)
+
+    # ── 每秒请求 (worker 按 TTL 去重) ──
+    def poll(self):
+        """按页取数: 只拉当前页所需, 页面切换即时响应不排队."""
+        self.mu_tick()                        # 音乐连播: 任意页/离线都要走 (本地曲库)
+        if self.net.mode == "online":
+            if self.page == 0:
+                self.net.job("ipo", fetchers.ipo_fetch, 1800)
+                self.net.job("hitokoto", fetchers.hitokoto_fetch, 3600)
+                self.net.job("news", news_rss.news_fetch_all, 600)   # 主页新闻卡
+                self.net.pub(WX_URL, "wx", 600)
+            if self.page == 2:
+                pass                          # 站台表内置 (radio_stations.STATIONS)
+            if self.page == 3:
+                self.net.pub_text(QT_BASE + ",".join(
+                    c for c in self._qt_codes()), "quotes", 12)
+                self.net.pub_text(QT_BASE + ",".join(c for _, c in IDX_LIST),
+                                   "idx", 15)
+                self.net.pub_text(QT_BASE + ",".join(HF_CODES), "cmd", 30)
+                self.net.pub(GATE_URL, "gate", 30)
+                if self.fdetail:
+                    code = self.fdetail["code"]
+                    self.net.pub(IFZQ_BASE + "minute/query?code=" + code,
+                                 "minute", 60)
+                    self.net.pub(IFZQ_BASE + "fqkline/get?param=" + code +
+                                 ",day,,,250,qfq", "day", 60)
+            if self.page == 4:
+                self.net.job("news", news_rss.news_fetch_all, 600)
+            if self.page == 5:
+                self.poll_tool()
+            if self.playing_key:
+                if self.player is not None and self.player.poll() is not None:
+                    self.radio_stop()          # ffplay 已退出 (断流/出错)
+                    self.osd = ("流已断", time.monotonic() + 1.5)
+
+    def poll_tool(self):
+        """工具子应用按需取数 (poll 每秒调; TTL 层去重)."""
+        self.timer_tick()
+        t = self.tool
+        if t == "fx":
+            self.net.job("rate", fetchers.fx_fetch, 3600)
+        elif t == "ssq":
+            self.net.job("ssq", fetchers.ssq_fetch, 600)
+        elif t == "music":
+            self._mu_qr_poll()                # 扫码状态机 (ok→搜索/fail→源页)
+
+    # ── 想法列表 (文字+语音按时间倒序合并) ──
+    def idea_items(self):
+        items = [{"kind": "text", "id": it.get("id"),
+                  "text": it.get("text", ""),
+                  "createdAt": it.get("createdAt", 0)}
+                 for it in self.ideas.get("texts", [])]
+        items.sort(key=lambda x: -x["createdAt"])
+        return items
+
+    def _qt_codes(self):
+        return [qt_code(it["code"]) for it in self.watch.get("items", [])
+                if it.get("code")][:16]
+
+    def fin_items(self):
+        """自选股: 本地 watchlist + 实时 quotes 覆盖."""
+        items = [dict(it) for it in self.watch.get("items", [])
+                 if it.get("code")][:16]
+        qt = parse_qt_text(self.data.get("quotes") or "")
+        for it in items:
+            f = qt.get(qt_code(it["code"]))
+            if qt_ok(f):
+                it["price"] = qt_num(f, 3)
+                it["chg"] = qt_num(f, 31)
+                it["pchg"] = qt_num(f, 32)
+        return items
+
+    def open_detail(self, code, name, view="min"):
+        self.fdetail = {"code": code, "name": name, "view": view, "zoom": 1.0}
+
+    def ime_clear(self):
+        """清空 IME 状态 (进出输入框/提交后调; 保留中英模式)."""
+        self.ime_buf = ""
+        self.ime_cands = []
+        self.ime_assoc = None
+        self.ime_page = 0
+
+    def ime_commit(self, w):
+        """提交候选词/字 → 追加文本 + 出联想."""
+        self.ime_buf = ""
+        self.ime_cands = []
+        self.ime_page = 0
+        self.ime_assoc = ime.assoc(w[-1]) or None
+        return ("word", w)
+
+    def ime_key(self, k, ch):
+        """拼音 IME 键处理 (仅中文模式调用). 返回 None=已消化;
+        ("char", s)=文本追加; ("del", "")=删已提交末字符; ("submit",)=提交输入框.
+        键位: 字母=拼音 (设备 f/z/x/c 经 unicode 同样进串), 空格=首选,
+        1-9=选候选, \u2191\u2193=翻页 (真方向键; 复用键事件带 unicode 不入此支),
+        Backspace=缩串/删字, Enter=拼音串转 ASCII 直提."""
+        if k in (pygame.K_UP, pygame.K_DOWN) and not ch:
+            n = len(self.ime_cands) if self.ime_buf else len(self.ime_assoc or [])
+            if n > 8:
+                d = -1 if k == pygame.K_UP else 1
+                self.ime_page = (self.ime_page + d) % ((n + 7) // 8)
+            return None
+        if k == pygame.K_BACKSPACE:
+            if self.ime_buf:
+                self.ime_buf = self.ime_buf[:-1]
+                self.ime_page = 0
+                self.ime_cands = ime.candidates(self.ime_buf)
+                return None
+            return ("del", "")                # 2 元组对齐 (调用处 tag, val 解包)
+        if ch and "a" <= ch.lower() <= "z":
+            self.ime_assoc = None
+            if len(self.ime_buf) < 12:
+                self.ime_buf += ch.lower()
+            self.ime_page = 0
+            self.ime_cands = ime.candidates(self.ime_buf)
+            return None
+        cands = self.ime_cands if self.ime_buf else (self.ime_assoc or [])
+        if ch and ch != "0" and ch.isdigit():
+            i = self.ime_page * 8 + (int(ch) - 1)
+            if cands and i < len(cands):
+                return self.ime_commit(cands[i])
+            return ("char", ch)               # 无候选 → ASCII 直通
+        if k == pygame.K_SPACE:
+            if cands:
+                return self.ime_commit(cands[self.ime_page * 8])
+            return ("char", " ")
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.ime_buf:
+            s = self.ime_buf
+            self.ime_clear()
+            return ("char", s)
+        if ch and 0x20 <= ord(ch) < 0x7F:     # 其余 ASCII (0/符号) 直通
+            return ("char", ch)
+        return None
+
+    def ime_bar(self, surf, y):
+        """候选条 (拼音/联想共用): 编号候选 + 页码指示. 返回 True=有画."""
+        if self.ime_buf:
+            cands = self.ime_cands
+            head = self.ime_buf
+        elif self.ime_assoc:
+            cands = self.ime_assoc
+            head = "联"
+        else:
+            return False
+        acc, soft, dim = (self.th("accent"), self.th("soft"),
+                          self.th("dim"))
+        text(surf, head, 11, acc, (6, y))
+        x = 6 + textw(head, 11) + 8
+        start = self.ime_page * 8
+        for i in range(start, min(len(cands), start + 8)):
+            s = "%d%s" % (i - start + 1, cands[i])
+            w = textw(s, 11)
+            if x + w > W - 30:
+                break
+            text(surf, s, 11, soft, (x, y))
+            x += w + 6
+        np = max(1, (len(cands) + 7) // 8)
+        if np > 1:
+            text(surf, "%d/%d" % (self.ime_page + 1, np), 10, dim,
+                 (W - 6, y + 1), right=True)
+        return True
+
+    def stop_player(self):
+        if self.player:
+            try:
+                self.player.terminate()
+            except Exception:
+                pass
+            self.player = None
+
+    # ── 电台 ──
+    @staticmethod
+    def _st_lang(s):
+        n = (s.get("name") or " ")[0]
+        return "en" if (n.isascii() and n.isalpha()) else "zh"
+
+    STATIONS_CACHE = os.path.join(STATE_DIR, "stations_cache.json")
+
+    def stations(self):
+        """台表: 内置 (radio_stations.STATIONS), 按语言过滤."""
+        import radio_stations
+        return [s for s in radio_stations.STATIONS
+                if self._st_lang(s) == self.radio_lang]
+
+    def radio_play(self, st):
+        self.radio_stop()
+        if self.mu_proc or self.mu_playing:   # 音频焦点: 音乐让路
+            self.mu_stop()
+        # 直连公开流 URL. -reconnect*: WiFi 停顿导致 TCP 断时 ffplay 自动
+        # 重拉同 URL (<5s 退避) 恢复播放, 而不是死掉报"流已断"; -infbuf 不限
+        # 输入缓冲, 吸收直播上游的突发空窗 (HLS 几秒一批).
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+               "-vn", "-infbuf"] + _ff_slow_net_flags() + \
+              ["-reconnect", "1", "-reconnect_streamed", "1",
+               "-reconnect_delay_max", "5", st["url"]]
+        try:
+            self.player = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL,
+                                           env=_AUDIO_ENV, **_FFPLAY_KW)
+            self.playing_key = st["key"]
+            self.play_at = time.monotonic()
+            self.lvl.start_parec()            # VU: pulse monitor 采本机输出
+            self.osd = (st["name"], time.monotonic() + 1.5)
+        except Exception:
+            self.osd = ("播放失败", time.monotonic() + 1.2)
+
+    def radio_stop(self):
+        self.stop_player()
+        self.playing_key = None
+        self.lvl.stop()                       # 电平源随播放进程一起断
+        self.vu = [3.0] * 12
+        self.vu_pk = [3.0] * 12
+
+    def radio_toggle(self):
+        if self.playing_key:
+            self.radio_stop()
+            return
+        sts = self.stations()
+        if 0 <= self.rsel < len(sts):
+            self.radio_play(sts[self.rsel])
+
+    # ── 音乐 app: 本地曲库直读 + QQ/网易直连 ──
+    def mu_rescan(self):
+        """进列表页重扫 (60s 节流); 扫描中当前播放文件可能换序 → idx 失效则止播."""
+        now = time.monotonic()
+        if self.mu_files and now - self.mu_scan_at < 60:
+            return
+        keep = (self.mu_playing or {}).get("path")
+        self.mu_files = scan_music_dir(MUSIC_DIR)
+        self.mu_scan_at = now
+        if keep:                              # 正在播的曲子重新对位 (续播不中断)
+            self.mu_play_idx = next((i for i, f in enumerate(self.mu_files)
+                                     if f["path"] == keep), self.mu_play_idx)
+        if not 0 <= self.mu_sel < len(self.mu_files):
+            self.mu_sel = 0
+
+    def mu_wall_pos(self):
+        """走秒位置 = -ss 起点 + 出声后 monotonic 差 (电台/油管同款墙钟).
+        AirPlay 起播期 (RAOP-UP 未到, ~15s) 冻结在续播位 — 歌词/进度条/
+        假EOF 判据都以它为准, 否则导入+握手期歌词空走 15s (用户报不同步)."""
+        if not self.mu_playing:
+            return 0.0
+        if self.mu_paused:
+            return self.mu_pos0
+        if self.mu_aud_up is None:
+            return self.mu_pos0
+        pos = self.mu_pos0 + max(0.0, time.monotonic() - self.mu_aud_up)
+        return min(pos, self.mu_dur) if self.mu_dur else pos
+
+    def mu_play(self, idx, pos=0.0):
+        """起播/续播. 电台先让路 (音频焦点)."""
+        if not 0 <= idx < len(self.mu_files):
+            return
+        self.mu_sess += 1                     # 会话号 (锚点线程守卫)
+        self.mu_aud_up = None                 # 出声时刻 (VU 首响即置)
+        if self.playing_key:
+            self.radio_stop()
+        if self.mu_proc:
+            self.mu_kill()
+        f = self.mu_files[idx]
+        target = f.get("url") or f.get("path")     # 本地路径 | QQ/网易流 URL
+        if not target:
+            self.osd = ("先按 Enter 解析这首", time.monotonic() + 1.8)
+            return                                  # 未解析在线曲目: 不起播
+        dur = f.get("dur") or 0
+        if not dur and target and not target.startswith("http"):
+            dur = mu_probe_dur(target)        # 起播前探: 无 ffplay 抢 CPU
+        if f.get("preview"):
+            dur = min(dur, 30) or 30          # TRY 试听: 进度条按 30s 计
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-vn"]
+        if target.startswith("http"):
+            cmd += ["-infbuf", "-reconnect", "1", "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5"]   # 电台同款断流自愈
+            cmd += _ff_slow_net_flags()            # 热点/慢网 15s 超时+网络错重连
+        if pos > 0.5:
+            cmd += ["-ss", "%.1f" % pos]
+        cmd += ["-i", target]
+        try:
+            self.mu_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL,
+                                            env=_AUDIO_ENV, **_FFPLAY_KW)
+        except Exception:
+            self.osd = ("播放失败", time.monotonic() + 1.2)
+            return
+        self.mu_proc_at = time.monotonic()    # 出声锚点交给 VU 首响
+        self.lvl.start_parec()                # pulse monitor 采电平
+        self._mu_common(idx, f, pos, dur)
+
+    def _mu_common(self, idx, f, pos, dur=0.0):
+        """起播状态落位 + 封面/歌词懒取."""
+        self.mu_playing = f
+        self.mu_play_idx = idx
+        self.mu_advance = True                # 自然播完 → 连播下一首
+        self.mu_paused = False
+        self.mu_pos0 = pos
+        self.mu_t0 = time.monotonic()
+        self.mu_dur = dur
+        self.mu_view = "play"
+        self.mu_retries = 3                   # 每曲重连额度 (源流断/假EOF)
+        self.mu_retry_at = 0.0
+        self.mu_session_save()
+        if self.mu_pic_path != (f.get("cover") or f.get("path")):
+            # 封面: 本地=内嵌图懒取; QQ/网易=CDN 外链 net.bin 直连 (换曲才取)
+            self.mu_pic_path = f.get("cover") or f.get("path")
+            self.mu_pic = None
+            if f.get("cover"):
+                self.mu_pic_seq += 1
+                self.net.bin(None, f["cover"], "mupic:%d" % self.mu_pic_seq,
+                             1800)
+            else:
+                # 内嵌图: 线程里只解字节, Surface 转换留主线程 (SDL 非线程安全)
+                self.mu_pic_raw = mu_extract_cover(f["path"])
+        key = (f.get("title"), f.get("artist"), int(dur or 0))
+        if key != self.mu_lyr_key:            # 换曲 → 清旧词 + 拉新词
+            self.mu_lyr_key = key
+            self.mu_lyr = []
+            if f.get("title"):
+                # 直连取词 (LRCLIB + 网易兜底, musrc.lrc_fetch); tag 按曲名
+                # 区分 (Net 按 tag 缓存, 同 tag 会压掉下一首)
+                self.net.job(
+                    "mulyr:" + (f.get("title") or "")[:24],
+                    lambda t=f.get("title"), a=f.get("artist") or "", d=int(dur or 0):
+                    musrc.lrc_fetch(t, a, d), 1800)
+
+    # ── 音乐 M2: QQ 直连 (扫码绑定 / 搜索 / 我喜欢 / 播放解析) ──────────────
+    def _mu_enter_source(self, sid):
+        """切源: 保存当前源队列, 载入目标源队列 (每源独立播放列表); 正在
+        播放且换源 → 停止 (换源即换内容)."""
+        if sid == self.mu_src:
+            return
+        if self.mu_view in ("list", "search"):
+            self.mu_lists[self.mu_src] = self.mu_files
+        if self.mu_proc or self.mu_playing:
+            self.mu_stop()
+        self.mu_src = sid
+        self.mu_files = self.mu_lists.get(sid, [])
+
+    def _mu_open_qq(self):
+        """进 QQ 源: 未绑定 → 扫码页; 已绑定 → 搜索页 (后台续期 musickey)."""
+        if not musrc.qq_ok():
+            self.osd = ("QQ: 需装 qqmusic-api (HANDOFF 部署节)",
+                        time.monotonic() + 3.0)
+            return
+        self._mu_enter_source("qq")
+        if musrc.qq_bound():
+            self._mu_open_search()
+            threading.Thread(target=musrc.qq_refresh_if_needed,
+                             daemon=True).start()
+        else:
+            self.mu_view = "qr"
+            self.mu_qr_kind = "qq"
+            self.mu_qr = musrc.QQLogin()
+            self.mu_qr.start()
+
+    def _mu_open_ne(self):
+        """进网易云源: 未绑定 → 扫码页 (s 免登录跳过); 已绑定 → 搜索页.
+        2026-11-14 后端游客态修复, 绑定闭环实测可拿 MUSIC_U."""
+        if not musrc.ne_ok():
+            self.osd = ("网易云: 需 cryptography (pip3 install cryptography)",
+                        time.monotonic() + 3.0)
+            return
+        self._mu_enter_source("ne")
+        if musrc.ne_bound():
+            self._mu_open_search()
+        else:
+            self.mu_view = "qr"
+            self.mu_qr_kind = "ne"
+            self.mu_qr = musrc.NeLogin()
+            self.mu_qr.start()
+
+    def _mu_open_search(self):
+        self.mu_view = "search"
+        self.mu_sel = 0
+        self.mu_q = ""
+        self.mu_input = False
+        self.mu_files = self.mu_lists.get(self.mu_src, [])   # 恢复该源队列
+
+    def _mu_open_fav(self):
+        self.mu_view = "fav"
+        self.mu_sel = 0
+        self.mu_files = []
+        if self.mu_busy:
+            return
+        self.mu_busy = True
+
+        def _w():
+            try:
+                res = (musrc.ne_favorites() if self.mu_src == "ne"
+                       else musrc.qq_favorites())
+                if not res:
+                    self.osd = ("我喜欢为空 (未绑定/无收藏)", time.monotonic() + 2)
+            except Exception as e:
+                res = []
+                self.osd = ("收藏拉取失败 %s" % str(e)[:16],
+                            time.monotonic() + 2)
+            self.mu_files = res
+            self.mu_busy = False
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _mu_search_start(self):
+        """n 输入 Enter → 后台搜索 (凭据; QQ 风控拦匿名, 未绑定进不来这里)."""
+        q = self.mu_q.strip()
+        if not q or self.mu_busy:
+            return
+        self.mu_busy = True
+        self.mu_files = []
+        self.mu_sel = 0
+
+        def _w():
+            try:
+                res = (musrc.ne_search(q) if self.mu_src == "ne"
+                       else musrc.qq_search(q))
+            except Exception as e:
+                res = []
+                self.osd = ("搜索失败: %s" % str(e)[:18],
+                            time.monotonic() + 2.5)
+            self.mu_files = res
+            self.mu_lists[self.mu_src] = res  # 搜索结果即该源队列
+            self.mu_busy = False
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _mu_play_item(self, idx=None, pos=0.0):
+        """列表条目 → 播放. QQ/网易曲目先线程解析 URL (1-2s), 成功回填再起播
+        (pos>0 = 恢复态续播); 解析期间用户换页/换选 → 丢弃 (item 身份校验)."""
+        if self.mu_busy or not self.mu_files:
+            return
+        if idx is None:
+            idx = self.mu_sel
+        item = self.mu_files[idx]
+        if item.get("url") or item.get("path"):
+            self.mu_play(idx, pos)
+            return
+        if not item.get("id"):                # 本地条目直接播
+            self.mu_play(idx, pos)
+            return
+        self.mu_busy = True
+        self.osd = ("解析中…", time.monotonic() + 2.5)
+
+        def _w():
+            url = preview = None
+            try:
+                if item.get("src") == "ne":
+                    url, preview = musrc.ne_resolve_url(item)
+                else:
+                    url, preview = musrc.qq_resolve_url(item)
+            except Exception as e:
+                self.osd = ("解析失败 %s" % str(e)[:16],
+                            time.monotonic() + 2)
+            self.mu_busy = False
+            if not url:
+                self.osd = ("解析不到链接 (风控/下架), 稍后再试",
+                            time.monotonic() + 2.5)
+                return
+            if self.mu_files[idx] is not item:
+                return                        # 列表已变 (换页/重搜)
+            item["url"] = url
+            item["preview"] = preview
+            if preview:
+                self.osd = ("非 VIP → 30s 试听", time.monotonic() + 2.5)
+            self.mu_play(idx, pos)
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _mu_qr_poll(self):
+        """扫码页状态机 (poll_tool 秒级): ok → 进搜索; fail → 弹错回源页."""
+        if self.mu_view != "qr":
+            return
+        st = self.mu_qr.state
+        if st == "ok":
+            self.mu_qr.stop()
+            self.osd = ("已绑定 ✓", time.monotonic() + 2.0)
+            self._mu_open_search()
+        elif st == "fail":
+            err = self.mu_qr.err
+            self.mu_qr.stop()
+            self.osd = ("扫码失败: %s" % err[:20], time.monotonic() + 3.0)
+            self.mu_view = "src"
+
+    def mu_kill(self):
+        """只杀子进程, 不清状态 (暂停/seek/续播走这里)."""
+        self.lvl.stop()                       # 电平源随播放进程一起断
+        if self.mu_proc:
+            try:
+                self.mu_proc.terminate()
+            except Exception:
+                pass
+        self.mu_proc = None
+
+    def mu_stop(self):
+        """x 键/切换曲目/退出连播末尾: 全停 (状态清空, 回列表)."""
+        self.mu_kill()
+        self.mu_playing = None
+        self.mu_play_idx = -1
+        self.mu_advance = False
+        self.mu_paused = False
+
+    def mu_session_save(self):
+        """上次播放会话落盘 (跨重启恢复: 队列元数据+曲目位+暂停态; 在线
+        url 不存 — 时效短, 恢复后走解析链重取)."""
+        if not self.mu_playing:
+            return
+        files = [{k: v for k, v in it.items() if k != "url"}
+                 for it in self.mu_files[:60]]
+        netmod.save_json_file(MU_LAST_CACHE, {
+            "src": self.mu_src, "files": files,
+            "idx": self.mu_play_idx,
+            "pos": (self.mu_pos0 if self.mu_paused
+                    else self.mu_wall_pos()),
+            "paused": bool(self.mu_paused),
+            "ts": int(time.time())})
+
+    def mu_session_restore(self):
+        """进音乐 app 空态时恢复上次会话: 播放页显示上次曲目 (暂停在位),
+        4/Enter 续播 (在线曲走解析链)."""
+        s = netmod.load_json_file(MU_LAST_CACHE, {})
+        try:
+            files = s.get("files") or []
+            idx = int(s.get("idx", -1))
+            if not files or not 0 <= idx < len(files):
+                return
+            self.mu_src = s.get("src") if s.get("src") in self.mu_lists \
+                else "local"
+            self.mu_lists[self.mu_src] = files   # 选源页队列同恢复
+            self.mu_files = files
+            self.mu_play_idx = idx
+            self.mu_playing = files[idx]
+            self.mu_pos0 = max(0.0, float(s.get("pos") or 0.0))
+            self.mu_dur = float(files[idx].get("dur") or 0.0)
+            self.mu_paused = True                # 显示暂停态, 4=续播
+            self.mu_advance = False              # 静止恢复态, 播放时再置
+        except Exception:
+            pass
+
+    def mu_pause_toggle(self):
+        """p 键: 暂停 = 记位杀进程; 恢复 = -ss 续播 (ffplay 无暂停, 本地可重启)."""
+        if not self.mu_playing:
+            return
+        if self.mu_paused:
+            f = self.mu_playing or {}
+            if not f.get("url") and not f.get("path") and f.get("id"):
+                self._mu_play_item(self.mu_play_idx, self.mu_pos0)
+                return                        # 在线曲恢复态 → 先解析再 -ss 续播
+            self.mu_play(self.mu_play_idx, self.mu_pos0)
+        elif self.mu_proc:
+            self.mu_pos0 = self.mu_wall_pos()
+            self.mu_kill()
+            self.mu_paused = True
+            self.mu_session_save()
+
+    def mu_seek(self, d):
+        """←/→ ±10s: 重启进程拼 -ss (油管墙钟同款)."""
+        if not self.mu_playing or self.mu_paused:
+            return
+        pos = max(0.0, self.mu_wall_pos() + d)
+        if self.mu_dur:
+            pos = min(pos, max(0.0, self.mu_dur - 2))
+        self.mu_kill()
+        self.mu_play(self.mu_play_idx, pos)
+
+    def mu_tick(self):
+        """连播/出错检测 (poll 每秒 + 播放页每帧都调). 判据进程退出 = 流结束:
+        rc=0 自然播完 → 连播下一首; 提前退出 (源流断/假EOF) → 额度内同位续流."""
+        if self.mu_busy and time.monotonic() - self.mu_busy_at > 30:
+            self.mu_busy = False              # 取数线程卡死兜底 (30s)
+            self.osd = ("取数超时, 请重试", time.monotonic() + 1.5)
+        if self.mu_playing and not self.mu_paused \
+                and time.monotonic() - self.mu_saved_at > 15.0:
+            self.mu_saved_at = time.monotonic()
+            self.mu_session_save()            # 播放位 15s 节流落盘 (断电保位)
+        if not self.mu_advance:
+            return
+        if self.mu_proc is None:
+            if self.mu_retry_at:
+                if time.monotonic() >= self.mu_retry_at:
+                    self.mu_retry_at = 0.0
+                    r = self.mu_retries           # 重试重生不刷新额度 (防无限)
+                    self.mu_play(self.mu_play_idx, self.mu_pos0)
+                    self.mu_retries = r
+            return
+        rc = self.mu_proc.poll()
+        if rc is None:
+            return
+        wall = self.mu_wall_pos()             # 死亡时刻的真实进度 (kill 前取)
+        life = (time.monotonic() - self.mu_proc_at
+                if self.mu_proc_at else 0.0)
+        self.mu_kill()
+        dur = self.mu_dur
+        # 声音未锚定 (静音曲头/无监视器环境): 墙钟冻结在 0, 假EOF判据会误杀
+        # → 退化为进程寿命判据: 寿命≥85% 时长=真播完, 否则=早死走重试/失败
+        if self.mu_aud_up is None:
+            done = dur > 0 and life >= dur * 0.85
+        else:
+            done = dur == 0 or wall >= dur * 0.85
+        if rc != 0 and done:
+            done = True                       # 尾段崩 (差几秒) → 按播完算
+        if not done and self.mu_retries > 0:
+            # 提前收工统一重连: 中途源流断 (QQ URL 断流实测) — 同位续播不假推进
+            self.mu_retries -= 1
+            self.mu_pos0 = min(wall, dur) if dur else wall
+            self.mu_retry_at = time.monotonic() + \
+                (2.0 if time.monotonic() - self.mu_t0 >= 15.0 else 3.0)
+            self.osd = ("重连…", time.monotonic() + 1.5)
+            return
+        if rc != 0 or not done:
+            self.mu_playing = None
+            self.mu_play_idx = -1
+            self.mu_advance = False
+            self.osd = ("播放失败 (格式不支持?)", time.monotonic() + 1.5)
+            self.mu_view = "list"
+            return
+        nxt = self.mu_play_idx + 1
+        if nxt >= len(self.mu_files):
+            self.mu_stop()
+            self.mu_view = "src"              # 列表播完回源选择页
+            return
+        f2 = self.mu_files[nxt]
+        if not (f2.get("url") or f2.get("path")) and f2.get("id"):
+            self.mu_sel = nxt
+            self._mu_play_item()              # 连播到未解析曲 → 走解析流
+            return
+        self.mu_play(nxt)
+
+    def mu_key(self, k, ch):
+        if self.mu_view == "src":
+            n = len(MUSIC_SRCS)
+            if k in (pygame.K_UP, pygame.K_DOWN):
+                d = -1 if k == pygame.K_UP else 1
+                self.mu_sel = (self.mu_sel + d) % n   # 源光标借用 mu_sel
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                sid = MUSIC_SRCS[self.mu_sel][0]
+                if sid == "local":
+                    self.mu_view = "list"
+                    self.mu_sel = 0              # src 光标 ≠ 曲目光标, 进列表归位
+                    self.mu_rescan()
+                elif sid == "qq":
+                    self._mu_open_qq()
+                else:
+                    self._mu_open_ne()
+            return True
+        if self.mu_view == "qr":
+            if k in (pygame.K_q, pygame.K_BACKSPACE):
+                self.mu_qr.stop()          # Esc 在全局层=退工具 (先掐线程)
+                self.mu_view = "src"
+            elif self.mu_qr_kind == "ne" and k == pygame.K_s:
+                self.mu_qr.stop()
+                self._mu_open_search()     # 网易免登录跳过 (免费曲库直搜)
+            return True
+        if self.mu_view == "search":
+            if self.mu_input:
+                if k == pygame.K_SLASH:       # 中/英切换 (IME)
+                    self.ime_mode = not self.ime_mode
+                    self.ime_clear()
+                    return True
+                if self.ime_mode:             # 拼音 IME
+                    if not self.ime_buf:
+                        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                            self.ime_clear()
+                            self.mu_input = False
+                            self._mu_search_start()
+                            return True
+                    act = self.ime_key(k, ch)
+                    if act is None:
+                        return True
+                    tag, val = act
+                    if tag == "del":
+                        self.mu_q = self.mu_q[:-1]
+                    elif tag == "submit":
+                        self.ime_clear()
+                        self.mu_input = False
+                        self._mu_search_start()
+                    else:                     # char/word
+                        self.mu_q = (self.mu_q + val)[:40]
+                    return True
+                # 英文直输 (原行为)
+                if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.mu_input = False
+                    self._mu_search_start()
+                elif k == pygame.K_BACKSPACE:
+                    self.mu_q = self.mu_q[:-1]
+                elif ch and 0x20 <= ord(ch) < 0x7F:
+                    if len(self.mu_q) < 40:
+                        self.mu_q += ch
+                return True
+            if k in (pygame.K_n, pygame.K_e):
+                self.ime_clear()
+                self.mu_input = True             # n=搜索 (想法页同款)
+            elif k in (pygame.K_UP, pygame.K_DOWN):
+                d = -1 if k == pygame.K_UP else 1
+                self.mu_sel = max(0, min(len(self.mu_files) - 1,
+                                         self.mu_sel + d))
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_4):
+                self._mu_play_item()             # 4=播放 (对齐实体键 4)
+            elif k == pygame.K_5:
+                self._mu_open_fav()              # 5=收藏 (对齐实体键 5;
+                                                 #  2026-11-14 网易绑定闭环拆占位门)
+            elif k == pygame.K_6:
+                self.mu_view = "src"             # 6=返回源选择 (实体键 6)
+            elif k == pygame.K_0:
+                self.mu_view = "src"             # 0=选源 (跨页统一)
+            elif k == pygame.K_8:
+                self.mu_stop()                   # 8=停止 (实体键 8)
+            return True
+        if self.mu_view == "fav":
+            if k in (pygame.K_UP, pygame.K_DOWN):
+                d = -1 if k == pygame.K_UP else 1
+                self.mu_sel = max(0, min(len(self.mu_files) - 1,
+                                         self.mu_sel + d))
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_4):
+                self._mu_play_item()             # 4=播放 (实体键 4)
+            elif k == pygame.K_6:
+                self._mu_open_search()           # 6=回搜索 (实体键 6)
+            elif k == pygame.K_0:
+                self.mu_view = "src"             # 0=选源 (跨页统一)
+            elif k == pygame.K_8:
+                self.mu_stop()                   # 8=停止 (实体键 8)
+            elif k == pygame.K_r and not self.mu_busy:
+                self._mu_open_fav()              # r=重拉收藏
+            return True
+        if self.mu_view == "list":
+            if k in (pygame.K_UP, pygame.K_DOWN):
+                d = -1 if k == pygame.K_UP else 1
+                self.mu_sel = max(0, min(len(self.mu_files) - 1,
+                                         self.mu_sel + d))
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                if self.mu_files:
+                    self.mu_play(self.mu_sel)
+            elif k == pygame.K_r:
+                self.mu_scan_at = 0.0          # r 强制重扫
+                self.mu_rescan()
+                self.osd = ("已重扫 %d 首" % len(self.mu_files),
+                            time.monotonic() + 1.2)
+            elif k == pygame.K_0:
+                self.mu_view = "src"           # 0=选源 (跨页统一)
+            return True
+        # play 视图: 4/Enter/P 暂停切换, 0 选源, x/8 停 + 回源选择
+        if k in (pygame.K_4, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_p):
+            self.mu_pause_toggle()        # 4=暂停 (2026-11-14 用户定版, 对齐
+                                          #   实体键 4; P 保留)
+        elif k in (pygame.K_x, pygame.K_8):
+            self.mu_stop()
+            self.mu_view = "src"          # 8=停止 (跨页统一)
+        elif k == pygame.K_p:
+            self.mu_pause_toggle()
+        elif k == pygame.K_0:
+            self.mu_view = "src"          # 0=选源 (跨页统一; 播放后台继续)
+        elif k == pygame.K_LEFT:
+            self.mu_seek(-10)
+        elif k == pygame.K_RIGHT:
+            self.mu_seek(10)
+        elif k in (pygame.K_UP, pygame.K_DOWN):
+            # 播放页 ↑↓ = 切上一/下一首; 下一首未解析 → 走解析流 (真机实证:
+            # 直接 mu_play 会在 target=None startswith 崩整 app)
+            d = -1 if k == pygame.K_UP else 1
+            nxt = self.mu_play_idx + d
+            if 0 <= nxt < len(self.mu_files):
+                f2 = self.mu_files[nxt]
+                if f2.get("url") or f2.get("path") or not f2.get("id"):
+                    self.mu_play(nxt)
+                else:
+                    self.mu_sel = nxt
+                    self._mu_play_item()
+        return True
+
+    def vu_tick(self, now, b, m, t):
+        """car-dash vuTick 移植: 钟形频段权重 / 快升慢降 / 峰值帽.
+        三带电平由调用方给 (电台/音乐=self.lvl.lvl, MusicLvl),
+        门控必须低于主循环帧距 (10fps→100ms), 否则 tick 被饿死."""
+        if now - self._vu_at < 0.09:
+            return
+        self._vu_at = now
+        for i in range(12):
+            w = i / 11
+            wb = 1 - 2 * w if w < 0.5 else 0.0
+            wt = 2 * w - 1 if w > 0.5 else 0.0
+            wm = 1 - wb - wt
+            target = 2 + (b * wb + m * wm + t * wt) * 0.26
+            if target > 28:
+                target = 28
+            k = 0.45 if target > self.vu[i] else 0.10 + (i % 5) * 0.04
+            self.vu[i] += (target - self.vu[i]) * k
+            h = max(2, min(28, int(round(self.vu[i]))))
+            pk = self.vu_pk[i]
+            pk = h if h >= pk else pk * 0.92
+            self.vu_pk[i] = max(pk, h)
+
+    def submit_idea(self):
+        txt = self.buf.strip()
+        if not txt:
+            self.in_input = False
+            return
+        self.ideas.setdefault("texts", []).append({
+            "id": "%d-%s" % (int(time.time() * 1000),
+                             "".join(random.choice("0123456789abcdef") for _ in range(6))),
+            "text": txt, "createdAt": int(time.time() * 1000),
+        })
+        netmod.save_json_file(IDEAS_FILE, self.ideas)
+        self.buf = ""
+        self.in_input = False
+        self.osd = ("已保存", time.monotonic() + 1.2)
+
+    def delete_selected(self):
+        items = self.idea_items()
+        if not (0 <= self.sel < len(items)):
+            return
+        it = items[self.sel]
+        self.ideas["texts"] = [x for x in self.ideas.get("texts", [])
+                               if x.get("id") != it["id"]]
+        netmod.save_json_file(IDEAS_FILE, self.ideas)
+        self.sel = max(0, self.sel - 1)
+        self.osd = ("已删除", time.monotonic() + 1.2)
+
+    # ── 键 ──
+    def key(self, k, ch=""):
+        if self.dialog:
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                if self.dialog[0] == "exit":
+                    if self.page == 0:
+                        self.radio_stop()
+                        return False          # 主页确认 → 退出
+                    self.dialog = None        # 非主页: 只关闭对话框
+                    return True
+                self.delete_selected()        # ("del", item) 确认删除
+                self.dialog = None
+            elif k == pygame.K_ESCAPE:
+                self.dialog = None
+            else:                             # 其余任意键 = 关闭对话框
+                self.dialog = None
+            return True
+
+        if self.page == 1 and self.in_input:
+            if k == pygame.K_SLASH:           # 中/英切换 (IME)
+                self.ime_mode = not self.ime_mode
+                self.ime_clear()
+                return True
+            if self.ime_mode:                 # 拼音 IME
+                if not self.ime_buf:
+                    if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self.ime_clear()
+                        self.submit_idea()
+                        return True
+                    if k == pygame.K_ESCAPE:
+                        self.ime_clear()
+                        self.in_input = False
+                        self.buf = ""
+                        self.esc_t = time.monotonic()   # 长按可继续 → 主页
+                        return True
+                act = self.ime_key(k, ch)
+                if act is None:
+                    return True
+                tag, val = act
+                if tag == "del":
+                    self.buf = self.buf[:-1]
+                elif tag == "submit":
+                    self.ime_clear()
+                    self.submit_idea()
+                else:                         # char/word
+                    self.buf = (self.buf + val)[:120]
+                return True
+            # 英文直输 (原行为)
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.submit_idea()
+            elif k == pygame.K_ESCAPE:
+                self.in_input = False
+                self.buf = ""
+                self.esc_t = time.monotonic()   # 长按可继续 → 主页
+            elif k == pygame.K_BACKSPACE:
+                self.buf = self.buf[:-1]
+            elif ch and 0x20 <= ord(ch) < 0x7F:
+                if len(self.buf) < 120:
+                    self.buf += ch
+            return True
+
+        # 工具子应用: 按键全归工具处理 (数字/方向都在工具内), Esc 回入口网格;
+        # 换肤键 t 仅主页 (工具内 t 是输入字符, 不劫持).
+        if self.tool:
+            if k == pygame.K_ESCAPE:
+                if self.tool == "music" and self.mu_input:
+                    if self.ime_buf:
+                        self.ime_clear()           # 先退拼音串 (IME)
+                    else:
+                        self.mu_input = False      # 音乐搜索输入态
+                        self.mu_q = ""
+                elif self.tool == "music" and self.mu_view == "play":
+                    self.esc_hold_at = time.monotonic()  # 长按满 1s 才退出
+                elif self.tool == "music" and self.mu_view == "qr":
+                    if self.mu_qr and self.mu_qr.state != "idle":
+                        self.mu_qr.stop()          # 扫码线程掐掉
+                    self.mu_view = "src"           # qr Esc → 源选择
+                elif self.tool == "music":
+                    # src → 播放页; list/search/fav → 源选择 (逐层回播放页;
+                    # 退出音乐唯一入口 = 播放页长按 Esc 1s)
+                    self.mu_view = "play" if self.mu_view == "src" else "src"
+                else:
+                    self.tool_close()
+                return True
+            self.tool_key(k, ch)
+            return True
+
+        # 各页动作键占用: 想法(4新增/7删除) 电台(1-8直播) 行情(3商品/4自选/5指数/8图表)
+        # 新闻(1-7选条/9换源) 工具网格页: 数字 1-9/0 全部留给 app 直开
+        page_keys = {1: (4, 7), 2: tuple(range(1, 9)),
+                     3: (4, 5, 6, 8), 4: tuple(range(1, 10)),  # 9 换源, 勿被全局跳页截走
+                     5: tuple(range(0, 10))}
+        digit = k - pygame.K_0                # pygame 常量值 → 数字序号
+        if (k in (pygame.K_4, pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8)
+                and digit not in page_keys.get(self.page, ())):
+            self.page = k - pygame.K_3        # 想法=4 电台=5 行情=6 新闻=7 工具=8
+                                              # (主页仅长按 Esc)
+            self.in_input = False
+        elif k in (pygame.K_LEFT, pygame.K_UP):
+            if self.page == 5:
+                self.tool_grid_key(k)
+            elif self.page == 1:
+                self.move_sel(-2 if k == pygame.K_UP else -1)
+            elif self.page == 2:
+                self.move_rsel(-1)
+            elif self.page == 3 and not self.fdetail:
+                self._move_fsel(-3 if k == pygame.K_UP else -1)
+            elif self.page == 4:
+                if self.news_detail:
+                    self.news_detail_scroll = max(0,
+                        self.news_detail_scroll - 1)   # 上滚一行
+                else:
+                    self.move_news(-1)
+            else:
+                self.page = (self.page - 1) % len(PAGES)
+        elif k in (pygame.K_RIGHT, pygame.K_DOWN):
+            if self.page == 5:
+                self.tool_grid_key(k)
+            elif self.page == 1:
+                self.move_sel(2 if k == pygame.K_DOWN else 1)
+            elif self.page == 2:
+                self.move_rsel(1)
+            elif self.page == 3 and not self.fdetail:
+                self._move_fsel(3 if k == pygame.K_DOWN else 1)
+            elif self.page == 4:
+                if self.news_detail:
+                    self.news_detail_scroll += 1       # 下滚一行
+                else:
+                    self.move_news(1)
+            else:
+                self.page = (self.page + 1) % len(PAGES)
+        elif self.page == 0 and k == pygame.K_t:
+            self.cycle_theme()                # 换肤键仅主页 (工具内 t=输入)
+        elif k == pygame.K_ESCAPE:
+            if self.news_detail:              # 新闻详情 → 关详情
+                self.news_detail = None
+            elif self.fdetail:                # 图表详情 → 关图表
+                self.fdetail = None
+            elif self.page != 0:
+                self.page = 0                 # 回主页
+                self.in_input = False
+                self.osd = ("返回主页", time.monotonic() + 1.0)
+            else:
+                self.esc_hold_at = time.monotonic()
+                # 主页长按 Esc 1s 退出 app (取消确认框交互, 与音乐播放页同款)
+        elif self.page == 1:
+            items = self.idea_items()
+            if k == pygame.K_n or k == pygame.K_4:      # 增加
+                self.ime_clear()
+                self.in_input = True
+                self.buf = ""
+            elif (k == pygame.K_d or k == pygame.K_7) and items:   # 删除
+                self.dialog = ("del", items[self.sel] if self.sel < len(items) else None)
+        elif self.page == 2:
+            digit = k - pygame.K_0
+            if pygame.K_1 <= k <= pygame.K_8:
+                sts_all = self.stations()
+                if digit - 1 < len(sts_all):
+                    self.rsel = digit - 1
+                    self.move_rsel(0)
+                    self.radio_play(sts_all[self.rsel])
+                    return True
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.radio_toggle()              # Enter = 播放/暂停
+            elif k == pygame.K_e:
+                self.radio_lang = "en" if self.radio_lang == "zh" else "zh"
+                self.rsel = 0
+                self.rscroll = 0
+        elif self.page == 5:
+            # 工具入口网格: 数字 1-9/0 直开, Enter 打开
+            # (方向键已在上方分支转入 tool_grid_key; Esc 全局分支 → 回主页)
+            self.tool_grid_key(k)
+        elif self.page == 4:
+            if k == pygame.K_9:                   # 切换新闻源
+                self.news_src_i = (self.news_src_i + 1) % len(NEWS_SOURCES)
+                self.news_sel = self.news_scroll = 0
+                self.news_detail = None
+            digit = k - pygame.K_0
+            if pygame.K_1 <= k <= pygame.K_7 and not self.news_detail:
+                idx = self.news_scroll + digit - 1   # 窗口内 1-7, 翻页复用
+                items = self.news_items()
+                if idx < len(items):
+                    self.news_sel = idx
+                    self.news_detail_scroll = 0
+                    self.news_detail = items[idx]
+
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                items = self.news_items()
+                if 0 <= self.news_sel < len(items):
+                    self.news_detail_scroll = 0
+                    self.news_detail = items[self.news_sel]
+        elif self.page == 3:
+            if self.fdetail:
+                if k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE):
+                    self.fdetail = None
+                elif k == pygame.K_m:
+                    self.fdetail["view"] = "min"
+                    self.fdetail["zoom"] = 1.0
+                elif k == pygame.K_d:
+                    self.fdetail["view"] = "day"
+                    self.fdetail["zoom"] = 1.0
+                elif k == pygame.K_9:             # 放大
+                    self.fdetail["zoom"] = min(4.0, self.fdetail.get("zoom", 1.0) * 1.3)
+                elif k == pygame.K_0:             # 缩小
+                    self.fdetail["zoom"] = max(0.5, self.fdetail.get("zoom", 1.0) / 1.3)
+            else:
+                if k == pygame.K_4:               # 自选股
+                    self.fin_view = 0
+                    self.fsel = self.fscroll = 0
+                elif k == pygame.K_5:             # 指数
+                    self.fin_view = 1
+                    self.fsel = self.fscroll = 0
+                elif k == pygame.K_6:             # 商品
+                    self.fin_view = 2
+                    self.fsel = self.fscroll = 0
+                elif k == pygame.K_8 and self.fin_view == 0:   # 图表
+                    items = self.fin_items()
+                    if 0 <= self.fsel < len(items):
+                        it = items[self.fsel]
+                        self.open_detail(qt_code(it["code"]),
+                                         it.get("name") or it["code"])
+                elif k in (pygame.K_RETURN, pygame.K_KP_ENTER) and \
+                        self.fin_view == 0:
+                    items = self.fin_items()   # 在分支内取, 避免未赋值引用
+                    if 0 <= self.fsel < len(items):
+                        it = items[self.fsel]
+                        self.open_detail(qt_code(it["code"]),
+                                         it.get("name") or it["code"])
+        return True
+
+    # ── 工具页: 入口网格 + 子应用 (参照 tab5 驾驶舱工具页) ───────────────────
+    def cycle_theme(self):
+        self.theme_idx = (self.theme_idx + 1) % len(THEMES)
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            json.dump({"idx": self.theme_idx}, open(THEME_FILE, "w"))
+        except Exception:
+            pass
+
+    def tool_open(self, tid):
+        self.tool = tid
+        self.cv_armed = False
+        self.osd = None
+        if tid == "music":
+            self.esc_hold_at = None           # 进 app 不残留长按态
+            if self.mu_playing is None:
+                self.mu_session_restore()     # 空态 → 恢复上次会话 (暂停在位)
+            self.mu_view = "play"             # 主页=播放页 (空态显示无标题, 0 选源)
+
+    def tool_grid_key(self, k):
+        """入口网格: 方向键移光标 / 数字 1-9,0 直开 / Enter 打开."""
+        n = len(TOOL_APPS)
+        if k in (pygame.K_LEFT, pygame.K_UP, pygame.K_RIGHT, pygame.K_DOWN):
+            d = -1 if k in (pygame.K_LEFT, pygame.K_UP) else 1
+            if k in (pygame.K_UP, pygame.K_DOWN):
+                d *= TOOL_GRID
+            self.tsel = max(0, min(n - 1, self.tsel + d))
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.tool_open(TOOL_APPS[self.tsel][0])
+        elif k == pygame.K_0:
+            if n > 9:                       # 第 10 个 app 才占 0 键
+                self.tool_open(TOOL_APPS[9][0])
+        elif pygame.K_1 <= k <= pygame.K_9:
+            if k - pygame.K_1 < n:
+                self.tool_open(TOOL_APPS[k - pygame.K_1][0])
+
+    def tool_close(self):
+        if self.tool == "music" and self.mu_view == "qr":
+            self.mu_qr.stop()                 # 扫码轮询线程停 (绑定状态留存)
+        self.tool = None
+        self.osd = None
+
+    def tool_head(self, surf, title, hint, dy=0):
+        text(surf, title, 14, self.th("hi"), (6, 2 + dy))
+        if hint:
+            text(surf, hint, 9, self.th("dim"), (W - 6, 5 + dy), right=True)
+
+    def tool_foot(self, surf, labels):
+        hx = 6
+        for lab in labels:
+            text(surf, lab, 12, self.th("soft"), (hx, 151))
+            hx += textw(lab, 12) + textw("我", 12)
+
+    def tool_key(self, k, ch):
+        t = self.tool
+        if t in ("fx", "unit"):
+            return self.cv_key(k, ch, t == "fx")
+        if t == "cal":
+            return self.cal_key(k)
+        if t == "ssq":
+            return self.ssq_key(k)
+        if t == "timer":
+            return self.timer_key(k)
+        if t == "music":
+            return self.mu_key(k, ch)
+        return True
+
+    # ── 汇率 / 单位换算 (共用字段模型: 0 金额 1 源 2 目标 3 类别) ──
+    def cv_key(self, k, ch, is_fx):
+        n = len(FX_CODES) if is_fx else len(UCATS)
+        if k in (pygame.K_LEFT, pygame.K_RIGHT):
+            d = -1 if k == pygame.K_LEFT else 1
+            mx = 2 if is_fx else 3              # fx 无类别字段
+            self.cv_field = (self.cv_field + d) % (mx + 1)
+        elif k in (pygame.K_UP, pygame.K_DOWN):
+            d = 1 if k == pygame.K_UP else -1    # UP 增加 / DOWN 减少
+            f = self.cv_field
+            if f == 0:
+                self._cv_amt_bump(d, is_fx)
+            elif f == 1:
+                self._cv_set(is_fx, "from", (self._cv_get(is_fx, "from") + d) % n)
+            elif f == 2:
+                self._cv_set(is_fx, "to", (self._cv_get(is_fx, "to") + d) % n)
+            elif not is_fx:
+                self.u_cat = (self.u_cat + d) % len(UCATS)
+                nu = len(UCATS[self.u_cat][1])
+                self.u_from = min(self.u_from, nu - 1)
+                self.u_to = min(self.u_to, nu - 1)
+        elif k == pygame.K_e:
+            a = self._cv_get(is_fx, "from")
+            self._cv_set(is_fx, "from", self._cv_get(is_fx, "to"))
+            self._cv_set(is_fx, "to", a)
+        elif not is_fx and k == pygame.K_r:
+            self.u_cat = (self.u_cat + 1) % len(UCATS)
+            nu = len(UCATS[self.u_cat][1])
+            self.u_from = min(self.u_from, nu - 1)
+            self.u_to = min(self.u_to, nu - 1)
+        elif ch and (ch.isdigit() or ch == "."):
+            self._cv_amt_char(ch, is_fx)
+        elif k == pygame.K_BACKSPACE:
+            self._cv_amt_char(None, is_fx)
+        return True
+
+    def _cv_get(self, is_fx, which):
+        return (self.fx_from if which == "from" else self.fx_to) if is_fx \
+            else (self.u_from if which == "from" else self.u_to)
+
+    def _cv_set(self, is_fx, which, v):
+        if is_fx:
+            if which == "from":
+                self.fx_from = v
+            else:
+                self.fx_to = v
+        elif which == "from":
+            self.u_from = v
+        else:
+            self.u_to = v
+
+    def _cv_amt_attr(self, is_fx):
+        return "fx_amt" if is_fx else "u_amt"
+
+    def _cv_amt_char(self, ch, is_fx):
+        attr = self._cv_amt_attr(is_fx)
+        v = getattr(self, attr)
+        if ch is None:                        # backspace
+            v = v[:-1]
+            if not v:
+                self.cv_armed = False
+        elif not self.cv_armed:               # 首键: 覆盖默认值
+            v = "0." + ch if ch == "." else ch
+            self.cv_armed = True
+        elif ch == ".":
+            if "." not in v:
+                v += "."
+                self.cv_armed = True
+        elif len(v.replace(".", "")) < 10:
+            v += ch
+        setattr(self, attr, v if v not in ("", ".") else "0")
+
+    def _cv_amt_bump(self, d, is_fx):
+        attr = self._cv_amt_attr(is_fx)
+        try:
+            v = float(getattr(self, attr))
+        except ValueError:
+            v = 0.0
+        v = max(0.0, round(v + d, 2))
+        setattr(self, attr, fmt_num(v).replace(",", ""))
+
+    # ── 健康 ──
+    def cal_key(self, k):
+        if k in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
+            y, m = self._cal_ym()
+            if k in (pygame.K_UP, pygame.K_DOWN):   # ↑↓ 换年
+                y += -1 if k == pygame.K_UP else 1
+            else:                                    # ←→ 换月 (跨年进退)
+                m += -1 if k == pygame.K_LEFT else 1
+                if m == 0:
+                    y, m = y - 1, 12
+                if m == 13:
+                    y, m = y + 1, 1
+            self.cal_ym = (y, m)
+        elif k == pygame.K_n:                        # n 回今天
+            t = time.localtime()
+            self.cal_ym = (t.tm_year, t.tm_mon)
+        return True
+
+    # ── 双色球 ──
+    SSQ_RED, SSQ_BLUE = (224, 32, 32), (42, 107, 224)
+
+    def ssq_key(self, k):
+        if k in (pygame.K_UP, pygame.K_DOWN):
+            n = len((self.data.get("ssq") or {}).get("issues") or [])
+            d = -1 if k == pygame.K_UP else 1
+            self.ssq_scroll = max(0, min(n - 1, self.ssq_scroll + d))
+        return True
+
+    def timer_key(self, k):
+        if self.tm_run:
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.tm_run = False          # 暂停
+                self.tm_left = max(0.0, self.tm_end - time.monotonic())
+            elif k == pygame.K_r:
+                self.tm_run = self.tm_done = False
+                self.tm_left = float(self.tm_dur)
+            return True
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if self.tm_left <= 0 or self.tm_done:
+                self.tm_left = float(self.tm_dur)
+            self.tm_done = False
+            self.tm_run = True
+            self.tm_end = time.monotonic() + self.tm_left
+        elif k == pygame.K_r:
+            self.tm_run = self.tm_done = False
+            self.tm_left = float(self.tm_dur)
+        elif pygame.K_1 <= k <= pygame.K_6:
+            self.tm_dur = TM_PRESETS[k - pygame.K_1] * 60
+            self.tm_left = float(self.tm_dur)
+            self.tm_done = False
+        elif k in (pygame.K_LEFT, pygame.K_RIGHT):
+            self.tm_dur = max(10, self.tm_dur + (60 if k == pygame.K_RIGHT else -60))
+            self.tm_left = float(self.tm_dur)
+            self.tm_done = False
+        elif k in (pygame.K_UP, pygame.K_DOWN):
+            self.tm_dur = max(10, self.tm_dur + (10 if k == pygame.K_DOWN else -10))
+            self.tm_left = float(self.tm_dur)
+            self.tm_done = False
+        return True
+
+    def timer_tick(self):
+        """倒计时推进 + 结束蜂鸣 (poll 每秒调用)."""
+        if self.tm_run:
+            self.tm_left = max(0.0, self.tm_end - time.monotonic())
+            if self.tm_left <= 0:
+                self.tm_run = False
+                self.tm_done = True
+                self.tm_beep()
+                self.osd = ("计时结束", time.monotonic() + 3.0)
+
+    def tm_beep(self):
+        if self.beep_proc and self.beep_proc.poll() is None:
+            return
+        try:
+            gen_beep()
+            self.beep_proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "/tmp/dz_beep.wav"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=_AUDIO_ENV, **_FFPLAY_KW)
+        except Exception:
+            pass
+
+    # ── 播放器 (TAB5 app_player 移植: HA media_player 遥控, 本机不出声) ──
+    def _cal_ym(self):
+        if self.cal_ym is None:
+            t = time.localtime()
+            self.cal_ym = (t.tm_year, t.tm_mon)
+        return self.cal_ym
+
+    def _move_fsel(self, d):
+        n = len(self.fin_items()) if self.fin_view == 0 else 8
+        if not n:
+            return
+        if abs(d) == 3:                       # 上/下越界 → 底/顶同列循环
+            new = self.fsel + d
+            if new < 0:
+                new = min(n - 1, ((n - 1) // 3) * 3 + self.fsel % 3)
+            elif new >= n:
+                new = min(n - 1, self.fsel % 3)
+            self.fsel = new
+        else:                                 # 左/右夹紧
+            self.fsel = max(0, min(n - 1, self.fsel + d))
+        if self.fsel < self.fscroll:
+            self.fscroll = self.fsel
+        if self.fsel >= self.fscroll + 6:
+            self.fscroll = self.fsel - 5
+
+    def keyup(self, k):
+        """Esc 松开: 长按退出 (音乐播放页/主页) 未满 1s → 取消."""
+        if k == pygame.K_ESCAPE:
+            self.esc_hold_at = None
+
+    def move_rsel(self, d):
+        n = len(self.stations())
+        if not n:
+            return
+        self.rsel = (self.rsel + d) % n          # 循环: 顶部↑到底部, 反之亦然
+        rows = 8
+        if self.rsel < self.rscroll:
+            self.rscroll = self.rsel
+        if self.rsel >= self.rscroll + rows:
+            self.rscroll = self.rsel - rows + 1
+
+    def move_sel(self, d):
+        n = len(self.idea_items())
+        if not n:
+            return
+        vis = min(n, 4)
+        if self.scroll <= self.sel < self.scroll + vis:
+            row, col = divmod(self.sel - self.scroll, 2)   # 2×2 网格行保持环绕
+            if abs(d) == 2:
+                row = (row + d // 2) % 2
+            else:
+                col = (col + d) % 2
+            self.sel = self.scroll + row * 2 + col
+        else:
+            self.sel = max(0, min(n - 1, self.sel + d))
+        if self.sel < self.scroll:
+            self.scroll = (self.sel // 4) * 4
+        if self.sel >= self.scroll + 4:
+            self.scroll = (self.sel // 4) * 4
+
+    def _pl_lrc_parse(s):
+        """LRC → [(秒, 文本)]; 多时间戳行展开, 稳定排序 (tab5 同款)."""
+        out = []
+        for ln in (s or "").splitlines():
+            stamps = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", ln)
+            if not stamps:
+                continue
+            txt = re.sub(r"\[(\d+):(\d+(?:\.\d+)?)\]", "", ln).strip()
+            for mm, ss in stamps:
+                out.append((int(mm) * 60 + float(ss), txt))
+        out.sort(key=lambda x: x[0])
+        return out
+
+    def adjust_volume(self, code):
+        try:
+            env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/1000")
+            if code == 113:                   # Fn+A 静音
+                subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
+                               timeout=2, check=False, env=env)
+            else:                             # Fn+D 音量- / Fn+S 音量+
+                vol = subprocess.run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+                                     capture_output=True, text=True, timeout=2,
+                                     env=env).stdout
+                m = re.search(r"(\d+)%", vol)
+                # pactl 相对增减可超 100% (软件增益, 会破音), 钳到系统上限 100
+                cur = max(0, min(100, (int(m.group(1)) if m else 100)
+                                 + (-5 if code == 114 else 5)))
+                subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@",
+                                "%d%%" % cur],
+                               timeout=2, check=False, env=env)
+            vol = subprocess.run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+                                 capture_output=True, text=True, timeout=2,
+                                 env=env).stdout
+            mute = subprocess.run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"],
+                                  capture_output=True, text=True, timeout=2,
+                                  env=env).stdout
+            m = re.search(r"(\d+)%", vol)
+            label = "音量 " + m.group(1) + "%" if m else "音量?"
+            if "yes" in mute:
+                label = "静音 " + label
+            self.osd = (label, time.monotonic() + 1.2)
+        except Exception:
+            self.osd = ("音量调节不可用", time.monotonic() + 1.0)
+
+    # ── 绘制 ──
+    def esc_hold_poll(self):
+        """长按 Esc ≥1s: 音乐播放页=退出音乐, 主页=退出 dash
+        (draw 每帧调; 松开 keyup 取消)."""
+        if self.esc_hold_at is None:
+            return
+        in_music = self.tool == "music" and self.mu_view == "play"
+        in_home = not self.tool and self.page == 0
+        if not (in_music or in_home):
+            self.esc_hold_at = None
+            return
+        if time.monotonic() - self.esc_hold_at >= 1.0:
+            if in_music:
+                self.esc_hold_at = None       # 音乐退出: 条随播放页消失
+                self.tool_close()
+            else:
+                # 主页退 dash: 保留满条 + "退出中" (2026-11-14 用户定版:
+                # 此前同帧清零 → 清理期屏幕上是退回 0 的空条)
+                self.esc_exit = True
+
+    def draw_exit_bar(self, surf, frac):
+        """退出进度条 (主页退 dash / 音乐播放页退音乐共用): 22px 高盖住底部
+        菜单栏, 条一出现即常显 '退出中' (无底色垫片, hi 色在 track 深底上
+        清晰; 2026-11-14 用户定版: 背景片突兀, 去掉)."""
+        pygame.draw.rect(surf, self.th("track"), (0, H - 22, W, 22))
+        pygame.draw.rect(surf, self.th("accent"),
+                         (0, H - 22, max(8, int(W * frac)), 22))
+        textc(surf, "退出中", 11, self.th("hi"), W // 2, H - 19)
+
+    def draw(self, surf):
+        self.esc_hold_poll()
+        t = time.localtime()
+        surf.fill(self.th("page"))
+        if self.tool:
+            self.draw_tool(surf)
+        elif self.page == 0:
+            self.draw_home(surf, t)
+        elif self.page == 1:
+            self.draw_ideas(surf)
+        elif self.page == 2:
+            self.draw_radio(surf)
+        elif self.page == 3:
+            self.draw_fin(surf)
+        elif self.page == 4:
+            self.draw_news(surf)
+        else:
+            self.draw_tools(surf)
+        _ex = 1.0 if self.esc_exit else None
+        if _ex is None and not self.tool and self.page == 0 \
+                and self.esc_hold_at is not None:
+            _ex = min(1.0, (time.monotonic() - self.esc_hold_at) / 1.0)
+        if _ex is None:
+            self.draw_tabs(surf)
+        else:
+            self.draw_exit_bar(surf, _ex)   # 退出条遮底栏 (主页退 dash)
+        self.draw_osd(surf)
+        self.draw_dialog(surf)
+
+    def draw_radio(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        border, track = self.th("border"), self.th("track")
+        BODY = 13                                # 与想法页同字号
+        sts = self.stations()
+        playing = bool(self.playing_key)
+        LX, LW = 2, 158                          # 列表区 (左, 半屏)
+        RX, RW = 164, 152                        # VU 区 (右, 半屏)
+
+        # 头部
+        text(surf, "电台", 14, hi, (6, 2))
+        tab = "EN" if self.radio_lang == "en" else "中文"
+        text(surf, "· %s %d 台 · e 切换" % (tab, len(sts)), 11, dim,
+             (6 + textw("电台", 14) + 6, 4))
+        text(surf, "1-8 换台 · Enter 播/停 · e 中/英 · Fn+S/D 音量", 13, soft, (6, 151))
+
+        # 电台列表 (左)
+        rows = 8
+        y0, rh = 20, 15
+        for i in range(rows):
+            idx = self.rscroll + i
+            if idx >= len(sts):
+                break
+            st = sts[idx]
+            y = y0 + i * rh
+            on = st["key"] == self.playing_key
+            sel = idx == self.rsel
+            if idx == self.rsel:
+                pygame.draw.rect(surf, track, (LX, y, LW, rh - 1), border_radius=3)
+                pygame.draw.rect(surf, acc, (LX, y, 2, rh - 1))
+            if on:
+                pygame.draw.polygon(surf, acc, [(LX + 8, y + 4), (LX + 8, y + 12),
+                                                (LX + 15, y + 8)])
+            name_col = hi if (on or idx == self.rsel) else soft
+            text(surf, str(idx + 1), 11, acc if sel else dim,
+                 (LX + 4, y + 2))
+            tx = LX + (20 if on else 16)
+            text(surf, clip_text(st.get("name", ""), BODY, LW - 48 - tx),
+                 BODY, name_col, (tx, y + 1))
+            fq = st.get("freq") or 0
+            if fq > 0:
+                text(surf, "FM%.1f" % (fq / 10.0), 10, dim,
+                     (LX + LW - 4, y + 3), right=True)
+
+        if not sts:
+            textc(surf, "无电台", BODY, dim, LX + LW // 2, 70)
+
+        # 右侧 VU 面板 (常驻): 播放中跳动, 未播放静止低位
+        if True:
+            if playing:
+                lvb, lvm, lvt = self.lvl.lvl
+                self.vu_tick(time.monotonic(), lvb, lvm, lvt)
+            cur = next((s["name"] for s in sts if s["key"] == self.playing_key),
+                       None)
+            r = pygame.Rect(RX, 16, RW, 130)
+            pygame.draw.rect(surf, self.card(0), r, border_radius=5)
+            pygame.draw.rect(surf, border, r, 1, border_radius=5)
+            text(surf, "播放中" if playing else "未播放", 10,
+                 acc if playing else dim, (r.x + 8, r.y + 4))
+            text(surf, clip_text(cur if cur else "—", 13, RW - 16), 13,
+                 hi if cur else dim, (r.x + 8, r.y + 17))
+            nb, bw2, bgap = 12, 9, 2.2
+            bh = r.height - 46
+            bx0 = r.x + (RW - (nb * bw2 + (nb - 1) * bgap)) // 2
+            by = r.y + 40
+            for i in range(nb):
+                bxx = bx0 + i * (bw2 + bgap)
+                pygame.draw.rect(surf, track, (bxx, by, bw2, bh), border_radius=2)
+                fh = max(3, min(bh, int(self.vu[i] / 28.0 * bh)))
+                pygame.draw.rect(surf, acc, (bxx, by + bh - fh, bw2, fh),
+                                 border_radius=2)
+                ph = min(bh, int(self.vu_pk[i] / 28.0 * bh))
+                if ph > fh:
+                    pygame.draw.rect(surf, hi,
+                                     (bxx, by + bh - ph - 2, bw2, 2))
+    def draw_ideas(self, surf):
+        hi, soft, dim = self.th("hi"), self.th("soft"), self.th("dim")
+        acc = self.th("accent")
+        border = self.th("border")
+        items = self.idea_items()
+        BODY = 13                                # 与农历/主页正文同字号
+
+        # 头部
+        text(surf, "想法", 12, hi, (6, 3))
+        text(surf, "· %d 条" % len(items), 10, dim,
+             (6 + textw("想法", 12) + 6, 5))
+
+        # 卡片网格 2×2: 4 张卡常驻 (时间行 + 内容 ≤2 行), 工具条固定在下方
+        M, GW, GH, gap = 4, 154, 62, 4
+        y0 = 16
+        pos = [(M, y0), (M + GW + gap, y0),
+               (M, y0 + GH + gap), (M + GW + gap, y0 + GH + gap)]
+        for i in range(4):
+            idx = self.scroll + i
+            r = pygame.Rect(pos[i][0], pos[i][1], GW, GH)
+            sel = idx == self.sel
+            have = idx < len(items)
+            pygame.draw.rect(surf, self.card(0) if have else self.th("track"),
+                             r, border_radius=5)
+            pygame.draw.rect(surf, acc if sel else border, r,
+                             2 if sel else 1, border_radius=5)
+            if not have:
+                continue
+            it = items[idx]
+            lines = self._wrap_lines(it.get("text") or "", BODY, GW - 16, 3)
+            ts = time.localtime(it["createdAt"] / 1000.0)
+            n_lines = len(lines)
+            blk = 12 + 2 + n_lines * 14 - 2        # 时间行 + 间距 + 内容块
+            ty = r.y + max(4, (GH - blk) // 2 - 3)  # 垂直居中偏上 3px (顶部保底 4px)
+            text(surf, "%02d-%02d %02d:%02d" % (ts.tm_mon, ts.tm_mday,
+                                                ts.tm_hour, ts.tm_min),
+                 10, dim, (r.x + 8, ty))
+            ly = ty + 15
+            for ln in lines[:n_lines]:
+                text(surf, ln, BODY, hi if sel else soft, (r.x + 8, ly))
+                ly += 14
+
+        if not items:
+            textc(surf, "暂无想法 · 按 n 记一条", BODY, dim, W // 2, 70)
+
+        # 输入行 (第 4 张卡的位置, 底 141 不越菜单, 框内元素全部收在框里)
+        if self.in_input:
+            r = pygame.Rect(M, 116, W - 2 * M, 27)
+            pygame.draw.rect(surf, self.card(0), r, border_radius=5)
+            pygame.draw.rect(surf, acc, r, 1, border_radius=5)
+            ty = r.y + (27 - 13) // 2          # 框内垂直居中
+            text(surf, ">", BODY, acc, (r.x + 8, ty))
+            tag = "拼" if self.ime_mode else "EN"
+            text(surf, tag, 10, acc, (r.x + 22, ty + 1))
+            shown = clip_text(self.buf + self.ime_buf, BODY, 150)
+            text(surf, shown, BODY, hi, (r.x + 40, ty))
+            if int(time.monotonic() * 2) % 2 == 0:
+                cx = r.x + 40 + textw(shown, BODY) + 1
+                pygame.draw.rect(surf, acc, (cx, ty + 2, 7, 13))
+            text(surf, "/ 英 · Enter 存", 9, dim, (r.right - 8, ty + 3),
+                 right=True)
+
+        # 底部快捷键提示 (拼音候选条激活时让位; 左侧留 2 字符宽)
+        if not (self.in_input and self.ime_bar(surf, 146)):
+            hx = 6 + textw("我我", 13)
+            for lab in ("4 增加", "7 删除"):
+                text(surf, lab, 13, soft, (hx, 151))
+                hx += textw(lab, 13) + textw("我我我", 13)
+
+    def _news_items(self):
+        j = self.data.get("news") or {}
+        ai = (j.get("feeds") or {}).get("ai") or {}
+        return [it for it in (ai.get("items") or []) if it.get("t")][:12]
+
+    def _wrap_lines(self, s_, size, maxw, n):
+        """按像素宽折行, 最多 n 行 (超出并到末行加省略号截断).
+        逐字符折行对邮件 800 字符全文是 O(n²) 渲染 (详情页每帧重算 → 冻结),
+        改逐行二分找断点, 结果按参数缓存 (详情打开期间文本不变)."""
+        key = (str(s_), size, maxw, n)
+        hit = _wrap_cache.get(key)
+        if hit is not None:
+            return list(hit)
+        out = _wrap_lines_impl(s_, size, maxw, n)
+        if len(_wrap_cache) > 600:
+            _wrap_cache.clear()
+        _wrap_cache[key] = out
+        return list(out)
+
+    def draw_home(self, surf, t):
+        hi, soft, dim = self.th("hi"), self.th("soft"), self.th("dim")
+        acc = self.th("accent")
+        border = self.th("border")
+        M = 4                                    # 屏边距 = 卡距
+        BODY = 13                                # 正文字号 (除时钟外统一)
+
+        # ── 左主卡: 时钟/日期+农历/天气/新股 ──
+        LW = 112
+        r = pygame.Rect(M, M, LW, 137)
+        pygame.draw.rect(surf, self.card(0), r, border_radius=6)
+        pygame.draw.rect(surf, border, r, 1, border_radius=6)
+        ccx = r.x + LW // 2
+
+        hm = "%02d:%02d" % (t.tm_hour, t.tm_min)
+        ss = "%02d" % t.tm_sec
+        grp = textw(hm, 30) + 4 + textw(ss, 12)
+        x0 = ccx - grp // 2
+        text(surf, hm, 30, hi, (x0, 12))
+        # 秒与分底部对齐 (30px/12px 字形底差 ≈13, 实测校正)
+        text(surf, ss, 12, dim, (x0 + textw(hm, 30) + 4, 25))
+
+        # 时钟下方四行 (日期/农历/天气/新股) 等距; 电池图标贴底
+        rows_y = []
+        top_y, bot_y = 42, r.bottom - 22
+        n_rows = 4
+        slot = (bot_y - top_y) / n_rows
+        for i in range(n_rows):
+            rows_y.append(int(top_y + i * slot + (slot - 9) // 2))
+
+        wd = WEEK_ZH[t.tm_wday]
+        textc(surf, "%02d月%02d日 %s" % (t.tm_mon, t.tm_mday, wd), BODY, soft,
+              ccx, rows_y[0])
+        textc(surf, "农历" + lunar.lunar_text(t.tm_year, t.tm_mon, t.tm_mday),
+              BODY, soft, ccx, rows_y[1])
+        wx = self.data.get("wx") or {}
+        cw = wx.get("current_weather") or {}
+        if cw.get("temperature") is not None:
+            temp = "%d°" % round(cw["temperature"])
+            cond = wx_code_zh(cw.get("weathercode", -1)) or "—"
+            textc(surf, clip_text(temp + " " + cond + " · " + WX_HOME["city"],
+                                  BODY, 104), BODY, hi, ccx, rows_y[2])
+        else:
+            textc(surf, "天气获取中" if self.net.mode != "offline" else "离线",
+                  BODY, dim, ccx, rows_y[2])
+        ipo = self.data.get("ipo") or {}
+        ip = (ipo.get("items") or [])[:1]
+        if ipo.get("ok") and ip:
+            it = ip[0]
+            textc(surf, clip_text("新股 " + (it.get("name") or "") + " " +
+                                  (it.get("date") or "") +
+                                  ("(今)" if it.get("today") else ""),
+                                  BODY, LW - 6), BODY, soft, ccx, rows_y[3])
+        else:
+            textc(surf, "新股 · 暂无", BODY, dim, ccx, rows_y[3])
+        # 电池图标 (贴底右下, 距底边 = 时钟距顶边 8px): 外壳+电量填充+正极头
+        bp, bs = battery_state()
+        if bp is not None:
+            charging = bs.startswith("Charg")
+            col = (acc if charging else
+                   (self.th("warn") if bp < 20 else soft))
+            iw, ih = 16, 8                        # 图标尺寸
+            ix = r.right - 8 - iw - 2             # 留出极头
+            iy = r.bottom - 8 - ih
+            pygame.draw.rect(surf, col, (ix, iy, iw, ih), 1, border_radius=2)
+            pygame.draw.rect(surf, col, (ix + iw, iy + 3, 2, ih - 6),
+                             border_radius=1)      # 正极头
+            fw = int((iw - 4) * bp / 100.0)
+            if fw > 0:
+                pygame.draw.rect(surf, col, (ix + 2, iy + 2, fw, ih - 4))
+            if charging:                          # 充电: 闪电标
+                pygame.draw.polygon(surf, hi, [
+                    (ix + iw // 2 + 1, iy + 1), (ix + iw // 2 - 3, iy + ih // 2),
+                    (ix + iw // 2, iy + ih // 2), (ix + iw // 2 - 1, iy + ih - 1),
+                    (ix + iw // 2 + 3, iy + ih // 2 + 1),
+                    (ix + iw // 2, iy + ih // 2 + 1)])
+
+        # ── 右列两卡: 每日一句 / 新闻 ──
+        cx = M + LW + M                            # 124
+        cw2 = W - cx - M                           # 192
+        chh, gap = 43, M
+        tops = (M, M + chh + gap)
+        for i, (lab, top) in enumerate(zip(("每日一句", "新闻"), tops)):
+            rr = pygame.Rect(cx, top, cw2, chh)
+            pygame.draw.rect(surf, self.card(i + 1), rr, border_radius=6)
+            pygame.draw.rect(surf, border, rr, 1, border_radius=6)
+            text(surf, lab, 8, dim, (rr.x + 8, rr.y + 3))
+        # 每日一句: 垂直居中, 最多两行 + 出处
+        top0 = tops[0]
+        hk = self.data.get("hitokoto") or {}
+        if hk.get("text"):
+            txt = hk["text"]
+            if hk.get("from"):
+                txt += " — " + hk["from"]
+            lines = self._wrap_lines(txt, BODY, cw2 - 16, 2)
+            zone_h = chh - 13
+            used = 15 if len(lines) > 1 else 13
+            ty = top0 + 13 + (zone_h - used) // 2
+            for li, ln in enumerate(lines):
+                text(surf, ln, BODY, soft if li == 0 else dim,
+                     (cx + 8, ty + li * 15))
+        else:
+            text(surf, "获取中" if self.net.mode == "online" else "--",
+                 BODY, dim, (cx + 8, top0 + 13 + (chh - 13 - BODY) // 2))
+        # 新闻: 单行 BODY px 垂直居中, 超宽横向跑马灯, 滚完一条再换
+        top1 = tops[1]
+        news = self._news_items()
+        now = time.monotonic()
+        if news:
+            vw = cw2 - 16
+            headline = news[self.news_i]["t"]
+            tw = textw(headline, BODY)
+            if tw <= vw:
+                if now - self._news_at > 10:
+                    self._news_at = now
+                    self.news_i = (self.news_i + 1) % len(news)
+            else:
+                SPEED = 28.0                       # px/s
+                span = tw + vw + 24                # 右进左出全程
+                if now - self._news_at > span / SPEED + 1.2:
+                    self._news_at = now
+                    self.news_i = (self.news_i + 1) % len(news)
+                    headline = news[self.news_i]["t"]
+                    tw = textw(headline, BODY)
+                vy2 = top1 + 13 + (chh - 13 - BODY) // 2
+                off = (now - self._news_at) * SPEED
+                x = cx + 8 + vw - off              # 右缘进入, 向左滚出
+                surf.set_clip((cx + 8, top1, vw, chh))
+                text(surf, headline, BODY, soft, (x, vy2))
+                surf.set_clip(None)
+        else:
+            text(surf, "获取中" if self.net.mode != "offline" else "离线",
+                 BODY, dim, (cx + 8, top1 + 16))
+
+    # ── 行情页: 自选/指数/商品 三子页 ──
+    FIN_TABS = ["自选股", "指数", "商品"]
+
+    @staticmethod
+    def _tint(base, col, t):
+        """向目标色混合 t (0-1), 用于涨红/跌绿卡片底."""
+        return tuple(int(base[i] + (col[i] - base[i]) * t) for i in range(3))
+
+    def _chg_col(self, v):
+        """红涨绿跌 (car-dash 同款: up=danger, down=ok)."""
+        if v > 0.005:
+            return self.th("danger")
+        if v < -0.005:
+            return self.th("ok")
+        return self.th("dim")
+
+    def _fmt_pct(self, v):
+        return ("+" if v > 0 else "") + "%.2f%%" % v
+
+    @staticmethod
+    def _flag_icon(surf, x, y, col):
+        """红色旗子图形: 旗杆 + 三角旗 (字体无 emoji 的替代)."""
+        pygame.draw.line(surf, col, (x, y), (x, y + 11), 2)
+        pygame.draw.polygon(surf, col, [(x + 1, y), (x + 11, y + 3), (x + 1, y + 7)])
+
+    def _fmt_price(self, v):
+        if v >= 10000:
+            return "%.0f" % v
+        if v >= 1000:
+            return "%.1f" % v
+        return "%.2f" % v
+
+    def fin_items(self):
+        """自选股: 本地 watchlist + 实时 quotes 覆盖."""
+        items = [dict(it) for it in self.watch.get("items", [])
+                 if it.get("code")][:16]
+        qt = parse_qt_text(self.data.get("quotes") or "")
+        for it in items:
+            f = qt.get(qt_code(it["code"]))
+            if qt_ok(f):
+                it["price"] = qt_num(f, 3)
+                it["chg"] = qt_num(f, 31)
+                it["pchg"] = qt_num(f, 32)
+        return items
+
+    def idx_cards(self):
+        qt = parse_qt_text(self.data.get("idx") or "")
+        out = []
+        for name, code in IDX_LIST:
+            f = qt.get(code)
+            if qt_ok(f):
+                out.append((name, code, qt_num(f, 3), qt_num(f, 31),
+                            qt_num(f, 32)))
+            else:
+                out.append((name, code, 0, 0, 0))
+        return out
+
+    def cmd_cards(self):
+        hf = parse_hf_text(self.data.get("cmd") or "")
+        btc = None
+        g = self.data.get("gate")
+        if isinstance(g, list) and g:
+            try:
+                if float(g[0].get("last") or 0) > 0:
+                    btc = g[0]
+            except (TypeError, ValueError, KeyError, IndexError):
+                btc = None
+        out = []
+        for name, code in CMD_LIST:
+            if code is None:
+                if btc:
+                    price = float(btc.get("last") or 0)
+                    pct = float(btc.get("change_percentage") or 0)
+                    out.append((name, "USDT", price, price * pct / 100.0, pct))
+                else:
+                    out.append((name, "USDT", 0, 0, 0))
+            else:
+                f = hf.get(code)
+                if f and qt_num(f, 0) > 0:
+                    price = qt_num(f, 0)
+                    pct = qt_num(f, 1)
+                    out.append((name, code.replace("hf_", ""), price,
+                                price * pct / 100.0, pct))
+                else:
+                    out.append((name, "", 0, 0, 0))
+        return out
+
+    def draw_fin(self, surf):
+        hi, soft, dim = self.th("hi"), self.th("soft"), self.th("dim")
+        acc = self.th("accent")
+        border = self.th("border")
+        BODY = 13
+        M = 4
+        view = self.fin_view
+
+        # 头部 (图表详情显示股票名, 不显示总标题)
+        if not self.fdetail:
+            text(surf, "行情", 14, hi, (6, 2))
+            text(surf, "· " + self.FIN_TABS[view], 11, dim,
+                 (6 + textw("行情", 14) + 6, 4))
+
+        if self.fdetail:
+            self.draw_fin_detail(surf)
+
+        else:
+            # 2 行 × 3 列卡片 (car-dash 股票卡: 涨红跌绿底)
+            if view == 0:
+                cards = [(it.get("name") or it["code"], it["code"],
+                          it.get("price") or 0, it.get("chg") or 0,
+                          it.get("pchg") or 0) for it in self.fin_items()]
+            elif view == 1:
+                cards = self.idx_cards()
+            else:
+                cards = self.cmd_cards()
+            base = self.card(0)
+            cols, cwid, chh, tgap = 3, 102, 61, 3
+            for i in range(6):
+                idx = self.fscroll + i
+                if idx >= len(cards):
+                    break
+                name, code, price, chg, pct = cards[idx]
+                colr = self._chg_col(pct)
+                col = self.th("danger") if pct > 0.005 else (
+                    self.th("ok") if pct < -0.005 else acc)
+                bg = self._tint(base, col, 0.22)   # 涨红跌绿底
+                r = pygame.Rect(M + (i % cols) * (cwid + tgap),
+                                16 + (i // cols) * (chh + tgap), cwid, chh)
+                pygame.draw.rect(surf, bg, r, border_radius=5)
+                pygame.draw.rect(surf, border, r, 1, border_radius=5)
+                if view == 0 and idx == self.fsel:
+                    pygame.draw.rect(surf, acc, r, 1, border_radius=5)
+                # 三行数据水平居中, 行距均分 (名称/价格/涨跌)
+                cx = r.x + cwid // 2
+                textc(surf, clip_text(name, 13, cwid - 8), 13, soft,
+                      cx, r.y + 7)
+                textc(surf, self._fmt_price(price) if price else "--", 16,
+                      colr if price else dim, cx, r.y + 25)
+                chgl = ("%s%.2f  %s" % ("+" if chg > 0 else "", chg,
+                                        self._fmt_pct(pct))) if pct else "--"
+                textc(surf, chgl, 11, colr if pct else dim, cx, r.y + 45)
+
+        # 底部子页快捷键
+        y = 151
+        x = 6
+        tabkeys = ["4", "5", "6"]
+        for i, t in enumerate(self.FIN_TABS):
+            col = acc if view == i else dim
+            lab = "%s %s" % (tabkeys[i], t)
+            text(surf, lab, 13, col, (x, y))
+            x += textw(lab, 13) + textw("我我我", 13)
+        if view == 0:
+            text(surf, "8 图表", 13, soft, (W - 6, y), right=True)
+
+    def draw_fin_detail(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        d = self.fdetail
+        code, name = d["code"], d["name"]
+
+        # 头部
+        text(surf, clip_text(name, 13, 120), 13, hi, (6, 3))
+        text(surf, code + (" · 分时" if d["view"] == "min" else " · 日K"), 9,
+             dim, (10 + textw(clip_text(name, 13, 120), 13), 7))
+        text(surf, "9 放大 · 0 缩小 · Enter 返回", 11, dim, (W - 6, 4), right=True)
+
+        # 价格行: 详情价取 quotes, 兜底 portfolio
+        price = pchg = chg = 0
+        qt = parse_qt_text(self.data.get("quotes") or "")
+        f = qt.get(code)
+        if qt_ok(f):
+            price, chg, pchg = qt_num(f, 3), qt_num(f, 31), qt_num(f, 32)
+            prev_close, high, low = qt_num(f, 4), qt_num(f, 33), qt_num(f, 34)
+            turnover = qt_num(f, 37)
+        col = self._chg_col(pchg)
+        text(surf, "%.2f" % price if price else "--", 22, col, (6, 20))
+        px = 12 + textw("%.2f" % price if price else "--", 22)
+        text(surf, "%s%.2f  %s" % ("+" if chg > 0 else "", chg,
+                                   self._fmt_pct(pchg)), 11, col, (px, 30))
+        if f and qt_ok(f):
+            text(surf, "高 %.2f  低 %.2f  昨 %.2f" % (high, low, prev_close),
+                 8, dim, (W - 6, 24), right=True)
+            if turnover:
+                text(surf, ("成交额 %.1f亿" % (turnover / 10000.0)
+                            if turnover >= 10000 else "成交额 %d万" % turnover),
+                     8, dim, (W - 6, 34), right=True)
+
+        # 图表区
+        r = pygame.Rect(2, 44, W - 4, 106)
+        pygame.draw.rect(surf, self.card(0), r, border_radius=4)
+        pygame.draw.rect(surf, self.th("border"), r, 1, border_radius=4)
+        if d["view"] == "min":
+            prices = parse_minute(self.data.get("minute") or {}, code)
+            self._draw_line_chart(surf, r, prices, baseline=prev_close if f else None,
+                                  labels=("9:30", "11:30/13:00", "15:00"),
+                                  zoom=d.get("zoom", 1.0))
+        else:
+            days = parse_day(self.data.get("day") or {}, code)
+            closes = [x[2] for x in days]
+            self._draw_line_chart(surf, r, closes, baseline=None,
+                                  labels=(days[0][0][2:] if days else "",
+                                          "", days[-1][0][2:] if days else ""),
+                                  color=col, zoom=d.get("zoom", 1.0))
+
+    def _draw_line_chart(self, surf, r, ys, baseline=None, labels=("", "", ""),
+                         color=None, zoom=1.0):
+        """折线图: r 区域内画 ys 序列 (+可选昨收基线 + 底部标签)."""
+        dim = self.th("dim")
+        if not ys:
+            textc(surf, "数据获取中…", 9, dim, r.centerx, r.y + 44)
+            return
+        lo, hi_ = min(ys), max(ys)
+        if baseline is not None:
+            lo, hi_ = min(lo, baseline), max(hi_, baseline)
+        center = (lo + hi_) / 2.0
+        half = max((hi_ - lo) / 2.0, 1e-6) / max(0.2, zoom)
+        lo, hi_ = center - half, center + half
+        span = (hi_ - lo) or 1.0
+        pad_t, pad_b = 12, 14
+        ch = r.height - pad_t - pad_b
+        cy0 = r.y + pad_t
+
+        def pt(i, v):
+            x = r.x + 4 + int(i / max(1, len(ys) - 1) * (r.width - 8))
+            y = cy0 + int((hi_ - v) / span * ch)
+            return (x, y)
+
+        surf.set_clip(r)                       # 缩放后线条只画在图框内
+        if baseline is not None:               # 昨收虚线
+            by = pt(0, baseline)[1]
+            for x in range(r.x + 4, r.x + r.width - 4, 8):
+                pygame.draw.line(surf, self.th("border"), (x, by), (x + 4, by), 1)
+        col = color or (self._chg_col(ys[-1] - baseline) if baseline is not None
+                        else self.th("accent"))
+        pts = [pt(i, v) for i, v in enumerate(ys)]
+        if len(pts) > 1:
+            pygame.draw.lines(surf, col, False, pts, 2)
+        # 最新点亮点
+        pygame.draw.circle(surf, col, pts[-1], 2)
+        surf.set_clip(None)
+        # 高低标签 (缩放时原极值已出框, 不显示)
+        if zoom <= 1.01:
+            text(surf, "%.2f" % hi_, 7, dim, (r.x + 6, r.y + 2))
+            text(surf, "%.2f" % lo, 7, dim, (r.x + 6, r.bottom - 12))
+        for lab, xx in zip(labels, (r.x + 6, r.centerx - 12, r.right - 44)):
+            if lab:
+                text(surf, lab, 7, dim, (xx, r.bottom - 11))
+
+    # ── 工具页: 万年历 / 汇率 ──
+    # ── 新闻页 (car-dash 同源 /news/feeds, 13px) ──
+    def news_items(self):
+        j = self.data.get("news") or {}
+        src = NEWS_SOURCES[self.news_src_i][0]
+        feed = (j.get("feeds") or {}).get(src) or {}
+        return [it for it in (feed.get("items") or []) if it.get("t")][:30]
+
+    def move_news(self, d):
+        n = len(self.news_items())
+        if not n:
+            return
+        new = self.news_sel + d
+        if new < self.news_scroll:                # 越过页顶 → 上一页
+            self.news_scroll = max(0, self.news_scroll - 7)
+            self.news_sel = self.news_scroll      # 选中落新页首
+        elif new >= self.news_scroll + 7:         # 越过页底 → 下一页
+            self.news_scroll = min(self.news_scroll + 7, max(0, n - 7))
+            self.news_sel = self.news_scroll
+        else:
+            self.news_sel = max(0, min(n - 1, new))
+
+    def draw_news(self, surf):
+        hi, soft, dim = self.th("hi"), self.th("soft"), self.th("dim")
+        acc = self.th("accent")
+        track = self.th("track")
+        BODY = 15
+        src_name = NEWS_SOURCES[self.news_src_i][1]
+
+        items = self.news_items()
+
+        if self.news_detail:
+            # 详情视图: 头 (源 · 时间) + 全文滚动
+            it = self.news_detail
+            text(surf, "%s · %s" % (src_name, it.get("ts", "")), 11, dim,
+                 (6, 2))
+            t_lines = self._wrap_lines(it.get("t", ""), BODY, W - 12, 999)
+            d_lines = self._wrap_lines(it.get("d", "") or "（无摘要）",
+                                       BODY, W - 12, 999)
+            lines = [(ln, hi) for ln in t_lines] + [(ln, soft) for ln in d_lines]
+            max_scroll = max(0, len(lines) - 7)
+            self.news_detail_scroll = max(0,
+                min(self.news_detail_scroll, max_scroll))
+            lh = 18
+            surf.set_clip((0, 14, W, 134))
+            for k in range(7):
+                li = self.news_detail_scroll + k
+                if li >= len(lines):
+                    break
+                ln, col = lines[li]
+                text(surf, ln, BODY, col, (6, 16 + k * lh))
+            surf.set_clip(None)
+            # 滚动指示三角 (右上=有上文, 右下=有下文)
+            if self.news_detail_scroll > 0:
+                pygame.draw.polygon(surf, dim,
+                                    [(W - 14, 8), (W - 6, 8), (W - 10, 3)])
+            if self.news_detail_scroll < max_scroll:
+                pygame.draw.polygon(surf, dim,
+                                    [(W - 14, 145), (W - 6, 145), (W - 10, 150)])
+            return
+
+        # 列表头
+        text(surf, "新闻", 14, hi, (6, 2))
+        text(surf, "· %s %d 条 · e 切换" % (src_name, len(items)), 11, dim,
+             (6 + textw("新闻", 14) + 6, 4))
+
+        # 列表行: 均匀分布
+        rows = 7
+        y0, rh = 17, 18
+        for i in range(rows):
+            idx = self.news_scroll + i
+            if idx >= len(items):
+                break
+            it = items[idx]
+            y = y0 + i * rh
+            sel = idx == self.news_sel
+            if sel:
+                pygame.draw.rect(surf, track, (2, y, W - 4, rh - 1),
+                                 border_radius=3)
+                pygame.draw.rect(surf, acc, (2, y, 2, rh - 1))
+            text(surf, str(idx - self.news_scroll + 1), BODY,
+                 acc if sel else dim, (8, y + 1))
+            text(surf, clip_text(it.get("t", ""), BODY, 226),
+                 BODY, hi if sel else soft, (26, y + 1))
+            if it.get("ts"):
+                text(surf, it["ts"], 10, dim, (W - 6, y + 2), right=True)
+
+        if not items:
+            textc(surf, "新闻获取中" if self.net.mode != "offline"
+                  else "离线 · 联网后同步", BODY, dim, W // 2, 70)
+        text(surf, "F/X 换页 · 1-7 打开 · 9 切换源", BODY, soft, (6, 151))
+
+    def draw_tool(self, surf):
+        {"fx": self.draw_fx, "unit": self.draw_unit,
+         "cal": self.draw_cal_app, "ssq": self.draw_ssq,
+         "timer": self.draw_timer, "music": self.draw_mu}[self.tool](surf)
+
+    def draw_tools(self, surf):
+        acc, hi, soft = self.th("accent"), self.th("hi"), self.th("soft")
+        border = self.th("border")
+        # 无信息栏, 卡片满屏: 四边距离 = 行列间距 (4px)
+        cols, gap, edge = TOOL_GRID, 4, 4
+        n = len(TOOL_APPS)
+        rows = (n + cols - 1) // cols
+        cw = (W - edge * 2 - gap * (cols - 1)) // cols
+        ch = (H - edge * 2 - gap * (rows - 1)) // rows
+        for i, (tid, name) in enumerate(TOOL_APPS):
+            r, c = divmod(i, cols)
+            x = edge + c * (cw + gap)
+            y = edge + r * (ch + gap)
+            sel = i == self.tsel
+            rect = pygame.Rect(x, y, cw, ch)
+            pygame.draw.rect(surf, self.card(0), rect, border_radius=5)
+            pygame.draw.rect(surf, acc if sel else border, rect,
+                             2 if sel else 1, border_radius=5)
+            text(surf, str((i + 1) % 10), 10, acc, (x + 5, y + 3))
+            textc(surf, name, 13, hi if sel else soft, x + cw // 2,
+                  y + (ch - 13) // 2)
+
+    # ── 工具·万年历 (原工具页月视图收编) ──
+    def draw_cal_app(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        y, m = self._cal_ym()
+        # 无标题栏: 年月农历即标题, 右上只留键提示
+        text(surf, "←→ 月 · ↑↓ 年 · n 今天", 9, dim, (W - 6, 5), right=True)
+        text(surf, "%d年%d月 · 农历%s月" % (
+            y, m, lunar.LM_CHARS[lunar.solar_to_lunar(y, m, 1)[1] - 1]
+            if lunar.solar_to_lunar(y, m, 1) else "?"), 14, hi, (6, 3))
+        for i, wd in enumerate(("日", "一", "二", "三", "四", "五", "六")):
+            col = self.th("danger") if i == 0 else (acc if i == 6 else dim)
+            text(surf, wd, 11, col, (6 + i * 45 + 13, 31))
+        import calendar as _cal
+        first_wd, days = _cal.monthrange(y, m)
+        ly, lm = (y, m - 1) if m > 1 else (y - 1, 12)
+        prev_days = _cal.monthrange(ly, lm)[1]
+        t = time.localtime()
+        cy0 = 44
+        for row in range(6):
+            for col in range(7):
+                idx = row * 7 + col - first_wd          # 0 = 1 号
+                if idx < 0:
+                    d, dim_day = prev_days + idx + 1, True
+                elif idx >= days:
+                    d, dim_day = idx - days + 1, True
+                else:
+                    d, dim_day = idx + 1, False
+                cx = 6 + col * 45
+                cyy = cy0 + row * 20
+                today = (not dim_day and d == t.tm_mday and
+                         (y, m) == (t.tm_year, t.tm_mon))
+                if today:
+                    pygame.draw.rect(surf, self.th("hero"), (cx, cyy, 34, 18),
+                                     border_radius=4)
+                dcol = dim if dim_day else (hi if today else soft)
+                text(surf, str(d), 12, dcol, (cx + 3, cyy + 2))
+                ld = lunar.solar_to_lunar(y, m, d) if not dim_day else None
+                if ld:
+                    lab = (lunar.LM_CHARS[ld[1] - 1] + "月") if d == 1 \
+                        else lunar.LD_CHARS[ld[2] - 1]
+                    text(surf, lab, 8, acc if d == 1 else dim, (cx + 18, cyy + 5))
+
+    # ── 工具·汇率 ──
+    def _cv_box(self, surf, x, y, w, s, focused, h=20, fs=12):
+        soft, acc = self.th("soft"), self.th("accent")
+        border = self.th("border")
+        r = pygame.Rect(x, y, w, h)
+        pygame.draw.rect(surf, self.card(0), r, border_radius=4)
+        pygame.draw.rect(surf, acc if focused else border, r,
+                         2 if focused else 1, border_radius=4)
+        text(surf, s, fs, self.th("hi") if focused else soft,
+             (x + 6, y + (h - fs) // 2))
+
+    def draw_fx(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        self.tool_head(surf, "汇率", "e 兑换 · ←→ 字段")
+        j = self.data.get("rate") or {}
+        rates = (j.get("rates") or {}) if j.get("ok") else FX_FALLBACK
+        try:
+            amt = float(self.fx_amt)
+        except ValueError:
+            amt = 0.0
+        fcode, tcode = FX_CODES[self.fx_from], FX_CODES[self.fx_to]
+        f = self.cv_field
+        # 主行: 金额/源/→/目标 加高放大, 水平均匀分布
+        # (8 | 116 g12 66 g12 18(→) g12 68 | 8, 全宽 320)
+        y0, bh = 34, 30
+        self._cv_box(surf, 8, y0, 116, self.fx_amt, f == 0, h=bh, fs=15)
+        self._cv_box(surf, 136, y0, 66, fcode, f == 1, h=bh, fs=14)
+        textc(surf, "→", 16, dim, 223, y0 + bh // 2 - 8)
+        self._cv_box(surf, 244, y0, 68, tcode, f == 2, h=bh, fs=14)
+        textc(surf, FX_NAMES[fcode], 9, dim, 169, y0 + bh + 3)
+        textc(surf, FX_NAMES[tcode], 9, dim, 278, y0 + bh + 3)
+        v = amt / (rates.get(fcode) or 1.0) * (rates.get(tcode) or 1.0)
+        textc(surf, "%s %s" % (fmt_num(round(v, 4)), FX_NAMES[tcode]),
+              21, acc, W // 2, 92)
+        u = (rates.get(tcode) or 1.0) / (rates.get(fcode) or 1.0)
+        textc(surf, "1 %s = %s %s" % (fcode, fmt_num(round(u, 4)), tcode),
+              10, soft, W // 2, 120)
+        if j.get("updated"):
+            label = "更新 " + time.strftime("%m-%d %H:%M",
+                                            time.localtime(j["updated"]))
+        else:
+            label = "离线静态表"
+        textc(surf, label, 8, dim, W // 2, 136)
+        self.tool_foot(surf, ("数字 金额", "↑↓ 调整", "e 交换", "Esc 返回"))
+
+    # ── 工具·单位换算 (与汇率同版式: 主行均匀分布 + 大结果) ──
+    def draw_unit(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        cat, units = UCATS[self.u_cat]
+        self.tool_head(surf, "单位换算", "r 换类 · e 交换")
+        fd = dict(units)
+        try:
+            a = float(self.u_amt)
+        except ValueError:
+            a = 0.0
+        fcode, tcode = units[self.u_from][0], units[self.u_to][0]
+        f = self.cv_field
+        # 主行: 金额/源/→/目标 与汇率同几何 (8|116 g12 66 g12 → g12 68|8)
+        y0, bh = 34, 30
+        self._cv_box(surf, 8, y0, 116, self.u_amt, f == 0, h=bh, fs=15)
+        self._cv_box(surf, 136, y0, 66, fcode, f == 1, h=bh, fs=14)
+        textc(surf, "→", 16, dim, 223, y0 + bh // 2 - 8)
+        self._cv_box(surf, 244, y0, 68, tcode, f == 2, h=bh, fs=14)
+        # 类别 (字段3): 居中小胶囊
+        lab = "◁ %s ▷" % cat
+        cw_ = textw(lab, 10) + 16
+        self._cv_box(surf, W // 2 - cw_ // 2, y0 + bh + 3, cw_, lab, f == 3,
+                     h=16, fs=10)
+        if cat == "温度":
+            v = temp_convert(a, fcode, tcode)
+            u = temp_convert(1, fcode, tcode)
+        else:
+            v = a * fd[fcode] / fd[tcode]
+            u = fd[fcode] / fd[tcode]
+        textc(surf, "%s %s" % (self._u_fmt(v), tcode), 21, acc, W // 2, 92)
+        textc(surf, "1 %s = %s %s" % (fcode, self._u_fmt(u), tcode),
+              10, soft, W // 2, 120)
+        textc(surf, "%s · %d 单位" % (cat, len(units)), 8, dim, W // 2, 136)
+        self.tool_foot(surf, ("数字 金额", "↑↓ 调整", "←→ 字段", "Esc 返回"))
+
+    @staticmethod
+    def _u_fmt(v):
+        if abs(v) >= 1e12 or (0 < abs(v) < 1e-6):
+            return "%.4g" % v
+        if v == int(v) and abs(v) < 1e10:
+            return "{:,d}".format(int(v))
+        return "{:,}".format(float("%.6g" % v))
+
+    # ── 工具·双色球 ──
+    def draw_ssq(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        self.tool_head(surf, "双色球", "↑↓ 选期")
+        j = self.data.get("ssq") or {}
+        issues = (j.get("issues") or []) if j.get("ok") else []
+        if not issues:
+            textc(surf, "加载中…" if self.net.mode != "offline" else "离线 · 联网后同步",
+                  12, dim, W // 2, 70)
+            return
+        n = len(issues)
+        self.ssq_scroll = max(0, min(self.ssq_scroll, n - 1))
+        it = issues[self.ssq_scroll]
+        # 顶部卡片 = 选中期, 期号/大球/奖金 全部水平居中
+        r = pygame.Rect(4, 17, W - 8, 60)
+        pygame.draw.rect(surf, self.card(0), r, border_radius=5)
+        pygame.draw.rect(surf, self.th("border"), r, 1, border_radius=5)
+        textc(surf, "第 %s 期 · %s 周%s" % (
+            it.get("code", ""), str(it.get("date", ""))[5:],
+            it.get("week", "")), 12, hi, W // 2, 21)
+        reds = it.get("reds") or []
+        rad = 12
+        bw = len(reds) * (rad * 2 + 5) + 3 + rad * 2
+        self._ssq_balls(surf, reds, it.get("blue"), (W - bw) // 2, 38, rad)
+        g1 = self._ssq_grade(it, 1)
+        g2 = self._ssq_grade(it, 2)
+        textc(surf, "奖池 %s · 一等 %s 注 %s · 二等 %s 注 %s" % (
+            self._ssq_yi(it.get("pool")), g1[0], g1[1], g2[0], g2[1]),
+            8, dim, W // 2, 65)
+        # 历史窗口 4 行, 选中行高亮, 窗口跟随光标
+        rows = 4
+        view = self.ssq_view
+        if self.ssq_scroll < view:
+            view = self.ssq_scroll
+        if self.ssq_scroll >= view + rows:
+            view = self.ssq_scroll - rows + 1
+        self.ssq_view = max(0, view)
+        for k in range(rows):
+            idx = self.ssq_view + k
+            if idx >= n:
+                break
+            h = issues[idx]
+            y = 83 + k * 16
+            selr = idx == self.ssq_scroll
+            if selr:
+                hl = pygame.Rect(4, y - 2, W - 8, 15)
+                pygame.draw.rect(surf, self.card(0), hl, border_radius=4)
+                pygame.draw.rect(surf, acc, hl, 1, border_radius=4)
+            text(surf, h.get("code", ""), 10, acc if selr else soft, (8, y))
+            text(surf, str(h.get("date", ""))[5:], 9, dim, (66, y + 1))
+            self._ssq_balls(surf, h.get("reds") or [], h.get("blue"), 106, y, 6)
+        text(surf, "%d/%d" % (self.ssq_scroll + 1, n),
+             8, dim, (W - 10, 147), right=True)
+
+    def _ssq_balls(self, surf, reds, blue, x, y, rad):
+        fs = 7 if rad <= 6 else (10 if rad <= 9 else 13)
+        # 数字在球内垂直居中: 用渲染表面字形包围盒中心对圆心 (设备 freetype
+        # get_metrics 段错误不可用; 行框含留白, fs//2 经验值会偏)
+        yo = y + rad - _ball_glyph_cy(fs)
+        for i, v in enumerate(reds):
+            cx = x + i * (rad * 2 + 5)
+            pygame.draw.circle(surf, self.SSQ_RED, (cx + rad, y + rad), rad)
+            s = "%02d" % v
+            text(surf, s, fs, (255, 255, 255),
+                 (cx + rad - textw(s, fs) // 2, yo))
+        bx = x + len(reds) * (rad * 2 + 5) + 3
+        pygame.draw.circle(surf, self.SSQ_BLUE, (bx + rad, y + rad), rad)
+        s = "%02d" % (blue or 0)
+        text(surf, s, fs, (255, 255, 255),
+             (bx + rad - textw(s, fs) // 2, yo))
+
+    @staticmethod
+    def _ssq_grade(it, level):
+        for g in (it.get("grades") or []):
+            if g.get("level") == level:
+                p = g.get("money") or 0
+                return (g.get("num") or 0,
+                        "浮动" if not p else
+                        ("%.2f 万" % (p / 1e4)) if p >= 1e4 else ("%d 元" % p))
+        return (0, "浮动")
+
+    @staticmethod
+    def _ssq_yi(v):
+        return "%.2f 亿" % ((v or 0) / 1e8)
+
+    # ── 家居页: HA 设备控制 ──
+    # ── 工具·照片 ──
+    def _cover_blit(surf, img, rect):
+        w, h = img.get_size()
+        scale = max(rect.w / w, rect.h / h)
+        nw, nh = max(rect.w, int(w * scale + 0.5)), max(rect.h, int(h * scale + 0.5))
+        img2 = pygame.transform.smoothscale(img, (nw, nh))
+        clip = surf.get_clip()
+        surf.set_clip(rect)
+        surf.blit(img2, (rect.x + (rect.w - nw) // 2, rect.y + (rect.h - nh) // 2))
+        surf.set_clip(clip)
+
+    # ── 工具·计时器 ──
+    def draw_timer(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        self.tool_head(surf, "计时器", "")
+        cx, cy, rad = W // 2, 76, 40          # 底缘 116, 让开 y132 预设行
+        frac = min(1.0, (self.tm_left / self.tm_dur) if self.tm_dur else 0.0)
+        col = acc if self.tm_run else self.th("dim")
+        # 平滑圆环: 4x 超采样离屏面绘制 → smoothscale 缩回 (缩放插值即抗锯齿;
+        # 设备无 AA 原语, draw.arc/circle 直画锯齿明显)。背景纯页面色, 不透明
+        # 面即可, 避开设备会段错误的 SRCALPHA/freetype 路径。按 (进度, 颜色,
+        # 主题) 缓存, 进度按秒变 → 每秒才重画超采样面, 常规帧只 blit。
+        key = (round(frac, 4), col, self.th("track"), self.th("page"),
+               self.theme_idx)
+        if getattr(self, "_ring_key", None) != key:
+            SS = 4
+            size = (rad + 2) * 2 * SS
+            tmp = pygame.Surface((size, size))
+            tmp.fill(self.th("page"))
+            c = size // 2
+            rr = rad * SS
+            pygame.draw.circle(tmp, self.th("track"), (c, c), rr, 3 * SS)
+            if frac > 0:
+                nseg = max(2, int(180 * frac))
+                pts = []
+                for i in range(nseg + 1):
+                    a = -math.pi / 2 + 2 * math.pi * frac * i / nseg
+                    pts.append((c + rr * math.cos(a), c + rr * math.sin(a)))
+                pygame.draw.lines(tmp, col, False, pts, 3 * SS)
+                for p in (pts[0], pts[-1]):   # 圆头端点
+                    pygame.draw.circle(tmp, col, (int(p[0]), int(p[1])), SS)
+            self._ring = pygame.transform.smoothscale(
+                tmp, ((rad + 2) * 2, (rad + 2) * 2))
+            self._ring_key = key
+        surf.blit(self._ring, (cx - rad - 2, cy - rad - 2))
+        s = max(0, math.ceil(self.tm_left))
+        disp = ("%d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
+                if s >= 3600 else "%02d:%02d" % (s // 60, s % 60))
+        textc(surf, disp, 22 if s < 3600 else 18,
+              hi if (self.tm_run or self.tm_left) else dim, cx, cy - 13)
+        if self.tm_done:
+            st = "计时结束!"
+        elif self.tm_run:
+            st = "运行至 %s" % time.strftime(
+                "%H:%M", time.localtime(time.time() + self.tm_left))
+        elif self.tm_left < self.tm_dur:
+            st = "已暂停"
+        else:
+            st = "数字 1-6 选预设"
+        textc(surf, st, 9, soft, cx, cy + 10)
+        # 预设按钮 6×30 + 5×4 = 200px, 水平居中
+        x0 = (W - (len(TM_PRESETS) * 30 + (len(TM_PRESETS) - 1) * 4)) // 2
+        for i, mn in enumerate(TM_PRESETS):
+            r = pygame.Rect(x0 + i * 34, 132, 30, 15)
+            on = self.tm_dur == mn * 60 and not self.tm_run
+            pygame.draw.rect(surf, self.card(0), r, border_radius=4)
+            pygame.draw.rect(surf, acc if on else self.th("border"), r,
+                             2 if on else 1, border_radius=4)
+            text(surf, str(i + 1), 7, acc, (r.x + 2, r.y + 1))
+            textc(surf, "%d分" % mn, 9, acc if on else soft, r.centerx, r.y + 2)
+        self.tool_foot(surf, ("Enter 播/停", "r 重置", "←→ ±1分", "↑↓ ±10s"))
+
+    # ── 工具·音乐 (左 文本/进度/歌词, 右 封面+VU) ──
+    def draw_mu(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        border = self.th("border")
+        self.mu_tick()                        # 播放页每帧检测 (连播/出错即停)
+        if self.mu_view == "play":
+            self._draw_mu_play(surf)
+            return
+        if self.mu_view == "qr":
+            self._draw_mu_qr(surf)
+            return
+        if self.mu_view in ("search", "fav"):
+            self._draw_mu_rows(surf)
+            return
+        if self.mu_view == "list":
+            self.tool_head(surf, "本地曲库", "%d 首" % len(self.mu_files))
+            if not self.mu_files:
+                textc(surf, "~/music 为空", 12, dim, W // 2, 70)
+                textc(surf, "scp 拷入 mp3 / flac / wav 即自动出现", 10, dim,
+                      W // 2, 92)
+                self.tool_foot(surf, ("r 重扫", "0 选源", "Esc 返回"))
+                return
+            nrow = 4
+            r0 = max(0, min(self.mu_sel - (nrow - 1), max(0,
+                            len(self.mu_files) - nrow)))
+            for kk in range(nrow):
+                i = r0 + kk
+                if i >= len(self.mu_files):
+                    break
+                f = self.mu_files[i]
+                y = 24 + kk * 30
+                sel = i == self.mu_sel
+                cur = self.mu_playing and i == self.mu_play_idx
+                rct = pygame.Rect(4, y, W - 8, 27)
+                pygame.draw.rect(surf, self.card(0), rct, border_radius=4)
+                pygame.draw.rect(surf, acc if sel else border, rct,
+                                 2 if sel else 1, border_radius=4)
+                if cur:
+                    text(surf, "▶" if self.mu_proc else "⏸", 12, acc,
+                         (10, y + 4))
+                label = f.get("title") or "(未命名)"
+                meta = (f.get("artist", "") + " · " if f.get("artist") else "") \
+                    + (f.get("ext") or "本地").lstrip(".")
+                text(surf, clip_text(label, 12, W - 110), 12,
+                     hi if sel else soft, (28 if cur else 12, y + 2))
+                text(surf, clip_text(meta, 9, W - 110), 9, dim,
+                     (28 if cur else 12, y + 15))
+            self.tool_foot(surf, ("↑↓ 选", "Enter 播", "r 重扫",
+                                  "0 选源", "Esc 返回"))
+            return
+        # src 源选择 (想法页卡片风; 卡底不压 y151 底栏)
+        self.tool_head(surf, "音乐", "♪ 播放中" if self.mu_playing else "")
+        for i, (sid, name, note) in enumerate(MUSIC_SRCS):
+            y = 24 + i * 42
+            sel = i == self.mu_sel
+            locked = sid == "ne"              # M3 网易云锁定
+            rct = pygame.Rect(8, y, W - 16, 38)
+            pygame.draw.rect(surf, self.card(0 if not locked else 2), rct,
+                             border_radius=5)
+            pygame.draw.rect(surf, acc if sel else border, rct,
+                             2 if sel else 1, border_radius=5)
+            text(surf, name, 14, hi if sel else soft, (20, y + 3))
+            if sid == "qq":
+                note = ("已绑定 · Enter 搜索" if musrc.qq_bound()
+                        else "扫码绑定 · Enter")
+            elif sid == "ne":
+                note = ("已绑定 · Enter 搜索" if musrc.ne_bound()
+                        else "扫码绑定 · Enter")
+            text(surf, note or "%d 首已就绪" % len(self.mu_files), 9,
+                 dim, (20, y + 21))
+        self.tool_foot(surf, ("↑↓ 选源", "Enter 进", "Esc 回播放"))
+        # (输出键提示只在播放页 — 2026-11-14 用户定版)
+
+    def _draw_mu_qr(self, surf):
+        """QQ 扫码页: 矩阵 rect 直绘 + 状态行 (q 取消)."""
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        st = self.mu_qr.state
+        self.tool_head(surf, "%s · 扫码绑定"
+                       % ("QQ 音乐" if self.mu_qr_kind == "qq" else "网易云"),
+                       "")
+        mat = self.mu_qr.matrix
+        if mat:
+            n = len(mat)
+            px = min(130 // n, 4)
+            ox = (W - n * px) // 2
+            oy = 16                    # 底 16+116=132, 让位状态行 y138
+            for my in range(n):
+                for mx in range(n):
+                    if mat[my][mx]:
+                        pygame.draw.rect(surf, hi,
+                                         (ox + mx * px, oy + my * px,
+                                          px, px))
+        if st == "qr":
+            appname = "网易云 APP" if self.mu_qr_kind == "ne" else "手机 QQ"
+            tip = "%s 扫一扫" % appname if self.mu_qr.matrix else "生成二维码…"
+        elif st == "scanned":
+            tip = "已扫描 · 请在手机上确认"
+        elif st == "ok":
+            tip = "绑定成功"
+        elif st == "fail":
+            tip = "失败: %s" % self.mu_qr.err[:24]
+        else:
+            tip = ""
+        textc(surf, tip, 11, acc if st in ("scanned", "ok") else soft,
+              W // 2, 138)
+        self.tool_foot(surf, ("过期自动刷新 · s 免登录", "q 取消")
+                       if self.mu_qr_kind == "ne"
+                       else ("过期自动刷新", "q 取消"))
+
+    def _draw_mu_rows(self, surf):
+        """搜索/收藏列表 (共用行渲染; 输入态画搜索行)."""
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        border = self.th("border")
+        is_fav = self.mu_view == "fav"
+        srcname = "网易云" if self.mu_src == "ne" else "QQ"
+        title = srcname + (" 我喜欢" if is_fav else " 搜索")
+        bound = (musrc.ne_bound() if self.mu_src == "ne"
+                 else musrc.qq_bound())
+        hint = ("6 搜索" if is_fav else
+                "n 关键词 · %s" % ("已绑定" if bound else "免登录"))
+        self.tool_head(surf, title, hint)
+        if self.mu_input:
+            r = pygame.Rect(24, 68, W - 30, 26)   # 屏幕中间 (原 y75 h19 太局促, 底 94 不动)
+            pygame.draw.rect(surf, self.card(0), r, border_radius=4)
+            pygame.draw.rect(surf, acc, r, 2, border_radius=4)
+            _it, _ib = glyph_vbox("拼", 11)        # CJK 参考墨迹范围
+            cy = r.y + (r.height - (_ib - _it + 1)) // 2 - _it   # 墨迹居中
+            tag = "拼" if self.ime_mode else "EN"
+            text(surf, tag, 11, acc, (r.x + 6, cy))
+            cur = "_" if time.monotonic() % 1 < 0.5 else ""
+            q = self.mu_q + self.ime_buf + cur
+            text(surf, clip_text(q or "键入关键词…", 11, W - 50), 11,
+                 hi if self.mu_q or self.ime_buf else dim,
+                 (r.x + 6 + textw(tag, 11) + 6, cy))
+            if not self.ime_bar(surf, 97):
+                textc(surf, "拼音 · / 英 · Enter 搜", 10, dim, W // 2, 104)
+            self.tool_foot(surf, ("Enter 搜", "Esc 退"))
+            return
+        if self.mu_busy:
+            textc(surf, "取数中… (4 播放需等此步)", 11, dim, W // 2, 80)
+            return
+        if not self.mu_files:
+            textc(surf, "无结果" if self.mu_q or is_fav
+                  else "n 搜索", 11, dim, W // 2, 80)
+            self._mu_rows_foot(surf, is_fav)
+            return
+        nrow = 4
+        r0 = max(0, min(self.mu_sel - (nrow - 1),
+                        max(0, len(self.mu_files) - nrow)))
+        for kk in range(nrow):
+            i = r0 + kk
+            if i >= len(self.mu_files):
+                break
+            f = self.mu_files[i]
+            y = 24 + kk * 30
+            sel = i == self.mu_sel
+            cur = self.mu_playing and i == self.mu_play_idx
+            rct = pygame.Rect(4, y, W - 8, 27)
+            pygame.draw.rect(surf, self.card(0), rct, border_radius=4)
+            pygame.draw.rect(surf, acc if sel else border, rct,
+                             2 if sel else 1, border_radius=4)
+            if cur:
+                text(surf, "▶" if self.mu_proc else "⏸", 12, acc, (10, y + 4))
+            label = f["title"] if f.get("artist") else \
+                f.get("title") or "(未命名)"
+            meta = f.get("artist", "")
+            if f.get("preview"):
+                meta = (meta + " · " if meta else "") + "试听"
+            elif f.get("dur"):
+                meta = (meta + " · " if meta else "") + "%d:%02d" \
+                    % (f["dur"] // 60, f["dur"] % 60)
+            text(surf, clip_text(label, 12, W - 110), 12,
+                 hi if sel else soft, (28 if cur else 12, y + 2))
+            text(surf, clip_text(meta, 9, W - 110), 9, dim,
+                 (28 if cur else 12, y + 15))
+        self._mu_rows_foot(surf, is_fav)
+
+    def _mu_rows_foot(self, surf, is_fav):
+        """搜索/收藏底栏 (自绘, 用户指定键位与间距): 4 播放 · 2 格 · 5 收藏
+        (fav=r 刷新) · 2 格 · 6 返回; 右侧 8 停止 — 输出键提示只在播放页
+        (2026-11-14 用户定版: 搜索页两处"输出"都删)."""
+        soft, dim = self.th("soft"), self.th("dim")
+        acc = self.th("accent")
+        text(surf, "　　4 播放　   5 收藏　  6 返回", 12,
+             soft, (6, 151))
+        text(surf, "4 播放", 12, acc, (6 + textw("　　", 12), 151))
+        tail = "8 停止"
+        text(surf, tail, 12, dim, (W - 6 - textw(tail, 12), 151))
+
+    def _draw_mu_play(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        track = self.th("track")
+        warn = self.th("warn")
+        p = self.mu_playing or {}
+        self.tool_head(surf, "音乐", "♪ 播放页 · 0 选源 · 长按Esc退出")
+        playing = bool(self.mu_proc) and not self.mu_paused
+        # VU 电平 (播放=pulse monitor / ffmpeg fd3; 暂停=回落静默衰减)
+        lvb, lvm, lvt = self.lvl.lvl if playing else (0.0, 0.0, 0.0)
+        self.vu_tick(time.monotonic(), lvb, lvm, lvt)
+        # 本机出声锚点: VU 首响定位 (2026-11-14) — HTTP 直连预缓冲 1-3s,
+        # 旧写法"起进程=出声"使歌词抢跑; pulse monitor 首个过阈帧=真出声,
+        # -0.15s 补监视器链路; 5s 静音曲头/监视器失效兜底回旧值. AirPlay
+        # 不走这 (mu_ff=cons), RAOP-UP 锚点线程不变
+        if self.mu_aud_up is None and playing and self.mu_ff is None:
+            if lvb > 2.0 or lvm > 2.0:
+                self.mu_aud_up = time.monotonic() - 0.15
+            elif (self.mu_proc and self.mu_proc_at
+                  and time.monotonic() - self.mu_proc_at > 5.0):
+                self.mu_aud_up = self.mu_proc_at
+        # 左栏: 标题 (折2) / 歌手 / 歌词当前行 (折2) / 进度条
+        ty = 24
+        for ln in self._wrap_lines(p.get("title") or "(无标题)", 15, 204, 2):
+            text(surf, ln, 15, hi, (8, ty))
+            ty += 20
+        if p.get("artist"):
+            text(surf, clip_text(p["artist"], 10, 204), 10, soft, (8, ty + 1))
+        pos = self.mu_wall_pos()
+        cur = None
+        for sec, ln in self.mu_lyr:           # 当前行: 时间戳 ≤ pos 的最后行
+            if sec > pos + 0.2:
+                break
+            cur = ln or cur
+        if cur:
+            ly = 80
+            for ln in self._wrap_lines(cur, 13, 204, 2):
+                text(surf, ln, 13, acc, (8, ly))
+                ly += 18
+        if self.mu_dur:
+            bw = 196
+            by = 122
+            pygame.draw.rect(surf, track, (8, by, bw, 6), border_radius=3)
+            frac = max(0.0, min(1.0, pos / self.mu_dur))
+            pygame.draw.rect(surf, acc, (8, by, max(4, int(bw * frac)), 6),
+                             border_radius=3)
+            text(surf, mmss(pos), 9, soft, (8, by + 10))
+            text(surf, mmss(self.mu_dur), 9, dim, (8 + bw, by + 10), right=True)
+            if self.mu_paused:
+                text(surf, "⏸ 已暂停", 10, warn, (8 + bw // 2 - 24, by + 10))
+        # 右栏: 封面 84×84 (player 同位) + VU 12 条 (封面下方, radio 迷你版)
+        cr = pygame.Rect(222, 22, 84, 84)
+        if self.mu_pic is None and self.mu_pic_raw:
+            self.mu_pic, self.mu_pic_raw = jpg_surf(self.mu_pic_raw, 84, 84), \
+                None                          # 主线程转 (一次; 失败即占位)
+        if self.mu_pic:
+            surf.blit(self.mu_pic, (222, 22))
+        else:
+            pygame.draw.rect(surf, self.card(0), cr, border_radius=5)
+            textc(surf, "无封面", 10, dim, cr.centerx, cr.centery - 6)
+        nb, bw2, bgap, vh = 12, 6, 1.4, 34
+        vx0 = cr.x + (cr.width - (nb * bw2 + (nb - 1) * bgap)) // 2
+        vy = 112
+        for i in range(nb):
+            bxx = vx0 + i * (bw2 + bgap)
+            pygame.draw.rect(surf, track, (bxx, vy, bw2, vh), border_radius=2)
+            fh = max(3, min(vh, int(self.vu[i] / 28.0 * vh)))
+            pygame.draw.rect(surf, acc,
+                             (bxx, vy + vh - fh, bw2, fh), border_radius=2)
+            pk = max(3, min(vh, int(self.vu_pk[i] / 28.0 * vh)))
+            pygame.draw.rect(surf, hi, (bxx, vy + vh - pk, bw2, 2))
+        if self.esc_hold_at is not None:      # 长按中: 退出条遮底栏 + 常显退出中
+            frac = min(1.0, (time.monotonic() - self.esc_hold_at) / 1.0)
+            self.draw_exit_bar(surf, frac)
+        else:
+            self.tool_foot(surf, ("4 播放/暂停", "←→ ±10s", "↑↓ 切曲",
+                                  "8 停止"))   # 0 选源见头部
+
+    def draw_tabs(self, surf):
+        """快捷入口条: 仅主页显示 (其他页长按 Esc 回主页), 不含主页自身."""
+        if self.page != 0:
+            return
+        y = H - 22
+        entries = PAGES[1:]
+        cw = W // len(entries)
+        for j, (name, _) in enumerate(entries):
+            x = j * cw
+            text(surf, str(j + 4), 11, self.th("accent"), (x + 7, y + 7))
+            text(surf, name, 13, self.th("soft"), (x + 24, y + 5))
+
+    def draw_osd(self, surf):
+        if not self.osd:
+            return
+        if time.monotonic() >= self.osd[1]:
+            self.osd = None
+            return
+        w = textw(self.osd[0], 11) + 16
+        r = pygame.Rect(W - w - 4, 20, w, 18)
+        pygame.draw.rect(surf, self.card(0), r, border_radius=4)
+        pygame.draw.rect(surf, self.th("border"), r, 1, border_radius=4)
+        text(surf, self.osd[0], 11, self.th("hi"), (W - 12, 23), right=True)
+
+    def draw_dialog(self, surf):
+        if not self.dialog:
+            return
+        dim = pygame.Surface((W, H), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 150))
+        surf.blit(dim, (0, 0))
+        r = pygame.Rect(W // 2 - 90, H // 2 - 28, 180, 56)
+        pygame.draw.rect(surf, self.card(1), r, border_radius=6)
+        pygame.draw.rect(surf, self.th("border"), r, 1, border_radius=6)
+        if self.dialog[0] == "exit":
+            textc(surf, "退出 ONEAPP?", 12, self.th("accent"), W // 2, H // 2 - 18)
+        else:
+            it = self.dialog[1] or {}
+            textc(surf, "删除这条想法?", 12, self.th("accent"), W // 2, H // 2 - 20)
+            textc(surf, clip_text((it.get("text") or "(语音)")[:24], 9, 164),
+                  9, self.th("soft"), W // 2, H // 2 - 6)
+        textc(surf, "Enter 确认 · Esc 取消", 9, self.th("soft"), W // 2, H // 2 + 2)
+
+
+# ── 设备帧缓冲: 与内置 APP 同路径 (/dev/fb_lcd 直写) ────────────────────────
+class Framebuffer:
+    def __init__(self):
+        self.dev = open("/dev/fb_lcd", "r+b", buffering=0)
+        bpp = 16
+        try:
+            bpp = int(open("/sys/class/graphics/fb_lcd/bits_per_pixel").read().strip())
+        except Exception:
+            pass
+        if bpp == 32:
+            self.conv = pygame.Surface((W, H), depth=32,
+                                       masks=(0xFF0000, 0xFF00, 0xFF, 0xFF000000))
+        else:                                   # RGB565 (little-endian)
+            self.conv = pygame.Surface((W, H), depth=16,
+                                       masks=(0xF800, 0x07E0, 0x001F, 0))
+        self.mm = mmap.mmap(self.dev.fileno(), W * H * bpp // 8)
+
+    def blit(self, canvas):
+        self.conv.blit(canvas, (0, 0))
+        self.mm.seek(0)
+        self.mm.write(self.conv.get_buffer().raw)
+
+    def close(self):
+        try:
+            self.mm.close()
+        finally:
+            self.dev.close()
+
+
+# ── 设备键盘: 裸 evdev (TCA8418) → pygame 事件 ──────────────────────────────
+EV_KEY = 0x01
+
+def find_keyboard():
+    for name_f in glob.glob("/sys/class/input/input*/name"):
+        try:
+            if open(name_f).read().strip() != "tca8418c":
+                continue
+            base = os.path.dirname(name_f)
+            for dev_dir in glob.glob(base + "/event*"):
+                n = os.path.basename(dev_dir)
+                if os.path.exists("/dev/input/" + n):
+                    return "/dev/input/" + n
+        except Exception:
+            continue
+    return None
+
+
+# 丝印方向键 F=↑ X=↓ Z=← C=→ (无需 Fn); 其余字母按标准 evdev 码
+EVDEV_MAP = {
+    1: pygame.K_ESCAPE,
+    2: pygame.K_1, 3: pygame.K_2, 4: pygame.K_3, 5: pygame.K_4, 6: pygame.K_5,
+    7: pygame.K_6, 8: pygame.K_7, 9: pygame.K_8, 10: pygame.K_9, 11: pygame.K_0,
+    14: pygame.K_BACKSPACE, 15: pygame.K_TAB, 28: pygame.K_RETURN,
+    96: pygame.K_KP_ENTER, 111: pygame.K_DELETE, 57: pygame.K_SPACE,
+    33: pygame.K_UP, 44: pygame.K_LEFT, 45: pygame.K_DOWN, 46: pygame.K_RIGHT,
+    103: pygame.K_UP, 108: pygame.K_DOWN, 105: pygame.K_LEFT, 106: pygame.K_RIGHT,
+    16: pygame.K_q, 17: pygame.K_w, 18: pygame.K_e, 19: pygame.K_r, 20: pygame.K_t,
+    21: pygame.K_y, 22: pygame.K_u, 23: pygame.K_i, 24: pygame.K_o, 25: pygame.K_p,
+    30: pygame.K_a, 31: pygame.K_s, 32: pygame.K_d, 34: pygame.K_g, 35: pygame.K_h,
+    36: pygame.K_j, 37: pygame.K_k, 38: pygame.K_l,
+    47: pygame.K_v, 48: pygame.K_b, 49: pygame.K_n, 50: pygame.K_m,
+    53: pygame.K_SLASH, 92: pygame.K_SLASH,    # IME 中/英切换 (设备 Fn+N 实发 92 — unmapped log 实证, 53=标准布局码)
+}
+
+
+# evdev code → 可打印字符 (输入模式用; 与 EVDEV_MAP 共存: 事件同时带 key 与 unicode)
+EVDEV_CHARS = {
+    2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6", 8: "7", 9: "8", 10: "9", 11: "0",
+    12: "-", 13: "=", 26: "[", 27: "]", 39: ";", 40: "'", 41: "`", 43: "\\",
+    51: ",", 52: ".", 53: "/", 92: "/", 57: " ",
+    16: "q", 17: "w", 18: "e", 19: "r", 20: "t", 21: "y", 22: "u", 23: "i",
+    24: "o", 25: "p", 30: "a", 31: "s", 32: "d", 33: "f", 34: "g", 35: "h",
+    36: "j", 37: "k", 38: "l", 44: "z", 45: "x", 46: "c", 47: "v", 48: "b",
+    49: "n", 50: "m",
+}
+
+
+class EvKeyboard:
+    app = None                                 # 主循环注入, 音量键用
+
+    def __init__(self):
+        self.path = find_keyboard()
+        self.fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK) if self.path else None
+
+    def poll(self):
+        if self.fd is None:
+            return
+        while True:
+            r, _, _ = select.select([self.fd], [], [], 0)
+            if not r:
+                return
+            try:
+                buf = os.read(self.fd, 24 * 16)
+            except BlockingIOError:
+                return
+            for off in range(0, len(buf) - 23, 24):
+                _, _, typ, code, val = struct.unpack_from("qqHHi", buf, off)
+                if typ != EV_KEY or val not in (0, 1):
+                    continue                  # 0=松开 1=按下 (2=自动重复丢弃)
+                if code in (113, 114, 115):     # Fn+A 静音 / Fn+S+ / Fn+D-
+                    if EvKeyboard.app:
+                        EvKeyboard.app.adjust_volume(code)
+                elif code in EVDEV_MAP:
+                    kt = pygame.KEYDOWN if val == 1 else pygame.KEYUP
+                    pygame.event.post(pygame.event.Event(
+                        kt, key=EVDEV_MAP[code], mod=0,
+                        unicode=EVDEV_CHARS.get(code, "") if val == 1 else ""))
+                else:
+                    try:
+                        with open("/tmp/dash_unmapped_keys.log", "a") as f:
+                            f.write("code=%d\n" % code)
+                    except Exception:
+                        pass
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+# ── 演示数据 (截图/展示, DASH_DEMO=1) ───────────────────────────────────────
+def _demo_qt_text(rows):
+    """按真实 qt 字段位(f30 时间戳/f31 涨跌/f32 涨跌%/f33 高/f34 低)造演示文本."""
+    parts = []
+    for code, name, num, price, prev, chg, pchg, high, low in rows:
+        f = ["1", name, num, "%.2f" % price, "%.2f" % prev, "%.2f" % price] + \
+            ["x"] * 24 + ["20261108150000", "%.2f" % chg, "%.2f" % pchg,
+                          "%.2f" % high, "%.2f" % low]
+        parts.append('v_%s="%s"' % (code, "~".join(f)))
+    return "\n".join(parts)
+
+
+def demo_data():
+    now = int(time.time() * 1000)
+    return {
+        "wx": {"current_weather": {"temperature": 24.6, "weathercode": 0}},
+        "hitokoto": {"ok": True, "text": "凡是过往,皆为序章。",
+                     "from": "莎士比亚"},
+        "idx": _demo_qt_text([
+            ("sh000001", "上证指数", "000001", 3316.20, 3305.75, 10.45, 0.32, 3320.11, 3298.55),
+            ("sz399001", "深证成指", "399001", 10572.50, 10500.10, 72.40, 0.69, 10580.0, 10490.2),
+            ("sz399006", "创业板指", "399006", 2191.30, 2175.80, 15.50, 0.71, 2196.0, 2170.4),
+            ("sh000688", "科创综指", "000688", 1045.60, 1040.20, 5.40, 0.52, 1048.0, 1038.1),
+            ("sh000300", "沪深300", "000300", 3910.80, 3895.10, 15.70, 0.40, 3916.0, 3890.5),
+            ("r_hkHSI", "恒生指数", "hkHSI", 20421.0, 20310.5, 110.5, 0.54, 20440.0, 20300.0),
+            ("usDJI", "道琼斯", "DJI", 44300.0, 44100.0, 200.0, 0.45, 44350.0, 44080.0),
+            ("usIXIC", "纳斯达克", "IXIC", 19100.0, 19050.0, 50.0, 0.26, 19120.0, 19040.0),
+        ]),
+        "quotes": _demo_qt_text([
+            ("sh600519", "贵州茅台", "600519", 1513.00, 1521.00, -8.00, -0.53, 1522.00, 1508.00),
+            ("sz000001", "平安银行", "000001", 11.62, 11.55, 0.07, 0.61, 11.70, 11.50),
+        ]),
+        "minute": {"code": 0, "data": {"sh600519": {"data": {"data": [
+            "%03d %.2f" % (930 + i // 60, 1500.0 + 20.0 * ((i % 120) / 120.0) +
+             (5.0 if i >= 120 else 0)) for i in range(0, 241)
+        ]}}}},
+        "day": {"code": 0, "data": {"sh600519": {"qfqday": [
+            ["2026-10-%02d" % (i + 1), 1480.0 + i * 2.0, 1490.0 + i * 2.0,
+             1500.0 + i * 2.0, 1475.0 + i * 2.0] for i in range(20)
+        ]}}},
+        "rate": {"ok": True, "base": "USD",
+                 "rates": {"USD": 1.0, "CNY": 6.6908, "EUR": 0.8958,
+                           "JPY": 158.32, "GBP": 0.7475, "HKD": 7.8396,
+                           "KRW": 1355.38, "AUD": 1.4541},
+                 "updated": 1794096151},
+        # 工具子应用演示数据 (截图/展示)
+        "ssq": {"ok": True, "issues": [
+            {"code": "2026128", "date": "2026-11-05", "week": "四",
+             "reds": [3, 9, 17, 22, 28, 32], "blue": 12,
+             "pool": 2212886688, "sales": 388451122,
+             "grades": [{"level": 1, "num": 4, "money": 9123456},
+                        {"level": 2, "num": 88, "money": 218866}]},
+            {"code": "2026127", "date": "2026-11-03", "week": "二",
+             "reds": [1, 7, 11, 19, 25, 33], "blue": 5,
+             "pool": 2188001122, "sales": 377112233,
+             "grades": [{"level": 1, "num": 2, "money": 10223344},
+                        {"level": 2, "num": 61, "money": 295511}]},
+            {"code": "2026126", "date": "2026-11-01", "week": "日",
+             "reds": [2, 8, 15, 21, 27, 31], "blue": 16,
+             "pool": 2150011223, "sales": 361002112,
+             "grades": [{"level": 1, "num": 0, "money": 0},
+                        {"level": 2, "num": 45, "money": 401122}]},
+            {"code": "2026125", "date": "2026-10-29", "week": "四",
+             "reds": [4, 10, 13, 20, 24, 30], "blue": 8,
+             "pool": 2102233441, "sales": 355901122,
+             "grades": [{"level": 1, "num": 1, "money": 11002233},
+                        {"level": 2, "num": 33, "money": 528833}]},
+        ]},
+        "news": {"ok": True, "feeds": {"ai": {"ok": True, "items": [
+            {"t": "终端侧AI:从单点应用走向智能体体验",
+             "d": "端侧方案展出", "ts": "11-08 19:05"},
+            {"t": "开源社区发布新版本",
+             "d": "没有永远的夏天", "ts": "11-08 12:09"},
+        ]}}},
+    }
+
+
+# ── 主循环 ──────────────────────────────────────────────────────────────────
+def main():
+    try:
+        signal.signal(signal.SIGTERM,
+                      lambda *a: pygame.event.post(pygame.event.Event(pygame.QUIT)))
+    except Exception:
+        pass
+    windowed = "--window" in sys.argv
+
+    on_device = not windowed and os.path.exists("/dev/fb_lcd")
+    if on_device:
+        # 必须在 pygame.init() 之前: 否则 SDL 抢面板 DRM master, fb 写入被丢弃
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+    pygame.init()
+
+    fb = kbd = None
+    if on_device:
+        pygame.display.set_mode((1, 1))
+        fb = Framebuffer()
+        kbd = EvKeyboard()
+        canvas = pygame.Surface((W, H))
+    elif windowed:
+        surf = pygame.display.set_mode((W * 2, H * 2))
+        pygame.display.set_caption("ONEAPP · CardputerZero")
+        canvas = pygame.Surface((W, H))
+    else:                                       # 无 fb 无头 (测试)
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+        pygame.display.set_mode((W, H))
+        canvas = pygame.Surface((W, H))
+
+    netins = netmod.Net()
+    app = App(netins)
+    if kbd:
+        EvKeyboard.app = app
+    if os.environ.get("DASH_DEMO") or "--demo" in sys.argv:
+        app.data = demo_data()
+    if os.environ.get("DASH_PAGE"):
+        app.page = max(0, min(len(PAGES) - 1, int(os.environ["DASH_PAGE"])))
+    if os.environ.get("DASH_PLAY"):
+        app.autoplay_key = os.environ["DASH_PLAY"]
+    if os.environ.get("DASH_TOOL") in [t[0] for t in TOOL_APPS]:
+        app.tool = os.environ["DASH_TOOL"]   # 截图/调试: 直落指定子应用
+        app.page = 5                         # 子应用只能从工具页进 (poll_tool 挂 page==5)
+    if os.environ.get("DASH_DETAIL"):
+        app.fdetail = {"code": os.environ["DASH_DETAIL"],
+                       "name": os.environ["DASH_DETAIL"], "view": "min"}
+
+    clock = pygame.time.Clock()
+    last_poll = 0
+    running = True
+    while running:
+        if kbd:
+            kbd.poll()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+            elif ev.type == pygame.KEYDOWN:
+                if not app.key(ev.key, getattr(ev, "unicode", "") or ""):
+                    running = False
+            elif ev.type == pygame.KEYUP:
+                app.keyup(ev.key)
+        # 网络结果队列 → app
+        try:
+            while True:
+                app.on_net(*netins.results.get_nowait())
+        except Exception:
+            pass
+        now = time.monotonic()
+        if now - last_poll >= 1.0:
+            last_poll = now
+            app.poll()
+        app.draw(canvas)
+        if app.esc_exit:
+            running = False
+        if fb:
+            fb.blit(canvas)
+        elif windowed:
+            pygame.transform.scale(canvas, (W * 2, H * 2), surf)
+            pygame.display.flip()
+        clock.tick(10)
+
+    app.mu_session_save()                      # 退出前保住播放位 (先于 mu_stop)
+    app.radio_stop()                           # 杀 ffplay + 停电平流
+    app.stop_player()
+    app.mu_stop()                              # 音乐 ffplay
+    netins.close()
+    if fb:
+        fb.close()
+    if kbd:
+        kbd.close()
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
