@@ -524,7 +524,16 @@ def test_voice():
         # 文字与语音互不影响
         app.submit_idea()
         assert len(app.idea_items()) == 1
-        print("voice OK (index/play/delete/trim)")
+        # 5 键不被全局跳页劫持 (回归: 曾跳去电台页) — Mac 无 arecord → 优雅失败留原页
+        app.page = 1
+        app.key(pygame.K_5)
+        assert app.page == 1, "K_5 must not jump pages on ideas"
+        assert app.rec_proc is None            # Mac 无 arecord → 优雅失败
+        assert app.osd and "录音" in app.osd[0], app.osd
+        app.page = 1
+        app.key(pygame.K_8)                    # 8=播放语音 (空表/非语音条 → 无动作留原页)
+        assert app.page == 1
+        print("voice OK (index/play/delete/trim/keys)")
     finally:
         _sh.rmtree(tmp, ignore_errors=True)
 
