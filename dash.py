@@ -434,6 +434,9 @@ MUSIC_SRCS = [("local", "本地曲库", ""), ("qq", "QQ 音乐", ""),
               ("ne", "网易云", "")]
 MU_LAST_CACHE = os.path.join(STATE_DIR, "mu_last.json")  # 上次播放会话 (跨重启)
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
+CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
+# 主页卡缓存标签: 进 app 秒显上次数据, 后台刷新后再覆盖 (用户要求免"获取中")
+HOME_CACHE_TAGS = ("wx", "hitokoto", "news", "ipo")
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")        # 自选股 (本地)
 # 自选股种子 (qt.gtimg.cn 代码; watch.json 存在则整体覆盖)
 WATCH_SEED = {"items": [
@@ -959,6 +962,7 @@ class App:
         self.net = netins
         self.page = 0
         self.data = {}                        # tag → json
+        self._load_home_cache()               # 上次数据秒显 (后台再刷新)
         self.theme_idx = 0
         try:
             self.theme_idx = json.load(open(THEME_FILE)).get("idx", 0) % len(THEMES)
@@ -1083,12 +1087,28 @@ class App:
     def card(self, i):
         return hex2rgb(THEMES[self.theme_idx]["cards"][i])
 
+    def _load_home_cache(self):
+        """主页卡数据磁盘缓存 → self.data (天气/每日一句/新闻/新股)."""
+        for tag in HOME_CACHE_TAGS:
+            j = netmod.load_json_file(os.path.join(CACHE_DIR, tag + ".json"),
+                                      None)
+            if j is not None:
+                self.data[tag] = j
+
     # ── 网络结果 ──
     def on_net(self, kind, a, b):
         if kind == "mode":
             self.data.clear()
+            self._load_home_cache()           # 模式切换不闪"获取中"
         elif kind == "data":
             self.data[a] = b
+            if a in HOME_CACHE_TAGS:
+                try:
+                    os.makedirs(CACHE_DIR, exist_ok=True)
+                    netmod.save_json_file(
+                        os.path.join(CACHE_DIR, a + ".json"), b)
+                except Exception:
+                    pass
             if a == "wxloc" and isinstance(b, dict) and b.get("lat") is not None:
                 old = self.wx_loc or {}
                 if b.get("city") != old.get("city") \
@@ -2345,13 +2365,13 @@ class App:
                     n_items = len(self.fin_items())
                     self.dialog = ("delwatch",
                                    self.fsel if self.fsel < n_items else 0)
-                elif k == pygame.K_4:               # 自选股
-                    self.fin_view = 0
+                elif k == pygame.K_4:             # 切换行情: 自选→指数→商品
+                    self.fin_view = (self.fin_view + 1) % len(self.FIN_TABS)
                     self.fsel = self.fscroll = 0
-                elif k == pygame.K_5:             # 指数
+                elif k == pygame.K_5:             # 指数 (直选, 不提示)
                     self.fin_view = 1
                     self.fsel = self.fscroll = 0
-                elif k == pygame.K_6:             # 商品
+                elif k == pygame.K_6:             # 商品 (直选, 不提示)
                     self.fin_view = 2
                     self.fsel = self.fscroll = 0
                 elif k == pygame.K_8 and self.fin_view == 0:   # 图表
@@ -2365,8 +2385,10 @@ class App:
                     items = self.fin_items()   # 在分支内取, 避免未赋值引用
                     if 0 <= self.fsel < len(items):
                         it = items[self.fsel]
+                        # 直开日线 (用户偏好; m 键详情内可切回分时)
                         self.open_detail(qt_code(it["code"]),
-                                         it.get("name") or it["code"])
+                                         it.get("name") or it["code"],
+                                         view="day")
         return True
 
     # ── 工具页: 入口网格 + 子应用 (参照 tab5 驾驶舱工具页) ───────────────────
@@ -3252,16 +3274,11 @@ class App:
 
         # 底部子页快捷键
         y = 151
-        x = 6
-        tabkeys = ["4", "5", "6"]
-        for i, t in enumerate(self.FIN_TABS):
-            col = acc if view == i else dim
-            lab = "%s %s" % (tabkeys[i], t)
-            text(surf, lab, 13, col, (x, y))
-            x += textw(lab, 13) + textw("我我我", 13)
+        text(surf, "4 切换行情", 13, acc if view else soft, (6, y))
+        text(surf, "ENTER 日线", 13, soft, (6 + textw("4 切换行情", 13)
+                                            + textw("我我", 13), y))
         if view == 0:
-            text(surf, "8 图表 · n 添加 · d 删", 13, soft, (W - 6, y),
-                 right=True)
+            text(surf, "n 添加 · d 删", 13, soft, (W - 6, y), right=True)
 
         # 添加自选股输入框 (第 2 排卡片之上浮层)
         if self.fin_input:
@@ -3304,19 +3321,19 @@ class App:
         if vw < 60:
             return
         dim = self.th("dim")
-        tw = textw(txt, 11)
-        vy = 5
+        tw = textw(txt, 13)
+        vy = 3
         now = time.monotonic()
         if tw <= vw:
-            text(surf, txt, 11, dim, (tx, vy))
+            text(surf, txt, 13, dim, (tx, vy))
             return
-        SPEED = 24.0
-        span = tw + vw + 20
+        SPEED = 28.0
+        span = tw + vw + 24
         if now - self._tk_at > span / SPEED + 1.0:
             self._tk_at = now
         off = (now - self._tk_at) * SPEED
-        surf.set_clip((tx, 0, vw, 17))
-        text(surf, txt, 11, dim, (tx + vw - off, vy))
+        surf.set_clip((tx, 0, vw, 18))
+        text(surf, txt, 13, dim, (tx + vw - off, vy))
         surf.set_clip(None)
 
     def draw_fin_detail(self, surf):

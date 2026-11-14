@@ -292,6 +292,17 @@ def test_render():
     app.key(pygame.K_RETURN)
     assert [i["code"] for i in app.watch["items"]] == ["sh600519"]
     app.draw(canvas)                              # 顶部跑马灯渲染
+    # 主页数据磁盘缓存: 收到即落盘, 新 App 实例 (模拟重启) 秒显
+    # (CACHE_DIR 指 tmp, 防污染真实缓存)
+    import json as _j
+    dash.CACHE_DIR = os.path.join(tmp, "cache")
+    cachef = os.path.join(dash.CACHE_DIR, "hitokoto.json")
+    app.on_net("data", "hitokoto", {"ok": True, "text": "缓存测试", "from": "t"})
+    assert _j.load(open(cachef))["text"] == "缓存测试"
+    app2 = dash.App(FakeNet())
+    assert app2.data.get("hitokoto", {}).get("text") == "缓存测试"
+    app2.on_net("mode", "online", None)            # 模式切换也不丢
+    assert app2.data.get("hitokoto", {}).get("text") == "缓存测试"
     # 快捷键 4-8 → 页 1-5 (主页触发; 新闻/电台页数字为功能键)
     pg = pygame
     for key, page in [(pg.K_4, 1), (pg.K_5, 2), (pg.K_6, 3),
