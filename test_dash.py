@@ -503,6 +503,8 @@ def test_music():
     assert dash.mu_parse_name("夜曲.wav") == ("", "夜曲", ".wav")
 
     tmp = tempfile.mkdtemp(prefix="onemusic")
+    real_last = dash.MU_LAST_CACHE        # 隔离: 会话落盘不得碰设备真 mu_last.json
+    dash.MU_LAST_CACHE = os.path.join(tmp, "state", "mu_last.json")
 
     def mkwav(path):
         sr = 8000
@@ -572,6 +574,7 @@ def test_music():
             dash.MUSIC_DIR = real_dir
         print("music OK (parse/scan/play/pause/session)")
     finally:
+        dash.MU_LAST_CACHE = real_last
         _sh.rmtree(tmp, ignore_errors=True)
 
 
