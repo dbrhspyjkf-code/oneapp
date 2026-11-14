@@ -148,105 +148,107 @@ async def _s():
     print(json.dumps(devs, ensure_ascii=False))
 asyncio.run(_s())
 '''
-# 直播流输入库 (消费端用, 测试同源 exec): pyatv 的 BufferedIOBaseWrapper 在
-# SemiSeekableBuffer 边界会对 miniaudio 返回短读, dr_flac 视短读为 EOF →
-# stream_file 无异常提前返回 → "响一声就没声" (2026-11-14 真机实证, aplog
-# 消费端无 traceback 干净退出 + ffmpeg Broken pipe)。_FullStream: read 恒满
-# 请求 (底层阻塞全读), 头部 LEAD 驻内存可 seek (tinytag 元数据解析 + dr_flac
-# 头部 seek 都落在真实数据上), 越过 lead 后单向直读 — 真正 EOF 才允许短读。
-_ATVR_STREAM_LIB = r'''
-import io
-LEAD = 262144
+# 直播 PCM 直通库 (消费端用, 测试同源 exec): pyatv stream_file 的解码层对
+# 无限直播管道根本不可用 — ma_decoder UNKNOWN 格式探测 (mp3 无魔数) 按实时
+# 节奏无限扫流 → ma_decoder_init 永不返回 → stream_file 从未发出过一个音频
+# 包 (2026-11-14 线程栈+aplog 实证; dash 音乐=有限文件探测会终止所以一直没
+# 事)。绕开 miniaudio: 产端 -f s16le 直出 PCM, open_source patch 成直通
+# AudioSource (readframes 阻塞全读, 真 EOF 才短读), 预读 64KB 作存活门。
+_ATVR_PCM_LIB = r'''
+import asyncio
+import pyatv.protocols.raop.audio_source as _as
+from pyatv.interface import MediaMetadata
 
 def _prefill(raw, target):
-    # 读满 target 或 EOF; 返回 (lead, eof)。产端没头/秒死在此暴露 (不烧音箱连接)
-    buf = bytearray()
-    while len(buf) < target:
-        chunk = raw.read(min(65536, target - len(buf)))
+    # 读满 target 或 EOF; 返回 eof。产端没头/秒死在此暴露 (不烧音箱连接)
+    n = 0
+    while n < target:
+        chunk = raw.read(min(65536, target - n))
         if not chunk:
-            break
-        buf.extend(chunk)
-    return bytes(buf), len(buf) < target
+            return True
+        n += len(chunk)
+    return False
 
-class _FullStream(io.BufferedIOBase):
-    def __init__(self, raw, lead, eof):
-        super().__init__()
+class PcmSource(_as.AudioSource):
+    def __init__(self, raw, rate, ch, width, title):
         self.raw = raw
-        self.lead = lead
-        self.eof = eof
-        self.pos = 0
+        self.rate = rate
+        self.ch = ch
+        self.width = width
+        self.title = title
+        self.loop = asyncio.get_event_loop()
 
-    def read(self, size=-1):
-        if size == 0:
-            return b""
-        out = bytearray()
-        if self.pos < len(self.lead):
-            take = len(self.lead) - self.pos if size < 0 \
-                else min(size, len(self.lead) - self.pos)
-            out += self.lead[self.pos:self.pos + take]
-            self.pos += take
-        if size >= 0 and len(out) >= size:
-            return bytes(out[:size])
-        if size < 0:                       # 读到 EOF (tinytag 尾部探测用)
-            while not self.eof:
-                chunk = self.raw.read(65536)
-                if not chunk:
-                    self.eof = True
-                    break
-                out.extend(chunk)
-                self.pos += len(chunk)
-            return bytes(out)
-        need = size - len(out)             # 越过 lead: 底层阻塞全读, 恒满 n
-        while need > 0 and not self.eof:
-            chunk = self.raw.read(min(need, 65536))
+    async def readframes(self, nframes):
+        need = nframes * self.ch * self.width
+        buf = bytearray()
+        while len(buf) < need:
+            chunk = await self.loop.run_in_executor(
+                None, self.raw.read, need - len(buf))
             if not chunk:
-                self.eof = True
                 break
-            out.extend(chunk)
-            self.pos += len(chunk)
-            need -= len(chunk)
-        return bytes(out)                  # 仅真 EOF 才短读
+            buf.extend(chunk)
+        return bytes(buf)
 
-    def seek(self, pos, origin=io.SEEK_SET):
-        if origin != io.SEEK_SET or pos > len(self.lead):
-            raise io.UnsupportedOperation("seek beyond lead")
-        self.pos = pos
-        return self.pos
+    async def get_metadata(self):
+        return MediaMetadata(title=self.title or None)
 
-    def tell(self):
-        return self.pos
+    @property
+    def sample_rate(self):
+        return self.rate
 
-    def seekable(self):
-        return True
+    @property
+    def channels(self):
+        return self.ch
 
-    def readable(self):
-        return True
+    @property
+    def sample_size(self):
+        return self.width
+
+    @property
+    def duration(self):
+        return 0
+
+    async def close(self):
+        pass
+
+def _patch_open_source(title):
+    async def open_source(source, sample_rate, channels, sample_size):
+        if (sample_rate, channels, sample_size) != (44100, 2, 2):
+            raise RuntimeError("pcm feed fixed 44100/2/s16, got %s/%s/%s" % (
+                sample_rate, channels, sample_size))
+        return PcmSource(source, sample_rate, channels, sample_size, title)
+    return open_source
 '''
-_ATVR_PLAY = _ATVR_STREAM_LIB + r'''
+_ATVR_PLAY = _ATVR_PCM_LIB + r'''
 import asyncio, os, signal, sys, threading
 async def _s():
     from pyatv import connect
     from pyatv.conf import AppleTV, ManualService
     from pyatv.const import Protocol
     from pyatv.interface import MediaMetadata
+    import pyatv.protocols.raop as _raop
+    import pyatv.protocols.raop.audio_source as _as
     loop = asyncio.get_event_loop()
     stop_evt = asyncio.Event()
     signal.signal(signal.SIGTERM,
                   lambda *_: loop.call_soon_threadsafe(stop_evt.set))
-    try:     # 预读 25s 上限: 产端无头/停摆直接退出, 不烧音箱连接 (冷却防护)
-        lead, eof = await asyncio.wait_for(
-            loop.run_in_executor(None, _prefill, sys.stdin.buffer, LEAD), 25)
+    try:     # 预读存活门 (25s 上限): 产端没头/停摆直接退出, 不烧音箱连接
+        if await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, _prefill, sys.stdin.buffer, 65536), 25):
+            return
     except Exception:
         return
+    title = sys.argv[4] if len(sys.argv) > 4 else ""
+    _as.open_source = _patch_open_source(title)   # PCM 直通 (绕开 miniaudio)
+    _raop.open_source = _as.open_source           # raop 模块全局引用同步换
     conf = AppleTV(sys.argv[1], sys.argv[1])   # 免 mDNS 扫描直连 (省 ~8s)
     conf.add_service(ManualService(sys.argv[3] or None, Protocol.RAOP,
                                    int(sys.argv[2]), None))
-    atv = await asyncio.wait_for(connect(conf, loop), 20)   # 挂死会拖 45s+
+    atv = await asyncio.wait_for(connect(conf, loop), 20)   # 挂死变快败
     try:                                 # 设备依赖组合下必坏 (srptools 1.0.1)
         print("RAOP-UP", flush=True)     # 出声锚点 (radio 无进度条, 仅日志用)
-        md = None                        # 台名进 RAOP 元数据 (HomePod 显示真台名)
-        if len(sys.argv) > 4 and sys.argv[4]:
-            md = MediaMetadata(title=sys.argv[4])
+        md = MediaMetadata(title=title) if title else None
         if len(sys.argv) > 5 and sys.argv[5]:
             def _vol_ctl(path=sys.argv[5]):
                 # 音量命令线程: SETVOL <0-100> → atv.audio.set_volume
@@ -274,7 +276,7 @@ async def _s():
         # atv.close() 真 RTSP TEARDOWN (python 默认 SIGTERM 立即死, 不跑
         # finally — 暴力拆连让音箱进冷却拒连, 换台秒死根因之一)
         stream_task = asyncio.ensure_future(atv.stream.stream_file(
-            _FullStream(sys.stdin.buffer, lead, eof), metadata=md,
+            sys.stdin.buffer, metadata=md,
             override_missing_metadata=True))
         evt_task = asyncio.ensure_future(stop_evt.wait())
         await asyncio.wait({stream_task, evt_task},
@@ -283,7 +285,7 @@ async def _s():
             stream_task.cancel()
             try:
                 await stream_task
-            except Exception:
+            except BaseException:        # CancelledError 非 Exception 子类
                 pass
     finally:
         atv.close()
@@ -1810,7 +1812,8 @@ class App:
         # 直播流按原速读, 不限速会把上游突发全缓冲 → 延迟无限增大
         cmd += ["-reconnect", "1", "-reconnect_streamed", "1",
                 "-reconnect_delay_max", "5"] + _ff_slow_net_flags()
-        cmd += ["-i", st["url"], "-f", "flac", "-", "-f", "wav", vufifo]
+        cmd += ["-i", st["url"], "-f", "s16le", "-ar", "44100", "-ac", "2",
+                "-", "-f", "wav", vufifo]
         try:
             self.player = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=cons.stdin,
