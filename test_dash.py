@@ -289,6 +289,8 @@ def test_render():
     app.fsel = 1
     app.key(pygame.K_d)
     assert app.dialog and app.dialog[0] == "delwatch"
+    assert app.dialog[1] == "sz002594", app.dialog       # 带 code 非下标
+    app.draw(canvas)                                     # dialog 渲染 (曾崩点)
     app.key(pygame.K_RETURN)
     assert [i["code"] for i in app.watch["items"]] == ["sh600519"]
     app.draw(canvas)                              # 顶部跑马灯渲染

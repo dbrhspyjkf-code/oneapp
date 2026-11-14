@@ -1241,14 +1241,15 @@ class App:
         netmod.save_json_file(WATCH_FILE, self.watch)
         self.osd = ("已添加 " + code, time.monotonic() + 1.5)
 
-    def watch_del(self, idx):
-        """删除自选股 (dialog 确认后调) → 落 watch.json."""
+    def watch_del(self, code):
+        """删除自选股 (dialog 确认后调, 按 code) → 落 watch.json."""
         items = self.watch.get("items", [])
-        if 0 <= idx < len(items):
-            code = items[idx].get("code")
-            del items[idx]
+        n0 = len(items)
+        self.watch["items"] = [x for x in items if x.get("code") != code]
+        if len(self.watch["items"]) != n0:
             netmod.save_json_file(WATCH_FILE, self.watch)
-            self.fsel = max(0, min(self.fsel, max(0, len(items) - 1)))
+            self.fsel = max(0, min(self.fsel,
+                                   len(self.watch["items"]) - 1))
             self.osd = ("已删除 " + (code or ""), time.monotonic() + 1.2)
 
     def fin_items(self):
@@ -2388,9 +2389,10 @@ class App:
                     self.cv_armed = False
                 elif (k == pygame.K_d or k == pygame.K_x) \
                         and self.fin_view == 0 and self.fin_items():
-                    n_items = len(self.fin_items())
-                    self.dialog = ("delwatch",
-                                   self.fsel if self.fsel < n_items else 0)
+                    items = self.fin_items()
+                    if 0 <= self.fsel < len(items):
+                        self.dialog = ("delwatch",
+                                       items[self.fsel].get("code"))
                 elif k == pygame.K_4:             # 切换行情: 自选→指数→商品
                     self.fin_view = (self.fin_view + 1) % len(self.FIN_TABS)
                     self.fsel = self.fscroll = 0
@@ -4180,6 +4182,9 @@ class App:
         pygame.draw.rect(surf, self.th("border"), r, 1, border_radius=6)
         if self.dialog[0] == "exit":
             textc(surf, "退出 ONEAPP?", 12, self.th("accent"), W // 2, H // 2 - 18)
+        elif self.dialog[0] == "delwatch":
+            textc(surf, "删除自选股 %s?" % (self.dialog[1] or ""),
+                  12, self.th("accent"), W // 2, H // 2 - 18)
         else:
             it = self.dialog[1] or {}
             textc(surf, "删除这条想法?", 12, self.th("accent"), W // 2, H // 2 - 20)
