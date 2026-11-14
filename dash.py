@@ -432,15 +432,55 @@ VOICES_DIR = os.path.join(STATE_DIR, "voices")   # 语音想法 (本地 wav)
 # 驱动默认态=错误路由, 底噪 RMS 2767, 配置后 258; 每次录音前重置, 默认会漂)
 REC_DEV = "plughw:CARD=ES8389Audio,DEV=0"
 REC_MAX = 60                             # 秒, 自动截断 (arecord -d 自己停)
+# 控制名必须用 amixer contents 的精确全名 — 短名靠 amixer 模糊匹配时灵时
+# 不灵且失败被 2>/dev/null 吞掉 (2026-11-14 "没声音"根因: Capture Volume 漂回
+# 50/-70dB → 全零). 录前 rec_mixer_apply 逐项回读取证, 不符即拒录并报哪项漂了.
 REC_MIXER = [
-    ["ADC MUX", "AMIC"], ["PGAL Select", "DifferentialL"],
+    ["ADC MUX", "AMIC"],
+    ["PGAL Select", "DifferentialL"],
     ["PGAR Select", "DifferentialR"],
-    ["ADCL", "160"], ["ADCR", "160"],       # 160=本单元有声下限附近 (128 实测
-                                           #   全零=静音区, 120→rms27 已哑边缘);
-                                           #   "吵"由 clean_voice 软件治
-    ["ADCL PGA", "6"], ["ADCR PGA", "6"],
-    ["ADC2DAC Mixer", "0"],
+    ["ADCL Capture Volume", "160"],      # 0-255, ≈-15.5dB (50=-70dB=全零)
+    ["ADCR Capture Volume", "160"],
+    ["ADCL PGA Volume", "6"],            # 0-14, ×3dB 前级
+    ["ADCR PGA Volume", "6"],
+    ["ADC Mixer DACL ADCL Mixer", "off"],   # 防 DAC→ADC 回环
+    ["ADC Mixer DACR ADCR Mixer", "off"],
+    ["ADC2DAC Mixer Volume", "0"],
 ]
+
+
+def rec_mixer_apply():
+    """应用录音 mixer 配置并逐项回读验证. → (ok, 失败项描述)."""
+    for k, v in REC_MIXER:
+        subprocess.run(["amixer", "-c", "1", "sset", k, v],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=4, check=False)
+    bad = []
+    for k, v in REC_MIXER:
+        cur = None
+        try:
+            out = subprocess.run(["amixer", "-c", "1", "sget", k],
+                                 capture_output=True, text=True,
+                                 timeout=4).stdout
+            for ln in out.splitlines():
+                ln = ln.strip()
+                if ln.startswith(": values="):
+                    cur = ln[len(": values="):].strip()
+                    break
+        except Exception:
+            cur = None
+        if v in ("on", "off"):
+            ok = cur == v
+        elif cur and cur[0].isdigit():
+            try:
+                ok = float(cur.split(",")[0]) >= float(v)
+            except ValueError:
+                ok = False
+        else:
+            ok = cur == v                # enum
+        if not ok:
+            bad.append("%s=%s≠%s" % (k, cur, v))
+    return (not bad), ";".join(bad)
 
 
 def trim_silence_head(path, thr=800, keep=0.3):
@@ -1877,11 +1917,11 @@ class App:
             if os.path.exists(self.rec_path):
                 os.remove(self.rec_path)
             os.makedirs(VOICES_DIR, exist_ok=True)
-            pre = ["sh", "-c", "exec " + " ; ".join(
-                "amixer -c 1 sset '%s' '%s' 2>/dev/null" % (k, v)
-                for k, v in REC_MIXER)]
-            subprocess.run(pre, timeout=5, check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ok, bad = rec_mixer_apply()
+            if not ok:
+                self.osd = ("麦克风配置失败 %s" % bad[:38],
+                            time.monotonic() + 3.0)
+                return
             self.rec_proc = subprocess.Popen(
                 ["arecord", "-D", REC_DEV, "-f", "S16_LE",
                  "-r", "16000", "-c", "1", "-d", str(REC_MAX),
