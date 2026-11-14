@@ -12,6 +12,7 @@
 
 import json
 import os
+import time
 import urllib.request
 from datetime import datetime
 
@@ -156,7 +157,11 @@ def em_watchlist_parse(j):
     except Exception:
         return {"ok": False, "err": "bad resp"}
     items = []
-    for block in (j.get("data") or {}).get("allResults") or []:
+    allr = (j.get("data") or {}).get("allResults") or {}
+    blocks = allr if isinstance(allr, list) else [allr]   # dict/list 双形态
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
         res = block.get("result") or {}
         for row in res.get("dataList") or []:
             code = str(row.get("SECURITY_CODE") or "").strip().lower()
@@ -179,19 +184,27 @@ def em_watchlist_parse(j):
 
 
 def em_watchlist_fetch(apikey):
-    """拉取通行证账户自选股 (POST, apikey 放 header). → parse 结果."""
+    """拉取通行证账户自选股 (POST, apikey 放 header). → parse 结果.
+
+    接口异步: 首响可能只有 SELECT_STOCK 查询容器 (无 allResults, 实测),
+    间隔 1.2s 重试至多 3 次."""
     if not apikey:
         return {"ok": False, "err": "未配置 API-KEY"}
     try:
-        req = urllib.request.Request(
-            _EM_SEL_URL, data=b"{}", method="POST",
-            headers={"apikey": apikey, "Content-Type": "application/json",
-                     "User-Agent": _UA})
-        with _OPENER_DIRECT.open(req, timeout=12) as r:
-            return em_watchlist_parse(
-                json.loads(r.read().decode("utf-8", "replace")))
+        for attempt in range(3):
+            req = urllib.request.Request(
+                _EM_SEL_URL, data=b"{}", method="POST",
+                headers={"apikey": apikey, "Content-Type": "application/json",
+                         "User-Agent": _UA})
+            with _OPENER_DIRECT.open(req, timeout=12) as r:
+                j = json.loads(r.read().decode("utf-8", "replace"))
+            if (j.get("data") or {}).get("allResults") is not None \
+                    or attempt == 2:
+                return em_watchlist_parse(j)
+            time.sleep(1.2)
     except Exception as e:
         return {"ok": False, "err": repr(e)[:40]}
+    return {"ok": False, "err": "no results"}
 
 
 # ── 双色球 (中彩官网; 参考 hermes _ssq.py 同源移植) ─────────────────────────
