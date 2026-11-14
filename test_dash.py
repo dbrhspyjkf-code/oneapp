@@ -556,6 +556,11 @@ def test_music():
             app.mu_view = "play"
             app.mu_aud_up = None
             app.draw(pygame.Surface((dash.W, dash.H)))
+            # 回归 (2026-11-14 歌词不显示): _pl_lrc_parse 丢 @staticmethod →
+            # on_net 投递 TypeError 被主循环 except 吞 → mu_lyr 永远空
+            app.on_net("data", "mulyr:t", {
+                "synced": "[00:05.5]你好\n[00:10]世界", "plain": None})
+            assert app.mu_lyr == [(5.5, "你好"), (10.0, "世界")], app.mu_lyr
             app.mu_stop()
             assert app.mu_playing is None and app.mu_proc is None
             # 会话持久化: 恢复暂停态
