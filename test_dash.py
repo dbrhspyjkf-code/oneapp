@@ -267,6 +267,8 @@ def test_render():
     app.fdetail["view"] = "day"
     app.draw(canvas)
     app.fdetail = None
+    # 设备上可能有真实 watch.json (用户手动加过股) — 测试强制种子态
+    app.watch = {"items": [dict(x) for x in dash.WATCH_SEED["items"]]}
     its = app.fin_items()
     assert its and its[0]["code"] == "sh600519", its
     # 自选股: qt_code 幂等 (行情没显示的根因) + n 添加 / d 删除 (本地 json)
