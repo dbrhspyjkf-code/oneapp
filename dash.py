@@ -2106,10 +2106,10 @@ class App:
             return True
 
         # 各页动作键占用: 想法(4新增/5录音/7删除/8播放语音) 电台(1-8直播)
-        # 行情(3商品/4自选/5指数/8图表) 新闻(1-7选条/9换源)
+        # 行情(3商品/4自选/5指数/8图表) 新闻(1-7选条, 源切换走←→)
         # 工具网格页: 数字 1-9/0 全部留给 app 直开
         page_keys = {1: (4, 5, 7, 8), 2: tuple(range(1, 9)),
-                     3: (4, 5, 6, 8), 4: tuple(range(1, 10)),  # 9 换源, 勿被全局跳页截走
+                     3: (4, 5, 6, 8), 4: tuple(range(1, 8)),
                      5: tuple(range(0, 10))}
         digit = k - pygame.K_0                # pygame 常量值 → 数字序号
         if (k in (pygame.K_4, pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8)
@@ -2127,7 +2127,9 @@ class App:
             elif self.page == 3 and not self.fdetail:
                 self._move_fsel(-3 if k == pygame.K_UP else -1)
             elif self.page == 4:
-                if self.news_detail:
+                if k == pygame.K_LEFT:
+                    self._news_src_cycle(-1)       # ← 切换源
+                elif self.news_detail:
                     self.news_detail_scroll = max(0,
                         self.news_detail_scroll - 1)   # 上滚一行
                 else:
@@ -2144,7 +2146,9 @@ class App:
             elif self.page == 3 and not self.fdetail:
                 self._move_fsel(3 if k == pygame.K_DOWN else 1)
             elif self.page == 4:
-                if self.news_detail:
+                if k == pygame.K_RIGHT:
+                    self._news_src_cycle(1)        # → 切换源
+                elif self.news_detail:
                     self.news_detail_scroll += 1       # 下滚一行
                 else:
                     self.move_news(1)
@@ -2201,10 +2205,6 @@ class App:
             # (方向键已在上方分支转入 tool_grid_key; Esc 全局分支 → 回主页)
             self.tool_grid_key(k)
         elif self.page == 4:
-            if k == pygame.K_9:                   # 切换新闻源
-                self.news_src_i = (self.news_src_i + 1) % len(NEWS_SOURCES)
-                self.news_sel = self.news_scroll = 0
-                self.news_detail = None
             digit = k - pygame.K_0
             if pygame.K_1 <= k <= pygame.K_7 and not self.news_detail:
                 idx = self.news_scroll + digit - 1   # 窗口内 1-7, 翻页复用
@@ -3251,6 +3251,13 @@ class App:
         feed = (j.get("feeds") or {}).get(src) or {}
         return [it for it in (feed.get("items") or []) if it.get("t")][:30]
 
+    def _news_src_cycle(self, d):
+        """←/→ 切换新闻源 (原 9 键); 换源清光标/滚动/详情."""
+        self.news_src_i = (self.news_src_i + d) % len(NEWS_SOURCES)
+        self.news_sel = 0
+        self.news_scroll = 0
+        self.news_detail = None
+
     def move_news(self, d):
         n = len(self.news_items())
         if not n:
@@ -3306,7 +3313,7 @@ class App:
 
         # 列表头
         text(surf, "新闻", 14, hi, (6, 2))
-        text(surf, "· %s %d 条 · e 切换" % (src_name, len(items)), 11, dim,
+        text(surf, "· %s %d 条 · ←→ 切换源" % (src_name, len(items)), 11, dim,
              (6 + textw("新闻", 14) + 6, 4))
 
         # 列表行: 均匀分布
@@ -3333,7 +3340,7 @@ class App:
         if not items:
             textc(surf, "新闻获取中" if self.net.mode != "offline"
                   else "离线 · 联网后同步", BODY, dim, W // 2, 70)
-        text(surf, "F/X 换页 · 1-7 打开 · 9 切换源", BODY, soft, (6, 151))
+        text(surf, "F/X 换页 · ↑↓ 选择 · 1-7 打开 · ←→ 源", BODY, soft, (6, 151))
 
     def draw_tool(self, surf):
         {"fx": self.draw_fx, "unit": self.draw_unit,

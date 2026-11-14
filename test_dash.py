@@ -294,11 +294,25 @@ def test_render():
     app.news_detail = its[0]
     app.draw(canvas)
     app.news_detail = None
-    # 新闻页 9 = 换源 (豁免全局跳页)
+    # 新闻页: ←→ 切换源, ↑↓ 选择 (9 不再换源; 4-8 跳页不劫持 1-7 选条)
     app.page = 4
     app.news_src_i = 0
     app.key(pg.K_9)
-    assert app.page == 4 and app.news_src_i == 1
+    assert app.page == 4 and app.news_src_i == 0      # 9 已无功能
+    app.key(pg.K_RIGHT)
+    assert app.news_src_i == 1 and app.news_sel == 0 and app.news_detail is None
+    app.key(pg.K_LEFT)
+    assert app.news_src_i == 0                        # 循环回绕
+    app.key(pg.K_LEFT)
+    assert app.news_src_i == len(dash.NEWS_SOURCES) - 1  # 向左回绕到末源
+    app.key(pg.K_RIGHT)
+    assert app.news_src_i == 0
+    app.news_detail = None
+    sel0 = app.news_sel
+    app.key(pg.K_DOWN)
+    assert app.news_sel == sel0 + 1                   # ↓ 选择下一条
+    app.key(pg.K_UP)
+    assert app.news_sel == sel0                       # ↑ 选择上一条
     print("render OK (6 pages + dialog + ideas-local + fin + tools/news)")
 
 
