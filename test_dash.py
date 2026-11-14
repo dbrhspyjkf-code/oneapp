@@ -1468,8 +1468,11 @@ def test_tv():
     assert a_sw[a_sw.index("-vf") + 1].startswith("fps=12,scale=320:170")
     a_an = app.tv_argv("http://x/live.m3u8", False, False)
     assert a_an[-1] == "-an" and "pulse" not in a_an
-    # Mac 无 v4l2 设备 → 自动探测 False (设备上有 bcm2835-codec-decode)
-    assert dash.App.tv_hwdec_available() is False
+    # 硬解探测: 无 v4l2 的机器 (Mac) 恒 False; True 仅可能出现在有
+    # /sys/class/video4linux 的设备 (bcm2835-codec-decode)
+    hw_probe = dash.App.tv_hwdec_available()
+    assert isinstance(hw_probe, bool)
+    assert hw_probe is False or os.path.isdir("/sys/class/video4linux")
 
     # ── 播放状态机: 打桩 spawn, 管道喂真帧字节 → 读帧线程只留最新 ──
     class FakeProc:
@@ -1533,9 +1536,9 @@ def test_tv():
         assert app.tv_playing is None and app.tool == "tv"
         assert len(procs) == 2                 # Esc 不再起新进程
 
-        # ── 看门狗: 起播超时 (软解/无 stderr) → 报错回列表 ──
+        # ── 看门狗: 起播超时 (钉软解 — 设备会自动探到硬解改走重试分支) ──
         app.tv_err = ""
-        app.tv_key(pygame.K_RETURN)
+        app.tv_play(lst[0], hw=False, audio=True)
         app.tv_started = _time.monotonic() - 13.0
         app.tv_watchdog()
         assert app.tv_playing is None and app.tv_err, app.tv_err
