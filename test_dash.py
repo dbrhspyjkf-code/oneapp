@@ -549,6 +549,11 @@ def test_music():
             app.mu_pause_toggle()                 # 续播 (-ss 续)
             assert not app.mu_paused and app.mu_proc is not None
             assert abs(app.mu_pos0 - pos) < 2.5, (app.mu_pos0, pos)
+            # 回归 (2026-11-14 mu_ff 闪退): 播放态必须能完整画播放页
+            # (出声锚点判据 self.mu_ff — 商店版删音乐 AirPlay 后必须保留初始化)
+            app.mu_view = "play"
+            app.mu_aud_up = None
+            app.draw(pygame.Surface((dash.W, dash.H)))
             app.mu_stop()
             assert app.mu_playing is None and app.mu_proc is None
             # 会话持久化: 恢复暂停态
