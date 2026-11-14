@@ -423,7 +423,7 @@ def test_tools():
     app.key(pygame.K_RIGHT)
     assert app.tsel == 1
     app.key(pygame.K_DOWN)
-    assert app.tsel == 5                          # 下一行同列, 钳到末卡 (6 卡)
+    assert app.tsel == 6                          # 下一行同列, 钳到末卡 (7 卡)
     app.key(pygame.K_3)
     assert app.tool == "cal"
     app.key(pygame.K_ESCAPE)
@@ -735,6 +735,233 @@ def test_ime():
     print("ime OK (words/chars/assoc/route/toggle)")
 
 
+def test_mail_parse():
+    """mail.py 解析层: RFC2047 头 / GBK 正文 / HTML 剥离 / 引言签名裁剪."""
+    import email as email_mod
+    import mail as mailmod
+    raw = (b"From: =?gbk?B?1cXI/Q==?= <li@163.com>\r\n"
+           b"Subject: =?utf-8?B?5L2g5aW9?=\r\n"
+           b"Date: Fri, 14 Nov 2026 09:30:00 +0800\r\n"
+           b"Content-Type: multipart/alternative; boundary=\"B\"\r\n\r\n"
+           b"--B\r\n"
+           b"Content-Type: text/plain; charset=\"gbk\"\r\n\r\n"
+           b"\xc4\xe3\xba\xc3\xa3\xac\xd5\xe2\xca\xc7\xd5\xfd\xce\xc4\xa1\xa3"
+           b"\r\n> \xd2\xfd\xd1\xd4\r\n-- \r\n\xc7\xa9\xc3\xfb\r\n"
+           b"--B\r\n"
+           b"Content-Type: text/html; charset=\"utf-8\"\r\n\r\n"
+           b"<p>hello&nbsp;<b>world</b></p><script>x()</script>\r\n"
+           b"--B--\r\n")
+    msg = email_mod.message_from_bytes(raw)
+    assert mailmod.decode_subject(msg["Subject"]) == "你好"
+    assert mailmod.decode_from(msg["From"], inbox=True) == "li@163.com"
+    assert mailmod.decode_from(msg["From"], inbox=False) == "张三"
+    body = mailmod.extract_body(msg)
+    assert body == "你好，这是正文。", body          # 引言/签名已裁
+    assert mailmod.extract_preview(msg).startswith("你好，这是正文。")
+    # 纯 HTML 邮件: plain 缺失 → 剥离兜底
+    raw2 = (b"From: x@y.com\r\nSubject: t\r\n"
+            b"Content-Type: text/html; charset=\"utf-8\"\r\n\r\n"
+            b"<style>p{}</style><p>hi&nbsp;ok</p>")
+    msg2 = email_mod.message_from_bytes(raw2)
+    assert mailmod.extract_body(msg2) == "hi ok", mailmod.extract_body(msg2)
+    assert __import__("re").match(r"^\d\d-\d\d \d\d:\d\d$",
+                                  mailmod.fmt_date(msg["Date"]))
+    assert mailmod.fmt_date(None) == ""
+    print("mail parse OK (RFC2047/GBK/html/quotes)")
+
+
+def test_mail_utf7():
+    """mail.py IMAP UTF-7: 解码已知 163 夹名 + 编解码往返."""
+    import mail as mailmod
+    assert mailmod._decode_imap_utf7("&XfJT0ZAB-") == "已发送"
+    assert mailmod._decode_imap_utf7("&g0l6P3ux-") == "草稿箱"
+    assert mailmod._decode_imap_utf7("INBOX") == "INBOX"
+    assert mailmod._decode_imap_utf7("abc&-def") == "abc&def"
+    assert mailmod._encode_imap_utf7("已发送") == "&XfJT0ZAB-"
+    for s in ("已发送", "草稿箱", "草稿&箱", "Notes", "收&件箱2"):
+        assert mailmod._decode_imap_utf7(mailmod._encode_imap_utf7(s)) == s, s
+    assert mailmod.should_skip("&g0l6P3ux-") and mailmod.should_skip("草稿箱")
+    assert not mailmod.should_skip("INBOX") and not mailmod.should_skip("已发送")
+    print("mail utf7 OK (163 folder names/roundtrip)")
+
+
+def test_mail_accounts():
+    """mail.py 账号存储: 0600 落盘 / 增删改 / provider 注册表与未知域回落."""
+    import mail as mailmod
+    import stat as stat_mod
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    mailmod.MAIL_FILE = os.path.join(tmp, "mail.json")
+    assert mailmod.load_accounts() == {"accounts": [], "last": ""}
+    assert mailmod.upsert_account("x@163.com", "code1")["ok"]
+    # 同邮箱 (大小写不敏感) 再存 = 改授权码, 不新增
+    assert mailmod.upsert_account("X@163.com", "code2")["ok"]
+    d = mailmod.load_accounts()
+    assert len(d["accounts"]) == 1 and d["accounts"][0]["auth"] == "code2"
+    assert d["last"] == "x@163.com"
+    assert stat_mod.S_IMODE(os.stat(mailmod.MAIL_FILE).st_mode) == 0o600
+    mailmod.upsert_account("y@qq.com", "k")
+    mailmod.remove_account("x@163.com")
+    d = mailmod.load_accounts()
+    assert [a["email"] for a in d["accounts"]] == ["y@qq.com"]
+    assert d["last"] == "y@qq.com"
+    p = mailmod.provider_for("x@163.com")
+    assert p["imap"] == "imap.163.com" and p["port"] == 993
+    assert mailmod.provider_for("u@UnknownMail.example")["imap"] == \
+        "imap.unknownmail.example"                 # 未知域回落 (预留扩展)
+    assert not mailmod.upsert_account("noat", "k")["ok"]
+    assert not mailmod.upsert_account("a@b.com", "")["ok"]
+    print("mail accounts OK (0600/upsert/provider)")
+
+
+def test_mail_keys():
+    """邮件 app 键流: 网格直开 → 登录表单 → 文件夹 → 列表 → 详情 → 逐层 Esc."""
+    import mail as mailmod
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    mailmod.MAIL_FILE = os.path.join(tmp, "mail.json")
+    app = dash.App(FakeNet())
+    # 网格数字直开: 邮件第 7 卡
+    app.page = 5
+    app.key(pygame.K_7)
+    assert app.tool == "mail" and app.mail_lv == "acct"
+    # 登录表单: 邮箱 → Enter → 授权码 → Enter 提交
+    app.key(pygame.K_RETURN)
+    assert app.mail_lv == "login" and app.mail_edit == 0
+    for c in "user@163.com":
+        app.key(0, c)
+    app.key(pygame.K_RETURN)
+    assert app.mail_edit == 1
+    for c in "authcode1":
+        app.key(0, c)
+    assert app.mail_auth_buf == "authcode1"
+    app.key(pygame.K_RETURN)
+    assert ("job", "mail_login") in app.net.got
+    # 登录成功 → 落盘 0600 + 进文件夹层
+    app.on_net("data", "mail_login", {"ok": True, "unread": 3,
+                                      "email": "user@163.com",
+                                      "auth": "authcode1"})
+    assert app.mail_lv == "folders" \
+        and app.mail_cur.get("email") == "user@163.com"
+    import stat as stat_mod
+    assert stat_mod.S_IMODE(os.stat(mailmod.MAIL_FILE).st_mode) == 0o600
+    assert ("job", "mail_folders") in app.net.got
+    app.on_net("data", "mail_folders", {"ok": True, "folders": [
+        {"raw": "INBOX", "name": "INBOX", "unread": 3, "total": 12},
+        {"raw": "\"&XfJT0ZAB-\"", "name": "已发送", "unread": 0, "total": 4}]})
+    assert [f["name"] for f in app.mail_folders] == ["INBOX", "已发送"]
+    app.key(pygame.K_RETURN)                      # INBOX → 列表层
+    assert app.mail_lv == "list" and app.mail_folder == "INBOX"
+    assert ("job", "mail_list") in app.net.got
+    app.on_net("data", "mail_list", {"ok": True, "total": 2, "msgs": [
+        {"uid": "11", "subject": "你好", "from": "a@b.com",
+         "date": "11-14 09:00", "preview": "内容", "seen": False,
+         "flagged": False},
+        {"uid": "10", "subject": "旧的", "from": "c@d.com",
+         "date": "11-13 08:00", "preview": "", "seen": True,
+         "flagged": True}]})
+    assert app.mail_total == 2 and len(app.mail_msgs) == 2
+    app.key(pygame.K_RETURN)                      # 开详情 → mail_body:11
+    assert app.mail_lv == "detail" and app.mail_body_uid == "11"
+    assert ("job", "mail_body:11") in app.net.got
+    app.on_net("data", "mail_body:11",
+               {"ok": True, "uid": "11", "text": "第一行\n第二行"})
+    assert app.mail_body == "第一行\n第二行"
+    # 详情 4/5: 标已读 / 红旗 (tag 带 uid) + Esc 回列表
+    app.key(pygame.K_4)
+    assert ("job", "mail_act:11:mark_read") in app.net.got
+    app.key(pygame.K_5)
+    assert ("job", "mail_act:11:flag") in app.net.got
+    app.key(pygame.K_ESCAPE)
+    assert app.mail_lv == "list"
+    # 列表 5: 全部↔未读视图切换
+    app.key(pygame.K_5)
+    assert app.mail_view == "unread"
+    app.key(pygame.K_5)
+    assert app.mail_view == "all"
+    app.key(pygame.K_ESCAPE)
+    assert app.mail_lv == "folders"
+    app.key(pygame.K_ESCAPE)
+    assert app.mail_lv == "acct" and app.mail_cur is None
+    # 账号层 d 删除 → dialog 确认 → 落盘
+    app.key(pygame.K_d)
+    assert app.dialog and app.dialog[0] == "delmail"
+    app.key(pygame.K_RETURN)
+    assert app.mail.get("accounts") == []
+    # Esc 账号层 → 回工具网格
+    app.key(pygame.K_ESCAPE)
+    assert app.tool is None
+    # 五层渲染冒烟 (空态/滚动/旗标角标)
+    app.tool_open("mail")
+    app.mail_unread["user@163.com"] = 5
+    app.draw(canvas)
+    app.mail_lv = "login"
+    app.mail_acct_buf = "u@163.com"
+    app.mail_auth_buf = "abc"
+    app.draw(canvas)
+    app.mail_lv = "folders"
+    app.mail_cur = {"email": "u@163.com", "auth": "x"}
+    app.mail_folders = [{"raw": "INBOX", "name": "INBOX", "unread": 2,
+                         "total": 9}]
+    app.mail_sel = 0
+    app.draw(canvas)
+    app.mail_lv = "list"
+    app.mail_folder = "INBOX"
+    app.mail_msgs = [{"uid": "1", "subject": "s", "from": "f", "date": "d",
+                      "preview": "p" * 300, "seen": False, "flagged": True}]
+    app.mail_sel = 0
+    app.draw(canvas)
+    app.mail_lv = "detail"
+    app.mail_body = "正文" * 200
+    app.mail_body_scroll = 3
+    app.draw(canvas)
+    print("mail keys OK (grid/login/folders/list/detail/del/esc/render)")
+
+
+def test_mail_live():
+    """163 真链 (RUN_NET=1 且本机有 ~/.config/imap-smtp-email/.env 时跑;
+    无凭据自动跳过 — 设备上无此文件, 商店版测试不受影响)."""
+    import mail as mailmod
+    envf = os.path.expanduser("~/.config/imap-smtp-email/.env")
+    if not os.path.exists(envf):
+        print("mail live SKIP (no ~/.config/imap-smtp-email/.env)")
+        return
+    env = {}
+    for line in open(envf):
+        line = line.strip()
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"')
+    addr, auth = env.get("IMAP_USER", ""), env.get("IMAP_PASS", "")
+    if not addr or not auth:
+        print("mail live SKIP (empty IMAP_USER/IMAP_PASS)")
+        return
+    acct = {"email": addr, "auth": auth}
+    r = mailmod.test_login(acct)
+    assert r["ok"], r
+    print("  login OK unread=%d" % r["unread"])
+    r = mailmod.list_folders(acct)
+    assert r["ok"] and r["folders"], r
+    inbox = next(f for f in r["folders"] if f["name"].upper() == "INBOX")
+    print("  folders %d, INBOX total=%s unread=%s" % (
+        len(r["folders"]), inbox.get("total"), inbox.get("unread")))
+    r = mailmod.fetch_msgs(acct, inbox["raw"], "all", 3)
+    assert r["ok"], r
+    for m in r["msgs"][:3]:
+        print("  %s [%s%s] %s | %s" % (m["date"], "未读" if not m["seen"] else "",
+                                       "旗" if m["flagged"] else "",
+                                       m["from"][:22], m["subject"][:34]))
+    if r["msgs"]:
+        uid = r["msgs"][0]["uid"]
+        b = mailmod.fetch_body(acct, inbox["raw"], uid)
+        assert b["ok"], b
+        print("  body %d chars: %s" % (len(b["text"]),
+                                       b["text"][:60].replace("\n", " / ")))
+    print("mail live OK (163 imap direct)")
+
+
 def test_net_live():
     """在线链路 (RUN_NET=1): 公网源真抓 + 音乐搜索 + 歌词 (大陆网络)."""
     import fetchers
@@ -781,6 +1008,11 @@ if __name__ == "__main__":
     test_music()
     test_voice()
     test_ime()
+    test_mail_parse()
+    test_mail_utf7()
+    test_mail_accounts()
+    test_mail_keys()
     if os.environ.get("RUN_NET"):
         test_net_live()
+        test_mail_live()
     print("ALL PASS")
