@@ -720,6 +720,31 @@ def test_radio_out():
         app9.playing_key = None
         assert app9.adjust_volume(115) is None  # Mac 无 pactl → OSD 兜底不崩
 
+        # 内嵌 -c 脚本语法完整性 (三引号截断教训) + _FullStream 全读语义
+        # (pyatv BufferedIOBaseWrapper 短读 → dr_flac 误判 EOF → 响一声就没声)
+        compile(dash._ATVR_SCAN, "atvr_scan", "exec")
+        compile(dash._ATVR_PLAY, "atvr_play", "exec")
+        ns = {}
+        exec(dash._ATVR_STREAM_LIB, ns)
+        _io = __import__("io")
+        data = bytes(range(256)) * 3000
+        _src = _io.BytesIO(data)
+        _lead, _eof = ns["_prefill"](_src, ns["LEAD"])
+        assert len(_lead) == ns["LEAD"] and _eof is False
+        _fs = ns["_FullStream"](_src, _lead, _eof)
+        assert _fs.read(400000) == data[:400000]    # 跨 lead 边界恒满 n
+        assert _fs.tell() == 400000
+        assert _fs.read(400000) == data[400000:]    # 真 EOF 才短读
+        assert _fs.seek(0) == 0 and _fs.read(10) == data[:10]
+        try:
+            _fs.seek(len(_lead) + 1)
+            assert False
+        except _io.UnsupportedOperation:
+            pass
+        _l3, _e3 = ns["_prefill"](_io.BytesIO(b"x" * 50), ns["LEAD"])
+        _fs3 = ns["_FullStream"](_io.BytesIO(b""), _l3, _e3)
+        assert _fs3.read(100) == b"x" * 50          # 短产端预读即 EOF
+
         # 设备 ffmpeg SIGTERM 会卡死 futex (真机实证) → radio_stop 必须
         # 补刀 SIGKILL: 产端/消费端都是忽略 SIGTERM 的替身, 停播后 2s 内死透
         stubborn = "import signal,time; signal.signal(signal.SIGTERM," \

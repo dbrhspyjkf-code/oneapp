@@ -148,18 +148,100 @@ async def _s():
     print(json.dumps(devs, ensure_ascii=False))
 asyncio.run(_s())
 '''
-_ATVR_PLAY = r"""
-import asyncio, os, sys, threading
+# 直播流输入库 (消费端用, 测试同源 exec): pyatv 的 BufferedIOBaseWrapper 在
+# SemiSeekableBuffer 边界会对 miniaudio 返回短读, dr_flac 视短读为 EOF →
+# stream_file 无异常提前返回 → "响一声就没声" (2026-11-14 真机实证, aplog
+# 消费端无 traceback 干净退出 + ffmpeg Broken pipe)。_FullStream: read 恒满
+# 请求 (底层阻塞全读), 头部 LEAD 驻内存可 seek (tinytag 元数据解析 + dr_flac
+# 头部 seek 都落在真实数据上), 越过 lead 后单向直读 — 真正 EOF 才允许短读。
+_ATVR_STREAM_LIB = r'''
+import io
+LEAD = 262144
+
+def _prefill(raw, target):
+    # 读满 target 或 EOF; 返回 (lead, eof)。产端没头/秒死在此暴露 (不烧音箱连接)
+    buf = bytearray()
+    while len(buf) < target:
+        chunk = raw.read(min(65536, target - len(buf)))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf), len(buf) < target
+
+class _FullStream(io.BufferedIOBase):
+    def __init__(self, raw, lead, eof):
+        super().__init__()
+        self.raw = raw
+        self.lead = lead
+        self.eof = eof
+        self.pos = 0
+
+    def read(self, size=-1):
+        if size == 0:
+            return b""
+        out = bytearray()
+        if self.pos < len(self.lead):
+            take = len(self.lead) - self.pos if size < 0 \
+                else min(size, len(self.lead) - self.pos)
+            out += self.lead[self.pos:self.pos + take]
+            self.pos += take
+        if size >= 0 and len(out) >= size:
+            return bytes(out[:size])
+        if size < 0:                       # 读到 EOF (tinytag 尾部探测用)
+            while not self.eof:
+                chunk = self.raw.read(65536)
+                if not chunk:
+                    self.eof = True
+                    break
+                out.extend(chunk)
+                self.pos += len(chunk)
+            return bytes(out)
+        need = size - len(out)             # 越过 lead: 底层阻塞全读, 恒满 n
+        while need > 0 and not self.eof:
+            chunk = self.raw.read(min(need, 65536))
+            if not chunk:
+                self.eof = True
+                break
+            out.extend(chunk)
+            self.pos += len(chunk)
+            need -= len(chunk)
+        return bytes(out)                  # 仅真 EOF 才短读
+
+    def seek(self, pos, origin=io.SEEK_SET):
+        if origin != io.SEEK_SET or pos > len(self.lead):
+            raise io.UnsupportedOperation("seek beyond lead")
+        self.pos = pos
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+'''
+_ATVR_PLAY = _ATVR_STREAM_LIB + r'''
+import asyncio, os, signal, sys, threading
 async def _s():
     from pyatv import connect
     from pyatv.conf import AppleTV, ManualService
     from pyatv.const import Protocol
     from pyatv.interface import MediaMetadata
     loop = asyncio.get_event_loop()
+    stop_evt = asyncio.Event()
+    signal.signal(signal.SIGTERM,
+                  lambda *_: loop.call_soon_threadsafe(stop_evt.set))
+    try:     # 预读 25s 上限: 产端无头/停摆直接退出, 不烧音箱连接 (冷却防护)
+        lead, eof = await asyncio.wait_for(
+            loop.run_in_executor(None, _prefill, sys.stdin.buffer, LEAD), 25)
+    except Exception:
+        return
     conf = AppleTV(sys.argv[1], sys.argv[1])   # 免 mDNS 扫描直连 (省 ~8s)
     conf.add_service(ManualService(sys.argv[3] or None, Protocol.RAOP,
                                    int(sys.argv[2]), None))
-    atv = await connect(conf, loop)     # 仅 RAOP 服务: Companion SRP 链在
+    atv = await asyncio.wait_for(connect(conf, loop), 20)   # 挂死会拖 45s+
     try:                                 # 设备依赖组合下必坏 (srptools 1.0.1)
         print("RAOP-UP", flush=True)     # 出声锚点 (radio 无进度条, 仅日志用)
         md = None                        # 台名进 RAOP 元数据 (HomePod 显示真台名)
@@ -188,12 +270,25 @@ async def _s():
                 except Exception:
                     pass
             threading.Thread(target=_vol_ctl, daemon=True).start()
-        await atv.stream.stream_file(sys.stdin.buffer, metadata=md,
-                                     override_missing_metadata=True)
+        # stream_task + stop_evt: SIGTERM → 优雅取消 stream → finally 走
+        # atv.close() 真 RTSP TEARDOWN (python 默认 SIGTERM 立即死, 不跑
+        # finally — 暴力拆连让音箱进冷却拒连, 换台秒死根因之一)
+        stream_task = asyncio.ensure_future(atv.stream.stream_file(
+            _FullStream(sys.stdin.buffer, lead, eof), metadata=md,
+            override_missing_metadata=True))
+        evt_task = asyncio.ensure_future(stop_evt.wait())
+        await asyncio.wait({stream_task, evt_task},
+                           return_when=asyncio.FIRST_COMPLETED)
+        if not stream_task.done():
+            stream_task.cancel()
+            try:
+                await stream_task
+            except Exception:
+                pass
     finally:
         atv.close()
 asyncio.run(_s())
-"""
+'''
 
 
 def raop_scan(timeout=12):
@@ -1144,6 +1239,7 @@ class App:
         self.raop_cons = None                 # AirPlay 消费端 (atvremote stream=-)
         self.vol_w = None                     # 音量控制 FIFO 写端 (O_RDWR, 会话期常开)
         self.vol_fifo = None
+        self.raop_up_at = None                # RAOP-UP 到达时刻 (None=未连上)
         self.raop_mute_prev = None            # Fn+A 静音前的音量 (恢复位)
         _v = netmod.load_json_file(RAOP_VOL_FILE, 50)
         self.raop_vol = _v if isinstance(_v, int) and 0 <= _v <= 100 else 50
@@ -1381,6 +1477,10 @@ class App:
                             and self.raop_cons.poll() is not None):
                     self.radio_stop()          # ffplay 已退出 / RAOP 会话已断
                     self.osd = ("流已断", time.monotonic() + 1.5)
+                elif self.raop_cons is not None and self.raop_up_at is None \
+                        and time.monotonic() - self.play_at > 50:
+                    self.radio_stop()          # RAOP 预读+连接 50s 没到 = 挂死
+                    self.osd = ("AirPlay 未连上", time.monotonic() + 2.0)
 
     def poll_tool(self):
         """工具子应用按需取数 (poll 每秒调; TTL 层去重)."""
@@ -1636,6 +1736,7 @@ class App:
         self.radio_stop()
         if self.mu_proc or self.mu_playing:   # 音频焦点: 音乐让路
             self.mu_stop()
+        self.raop_up_at = None                # 新会话: RAOP-UP 重新等
         dev = self._raop_dev()
         if dev:                               # AirPlay 输出: RAOP 直推
             if self._radio_play_raop(st, dev):
@@ -1755,12 +1856,14 @@ class App:
             self.vol_fifo = None
 
     def _raop_watch(self, proc):
-        """消费端 stdout: RAOPVOL <n> → 采纳 pyatv 视角会话音量 (音箱端/iPhone
-        侧的音量变更会被 pyatv 拦截进来, 比纯本地记忆更准)."""
+        """消费端 stdout: RAOP-UP → 出声锚点 (看门狗判未连上用); RAOPVOL <n>
+        → 采纳 pyatv 视角会话音量 (音箱端/iPhone 侧变更会被 pyatv 拦截回流)."""
         try:
             for line in proc.stdout:
                 line = line.decode(errors="replace").strip()
-                if line.startswith("RAOPVOL "):
+                if line.startswith("RAOP-UP"):
+                    self.raop_up_at = time.monotonic()
+                elif line.startswith("RAOPVOL "):
                     try:
                         self.raop_vol = max(0,
                                             min(100, int(float(line.split()[1]))))
@@ -1838,9 +1941,12 @@ class App:
     def radio_stop(self):
         self._radio_kill(self.player)         # 产端 (ffplay 本机 / ffmpeg AirPlay)
         self.player = None
-        self._radio_kill(self.raop_cons)      # RAOP 消费端随产端一起断
+        # 消费端长宽限: SIGTERM → 优雅取消 stream → finally RTSP TEARDOWN
+        # (暴力拆连让音箱进冷却拒连, 下一次换台秒死 — 实证); futex 卡死才兜底 K9
+        self._radio_kill(self.raop_cons, grace=2.5)
         self.raop_cons = None
         self._vol_fifo_close()                # 音量命令通道随会话关
+        self.raop_up_at = None
         self.playing_key = None
         self.lvl.stop()                       # 电平源随播放进程一起断
         self.vu = [3.0] * 12
