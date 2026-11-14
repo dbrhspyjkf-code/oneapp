@@ -15,7 +15,7 @@ M5Stack CardputerZero (320×170) 的 pygame 工具箱 app。**零本地服务依
 | 电台 | 20 台内置直连流 (中/英), 12 条频谱 VU, 输出 O 键循环 (本机 / 局域网 AirPlay 音箱) | qingting.fm / cnr.cn / BBC / NPR… |
 | 行情 | 自选股+指数+贵金属, 分时/250日K | 腾讯 qt.gtimg.cn |
 | 新闻 | 7 个中文 RSS 源 | IT之家 / 少数派 / Solidot… |
-| 工具 | 汇率 / 单位换算 / 万年历 / 双色球 / 计时器 / 音乐 | open.er-api.com / 中彩官网 / QQ·网易直连 |
+| 工具 | 汇率 / 单位换算 / 万年历 / 双色球 / 计时器 / 音乐 / 电视 | open.er-api.com / 中彩官网 / QQ·网易直连 / 公共直播源 |
 
 音乐 app: 本地曲库 (mp3/flac/wav) + QQ 音乐 / 网易云**直连协议**
 (musrc.py 自实现 weapi/eapi, 扫码绑定, 歌词走 LRCLIB+网易兜底);
@@ -28,6 +28,16 @@ pyatv RAOP 直推, 台名进音箱元数据)。AirPlay 播放中 Fn+S/D/A 音量
 未播放时回落本机并在 OSD 注明 "本机")。设备需 `pip install --user
 --break-system-packages pyatv==0.18.0 srptools==1.0.1`;
 缺库/无设备时自动回落本机播放。
+
+电视 app (工具第 8 卡): **95 个实测可用公共直播频道** (央视/卫视/地方/国际
+四分组, 源自官方 cardputer-zero-iptv 的 public-live.m3u 全量体检后取稳定无
+短时效 token 的 95 条, 见 `tv_channels.py`)。单 ffmpeg 进程直推面板: HLS →
+`fps=12,scale=320:170` → rgb24 管道 + 音频同进程 pulse (播放链移植其
+panel.py 方案); 有 bcm2835-codec-decode 时自动 H.264 硬解 (h264_v4l2m2m),
+不出画自动回退软解。键位: 列表 `←→` 分组 `↑↓` 选台 `Enter` 播;
+播放中 `↑↓`(F/X) 换台、`Esc` 回列表; 断流/起播超时自动回列表报文案
+(公共源单台失效属正常, 换台即恢复)。上次分组/光标记忆 `tv_last.json`,
+诊断轨迹 `/tmp/oneapp_tv.log`。
 
 ## 运行
 

@@ -663,7 +663,7 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
 #    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
 TOOL_APPS = [("fx", "汇率"), ("unit", "单位换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
-             ("music", "音乐"), ("mail", "邮件")]
+             ("music", "音乐"), ("mail", "邮件"), ("tv", "电视")]
 TOOL_GRID = 5                            # 每行卡片数
 MAIL_BODY_ROWS = 6                       # 邮件详情每屏正文行数 (12px)
 
@@ -675,6 +675,7 @@ MUSIC_SRCS = [("local", "本地曲库", ""), ("qq", "QQ 音乐", ""),
               ("ne", "网易云", "")]
 MU_LAST_CACHE = os.path.join(STATE_DIR, "mu_last.json")  # 上次播放会话 (跨重启)
 MU_OUT_CACHE = os.path.join(STATE_DIR, "mu_out.json")   # 音乐输出 (按设备 id)
+TV_LAST_CACHE = os.path.join(STATE_DIR, "tv_last.json")  # 电视上次分组/光标
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
 CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
 _SENT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1390,6 +1391,27 @@ class App:
         self.mail_total = 0                    # 当前文件夹邮件总数
         self.mail_err = ""                     # 列表获取失败文案 (空态显示)
         self._mail_body_cache = (None, [])     # (key, lines) 详情折行缓存
+        # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
+        # + 音频同进程 — 播放方案移植官方 cardputer-zero-iptv 的 panel.py)
+        self.tv_grp = 0                        # 分组索引 (tv_channels.GROUPS)
+        self.tv_sel = 0                        # 组内光标
+        self.tv_sels = {0: 0}                  # 每组光标 {grp_idx: sel}
+        self.tv_scroll = 0                     # 列表窗口起点
+        self.tv_playing = None                 # 播放中频道 (name, group, url)
+        self.tv_proc = None                    # ffmpeg 子进程
+        self.tv_gen = 0                        # 播放会话号 (读帧线程守卫)
+        self.tv_hw = False                     # 本次尝试硬解 (h264_v4l2m2m)
+        self.tv_audio = True                   # 本次尝试带音频映射
+        self.tv_att = 0                        # 重试梯级 (0 初试 / 1 软解 / 2 -an)
+        self.tv_frame = None                   # 最新 rgb24 帧 (W*H*3 字节)
+        self.tv_frames = 0                     # 累计帧数 (诊断)
+        self.tv_first_at = None                # 首帧耗时锚 (None=未出帧)
+        self.tv_last_at = 0.0                  # 最近帧时刻 (断流看门狗)
+        self.tv_started = 0.0                  # 本次起播时刻
+        self.tv_err = ""                       # 播放失败文案 (列表页 OSD)
+        self.tv_dead = None                    # 读帧线程收尾 {"rc":..., "err":...}
+        self.tv_osd_at = 0.0                   # 频道名 OSD 起始
+        self.tv_reader = None                  # 读帧线程
         # 拼音 IME (中文输入; '/' 切中英; 两处输入框共用一套状态)
         self.ime_mode = True                   # True=拼音 False=英文直输
         self.ime_buf = ""                      # 当前拼音串
@@ -1529,6 +1551,8 @@ class App:
             self._mu_qr_poll()                # 扫码状态机 (ok→搜索/fail→源页)
         elif t == "mail":
             self.poll_mail()                  # TTL 层去重, 各层只拉当层数据
+        elif t == "tv":
+            self.tv_watchdog()                # 起播超时/断流/退出分类
 
     # ── 想法列表 (文字+语音按时间倒序合并) ──
     def idea_items(self):
@@ -1771,6 +1795,8 @@ class App:
         self.radio_stop()
         if self.mu_proc or self.mu_playing:   # 音频焦点: 音乐让路
             self.mu_stop()
+        if self.tv_playing:                   # 音频焦点: 电视让路
+            self.tv_stop()
         self.raop_up_at = None                # 新会话: RAOP-UP 重新等
         dev = self._raop_dev()
         if dev:                               # AirPlay 输出: RAOP 直推
@@ -2034,6 +2060,8 @@ class App:
         self.mu_aud_up = None                 # 出声时刻 (VU 首响即置)
         if self.playing_key:
             self.radio_stop()
+        if self.tv_playing:                   # 音频焦点: 电视让路
+            self.tv_stop()
         if self.mu_proc:
             self.mu_kill()
         f = self.mu_files[idx]
@@ -2876,6 +2904,370 @@ class App:
         self.playing_voice = item
         self._voice_at = time.monotonic()
 
+    # ── 电视 (工具第 8 卡): 直播源内置 tv_channels.py; 播放链移植官方
+    #    cardputer-zero-iptv 的 panel.py — 单 ffmpeg 进程: HLS →
+    #    fps+scale 滤镜 → rgb24 rawvideo 管道 (读帧线程只留最新, 主循环
+    #    10fps blit), 音频同进程 -f pulse; 硬解 h264_v4l2m2m 失败回退软解.
+    #    滤镜顺序/不加 reconnect 旗标均照 panel.py 真机实证 (强加 reconnect
+    #    会致 HLS 分段边沿卡顿). ─────────────────────────────────────────
+    TV_FPS = 12
+    TV_FIRST_TIMEOUT = 12.0                 # 起播无首帧判死 (慢源留给探测)
+    TV_STALL_TIMEOUT = 8.0                  # 播放中断流判定
+
+    def tv_list(self, grp=None):
+        """分组频道表 (grp=None → 当前组)."""
+        import tv_channels
+        g = self.tv_grp if grp is None else grp
+        return [c for c in tv_channels.CHANNELS if c[1] == tv_channels.GROUPS[g]]
+
+    def tv_restore(self):
+        """进 app 恢复上次分组/光标 (tv_last.json)."""
+        import tv_channels
+        v = netmod.load_json_file(TV_LAST_CACHE, None)
+        if isinstance(v, dict):
+            g = v.get("grp", 0)
+            if isinstance(g, int) and 0 <= g < len(tv_channels.GROUPS):
+                self.tv_grp = g
+            s = v.get("sel", 0)
+            n = len(self.tv_list())
+            if isinstance(s, int) and n:
+                self.tv_sel = max(0, min(s, n - 1))
+                self.tv_sels[self.tv_grp] = self.tv_sel
+
+    def tv_save(self):
+        netmod.save_json_file(TV_LAST_CACHE,
+                              {"grp": self.tv_grp, "sel": self.tv_sel})
+
+    @staticmethod
+    def tv_hwdec_available():
+        """bcm2835-codec-decode 设备存在且可读写 → v4l2m2m 硬解可用."""
+        try:
+            for p in sorted(glob.glob("/sys/class/video4linux/video*/name")):
+                if open(p).read().strip() != "bcm2835-codec-decode":
+                    continue
+                dev = "/dev/" + os.path.basename(os.path.dirname(p))
+                if os.access(dev, os.R_OK | os.W_OK):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def tv_argv(self, url, hw, audio):
+        """ffmpeg argv: 视频 rgb24 管道 + 音频同进程 pulse (panel.py 同款)."""
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+               "-protocol_whitelist", "file,pipe,crypto,http,https,tcp,tls"]
+        if hw:                               # 硬解前缀 (输出前 copy 免回读抢占)
+            cmd += ["-c:v", "h264_v4l2m2m", "-num_capture_buffers", "8",
+                    "-num_output_buffers", "8", "-pixel_format", "yuv420p"]
+        vf = ("copy," if hw else "") + \
+             "fps=%d,scale=%d:%d:flags=fast_bilinear" % (self.TV_FPS, W, H)
+        cmd += ["-i", url, "-map", "0:v:0", "-vf", vf,
+                "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"]
+        if audio:
+            cmd += ["-map", "0:a:0", "-ac", "2", "-ar", "44100",
+                    "-f", "pulse", "default"]
+        else:
+            cmd.append("-an")
+        return cmd
+
+    def _tv_spawn(self, cmd):
+        """spawn 点独立成方法 — 测试打桩用 (无真 ffmpeg/网络)."""
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=_AUDIO_ENV, **_FFPLAY_KW)
+
+    def tv_play(self, ch, hw=None, audio=True, att=0):
+        """起播: 杀旧会话 → spawn → 读帧线程. hw=None 自动探测硬解;
+        att=重试梯级 (0 初试; 看门狗触发 1=软解 2=关音频, 最多 3 次尝试)."""
+        self.tv_stop()
+        if self.playing_key:                  # 音频焦点: 电台/音乐让路
+            self.radio_stop()
+        if self.mu_proc or self.mu_playing:
+            self.mu_stop()
+        if hw is None:
+            hw = self.tv_hwdec_available()
+        cmd = self.tv_argv(ch[2], hw, audio)
+        try:
+            proc = self._tv_spawn(cmd)
+        except Exception:
+            self.tv_err = "无法启动播放器"
+            self._tv_log("spawn-fail %s" % ch[0])
+            return
+        self.tv_gen += 1
+        self.tv_playing = ch
+        self.tv_hw = hw
+        self.tv_audio = audio
+        self.tv_att = att
+        self.tv_frame = None
+        self.tv_frames = 0
+        self.tv_first_at = None
+        self.tv_dead = None
+        self.tv_err = ""
+        now = time.monotonic()
+        self.tv_started = self.tv_last_at = self.tv_osd_at = now
+        self.tv_proc = proc
+        self._tv_log("play %s att=%d hw=%d audio=%d" % (ch[0], att, hw, audio))
+        self.tv_reader = threading.Thread(target=self._tv_read_loop,
+                                          args=(self.tv_gen, proc), daemon=True)
+        self.tv_reader.start()
+
+    def _tv_read_loop(self, gen, proc):
+        """读帧线程: select 双管道, stdout 按整帧 (W*H*3) 拼, 只保留最新一帧
+        (主循环 10fps 消费, 生产 12fps 丢旧不积压); stderr 截尾收集.
+        会话号 gen 不匹配 (已停播/已换台) 即退出, 不再触碰状态."""
+        frame_bytes = W * H * 3
+        buf = bytearray()
+        err = bytearray()
+        try:
+            out_fd = proc.stdout.fileno()
+            fds = [out_fd, proc.stderr.fileno()]
+        except (OSError, ValueError):
+            return
+        try:
+            while fds:
+                if gen != self.tv_gen:
+                    return
+                r, _, _ = select.select(fds, [], [], 0.25)
+                for fd in r:
+                    try:
+                        data = os.read(fd, 1 << 16)
+                    except (OSError, ValueError):
+                        data = b""
+                    if not data:              # EOF: 此管道收工
+                        fds = [f for f in fds if f != fd]
+                        continue
+                    if fd != out_fd:
+                        err += data
+                        if len(err) > 8192:
+                            del err[:-8192]
+                        continue
+                    buf += data
+                    while len(buf) >= frame_bytes:
+                        if gen != self.tv_gen:
+                            return
+                        self.tv_frame = bytes(buf[:frame_bytes])
+                        del buf[:frame_bytes]
+                        now = time.monotonic()
+                        if self.tv_first_at is None:
+                            self.tv_first_at = now
+                            self._tv_log("first-frame %.1fs" %
+                                         (now - self.tv_started))
+                        self.tv_frames += 1
+                        self.tv_last_at = now
+        except OSError:
+            return                            # fd 被停播关闭的竞态 → 安静退出
+        if gen != self.tv_gen:
+            return
+        try:
+            rc = proc.wait(timeout=1)
+        except Exception:
+            rc = proc.poll()
+        self.tv_dead = {"rc": rc,
+                        "err": bytes(err).decode("utf-8", "replace")}
+
+    def tv_stop(self):
+        """停播: 杀 ffmpeg (TERM→0.5s→KILL 补刀 — ffmpeg SIGTERM futex 僵死
+        教训) + 收读帧线程; 播放态清空, 错误文案留给列表页."""
+        if self.tv_playing and self.tv_frames:
+            self._tv_log("stop %s frames=%d" % (self.tv_playing[0],
+                                                self.tv_frames))
+        proc = self.tv_proc
+        self.tv_gen += 1                      # 读帧线程守卫 (先加号再杀)
+        self.tv_proc = None
+        self.tv_playing = None
+        self.tv_frame = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+        if self.tv_reader is not None:
+            # 先收线程再关管道: 子进程死 → 管道 EOF → 线程自然退 (0.25s 内)
+            self.tv_reader.join(timeout=1.5)
+            self.tv_reader = None
+        for f in (getattr(proc, "stdout", None),
+                  getattr(proc, "stderr", None)):
+            try:
+                if f:
+                    f.close()
+            except Exception:
+                pass
+
+    def _tv_fail(self, msg):
+        self._tv_log("fail " + msg)
+        self.tv_stop()
+        self.tv_err = msg
+
+    def _tv_retry(self, why, hw, audio):
+        """换参数重播同频道 (梯级 ≤2: 硬解→软解 / 关音频)."""
+        ch = self.tv_playing
+        if ch is None or self.tv_att >= 2:
+            self._tv_fail("无法播放 · 换台试试")
+            return
+        self._tv_log("retry " + why)
+        self.tv_play(ch, hw=hw, audio=audio, att=self.tv_att + 1)
+
+    def tv_watchdog(self):
+        """poll_tool 每秒: 进程退出/起播超时 → 零帧分类 (可修则重试);
+        播放中断流 → 信号中断停播 (换台即恢复, 不自动重试)."""
+        if not self.tv_playing:
+            return
+        now = time.monotonic()
+        exited = self.tv_proc is None or self.tv_proc.poll() is not None
+        if exited or (self.tv_frames == 0 and
+                      now - self.tv_started > self.TV_FIRST_TIMEOUT):
+            self._tv_classify(exited)
+            return
+        if self.tv_frames and now - self.tv_last_at > self.TV_STALL_TIMEOUT:
+            self._tv_fail("信号中断 · 换台可恢复")
+
+    def _tv_classify(self, exited):
+        """零帧失败分类: stderr 有解则换参重试, 否则报文案回列表."""
+        if self.tv_frames:                    # 出过画再断 = 信号中断
+            self._tv_fail("信号中断 · 换台可恢复")
+            return
+        dead = self.tv_dead or {}
+        low = dead.get("err", "").lower()
+        if self.tv_audio and "matches no streams" in low:
+            self._tv_retry("流无音频, 关声重试", hw=self.tv_hw, audio=False)
+            return
+        if self.tv_hw and (not exited or "v4l2m2m" in low
+                           or "no device" in low
+                           or "cannot allocate" in low):
+            self._tv_retry("硬解未出画, 切软解", hw=False, audio=self.tv_audio)
+            return
+        m = re.search(r"(?:server returned|http error)\s*(?:status\s+)?(\d{3})", low)
+        code = m.group(1) if m else ""
+        if code == "404":
+            self._tv_fail("源不可用 (404) · 换台试试")
+        elif code in ("401", "403"):
+            self._tv_fail("源拒绝访问 (%s)" % code)
+        elif "timed out" in low or "connection" in low:
+            self._tv_fail("连接超时 · 稍后再试")
+        elif exited and dead.get("rc") is not None:
+            self._tv_fail("无法播放 (退出码 %s)" % dead.get("rc"))
+        else:
+            self._tv_fail("无法播放 · 换台试试")
+
+    def tv_key(self, k):
+        """列表: ←→ 切分组 ↑↓ 选台 Enter 播; 播放态: ↑↓ 换台 (Esc 外层)."""
+        import tv_channels
+        lst = self.tv_list()
+        if self.tv_playing:
+            if k in (pygame.K_UP, pygame.K_DOWN) and lst:
+                d = -1 if k == pygame.K_UP else 1
+                self.tv_sel = (self.tv_sel + d) % len(lst)
+                self.tv_sels[self.tv_grp] = self.tv_sel
+                self.tv_play(lst[self.tv_sel])
+                self.tv_save()
+            return True
+        if not lst:
+            return True
+        if k in (pygame.K_LEFT, pygame.K_RIGHT):
+            d = -1 if k == pygame.K_LEFT else 1
+            self.tv_sels[self.tv_grp] = self.tv_sel   # 存当前组光标
+            self.tv_grp = (self.tv_grp + d) % len(tv_channels.GROUPS)
+            lst = self.tv_list()
+            self.tv_sel = min(self.tv_sels.get(self.tv_grp, 0), len(lst) - 1)
+            self.tv_err = ""
+            self.tv_save()
+        elif k in (pygame.K_UP, pygame.K_DOWN):
+            d = -1 if k == pygame.K_UP else 1
+            self.tv_sel = (self.tv_sel + d) % len(lst)
+            self.tv_sels[self.tv_grp] = self.tv_sel
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.tv_err = ""
+            self.tv_play(lst[self.tv_sel])
+            self.tv_save()
+        return True
+
+    def draw_tv(self, surf):
+        if self.tv_playing:
+            self._draw_tv_play(surf)
+            return
+        import tv_channels
+        from urllib.parse import urlparse
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        lst = self.tv_list()
+        self.tool_head(surf, "电视", "%d 台 · 实测源" % len(lst))
+        if self.tv_err:
+            text(surf, clip_text(self.tv_err, 9, 200), 9,
+                 self.th("danger"), (6, 15))
+        # 分组 tabs
+        gx = 6
+        for i, g in enumerate(tv_channels.GROUPS):
+            sel = i == self.tv_grp
+            if sel:
+                r = pygame.Rect(gx - 3, 26, textw(g, 11) + 6, 15)
+                pygame.draw.rect(surf, self.card(0), r, border_radius=3)
+                pygame.draw.rect(surf, acc, r, 1, border_radius=3)
+            text(surf, g, 11, hi if sel else soft, (gx, 28))
+            gx += textw(g, 11) + 14
+        # 频道列表 4 行 (本地曲库列表同款)
+        nrow = 4
+        r0 = max(0, min(self.tv_sel - (nrow - 1), max(0, len(lst) - nrow)))
+        self.tv_scroll = r0
+        for kk in range(nrow):
+            i = r0 + kk
+            if i >= len(lst):
+                break
+            name, grp, url = lst[i]
+            y = 44 + kk * 26
+            sel = i == self.tv_sel
+            rct = pygame.Rect(4, y, W - 8, 24)
+            pygame.draw.rect(surf, self.card(0), rct, border_radius=4)
+            pygame.draw.rect(surf, acc if sel else self.th("border"), rct,
+                             2 if sel else 1, border_radius=4)
+            text(surf, clip_text(name, 12, W - 130), 12,
+                 hi if sel else soft, (12, y + 1))
+            text(surf, urlparse(url).netloc, 9, dim, (12, y + 13))
+            text(surf, "%02d" % (i + 1), 10, acc, (W - 24, y + 7), right=True)
+        self.tool_foot(surf, ("←→ 分组", "↑↓ 选台", "Enter 播", "Esc 返回"))
+
+    def _draw_tv_play(self, surf):
+        surf.fill((0, 0, 0))
+        if self.tv_frame:
+            try:
+                surf.blit(pygame.image.frombuffer(self.tv_frame,
+                                                  (W, H), "RGB"), (0, 0))
+            except Exception:
+                pass                          # 帧长度异常: 保留黑屏不断流
+            if time.monotonic() - self.tv_osd_at < 2.5:   # 开播/换台 OSD
+                tag = self.tv_playing[0]
+                bar = pygame.Surface((textw(tag, 11) + 12, 17),
+                                     pygame.SRCALPHA)
+                bar.fill((0, 0, 0, 160))
+                surf.blit(bar, (4, 4))
+                text(surf, tag, 11, self.th("hi"), (10, 6))
+            return
+        textc(surf, "连接中…", 14, self.th("hi"), W // 2, 60)
+        textc(surf, self.tv_playing[0], 12, self.th("soft"), W // 2, 82)
+        textc(surf, "F/X 换台 · Esc 返回", 9, self.th("dim"), W // 2, 136)
+
+    def _tv_log(self, line):
+        """诊断轨迹 /tmp/oneapp_tv.log (E2E 证据: 首帧耗时/帧数/错误)."""
+        try:
+            p = "/tmp/oneapp_tv.log"
+            if os.path.exists(p) and os.path.getsize(p) > 200 * 1024:
+                os.truncate(p, 0)
+            with open(p, "a") as f:
+                f.write(time.strftime("%m-%d %H:%M:%S ") + line + "\n")
+        except Exception:
+            pass
+
     # ── 键 ──
     def key(self, k, ch=""):
         if self.dialog:
@@ -3024,7 +3416,9 @@ class App:
         # 换肤键 t 仅主页 (工具内 t 是输入字符, 不劫持).
         if self.tool:
             if k == pygame.K_ESCAPE:
-                if self.tool == "music" and self.mu_input:
+                if self.tool == "tv" and self.tv_playing:
+                    self.tv_stop()             # 播放态 Esc → 回列表 (不退 app)
+                elif self.tool == "music" and self.mu_input:
                     if self.ime_buf:
                         self.ime_clear()           # 先退拼音串 (IME)
                     else:
@@ -3247,6 +3641,8 @@ class App:
             if self.mu_playing is None:
                 self.mu_session_restore()     # 空态 → 恢复上次会话 (暂停在位)
             self.mu_view = "play"             # 主页=播放页 (空态显示无标题, 0 选源)
+        if tid == "tv":
+            self.tv_restore()                 # 恢复上次分组/光标
 
     def tool_grid_key(self, k):
         """入口网格: 方向键移光标 / 数字 1-9,0 直开 / Enter 打开."""
@@ -3268,6 +3664,8 @@ class App:
     def tool_close(self):
         if self.tool == "music" and self.mu_view == "qr":
             self.mu_qr.stop()                 # 扫码轮询线程停 (绑定状态留存)
+        if self.tool == "tv":
+            self.tv_stop()                    # 播放中关 app = 停播
         self.tool = None
         self.osd = None
 
@@ -3296,6 +3694,8 @@ class App:
             return self.mu_key(k, ch)
         if t == "mail":
             return self.mail_key(k, ch)
+        if t == "tv":
+            return self.tv_key(k)
         return True
 
     # ── 邮件 (工具第 7 卡; IMAP 授权码直连, 协议层 mail.py, net.job 后台跑) ──
@@ -4910,7 +5310,7 @@ class App:
         {"fx": self.draw_fx, "unit": self.draw_unit,
          "cal": self.draw_cal_app, "ssq": self.draw_ssq,
          "timer": self.draw_timer, "music": self.draw_mu,
-         "mail": self.draw_mail}[self.tool](surf)
+         "mail": self.draw_mail, "tv": self.draw_tv}[self.tool](surf)
 
     def draw_tools(self, surf):
         acc, hi, soft = self.th("accent"), self.th("hi"), self.th("soft")
@@ -5826,6 +6226,7 @@ def main():
         clock.tick(10)
 
     app.mu_session_save()                      # 退出前保住播放位 (先于 mu_stop)
+    app.tv_stop()                              # 杀 TV ffmpeg + 收读帧线程
     app.radio_stop()                           # 杀 ffplay + 停电平流
     app.stop_player()
     app.mu_stop()                              # 音乐 ffplay

@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "app_name": "ONEAPP",
   "bin_name": "oneapp",
-  "description": "All-in-one toolbox for M5Stack CardputerZero - clock/lunar/weather/hitokoto home, idea capture, radio with live VU and AirPlay speaker output (bundled direct streams), stocks with minute/day charts, and a 6-in-1 tool page (FX/unit/lunar-calendar/lottery/timer/music with QQ & NetEase direct). Zero local-server dependencies: every data source is a public API fetched directly from the device.",
+  "description": "All-in-one toolbox for M5Stack CardputerZero - clock/lunar/weather/hitokoto home, idea capture, radio with live VU and AirPlay speaker output (bundled direct streams), stocks with minute/day charts, a 7-in-1 tool page (FX/unit/lunar-calendar/lottery/timer/music with QQ & NetEase direct), and live TV with 95 verified HLS channels (hardware H.264 decode). Zero local-server dependencies: every data source is a public API fetched directly from the device.",
   "store": {
-    "summary": "时钟农历天气 + 想法速记 + 电台 VU + 行情分时 + 工具箱(汇率/换算/万年历/双色球/计时器) + 音乐(QQ/网易云直连)",
-    "description": "为 M5Stack CardputerZero 打造的一体化工具箱, 零本地服务依赖, 数据全部公网直连.\n\n· 主页: 大时钟+农历、天气(Open-Meteo)、每日一句、新闻跑马灯\n· 想法: 键盘速记 (拼音 IME), 本地存储\n· 电台: 20 个电台直连流(中/英), 12 条实时频谱 VU, 断流自愈, O 键输出到局域网 AirPlay 音箱\n· 行情: 自选股+8 大指数+贵金属实时报价(红涨绿跌), 分时/250日K折线 (腾讯行情)\n· 新闻: 7 个中文 RSS 源 (IT之家/少数派/Solidot 等)\n· 工具: 汇率、单位换算、万年历(农历)、双色球(中彩官网)、计时器\n· 音乐: 本地曲库 + QQ 音乐/网易云直连(扫码绑定), 歌词同步 (LRCLIB+网易)\n· 4 套主题色, Fn 组合键系统音量调节\n\n数据源: Open-Meteo / 腾讯行情 / 中彩官网 / 东方财富 / open.er-api.com /\nhitokoto / LRCLIB / 各电台与音乐公开接口. 需要联网 (家庭 WiFi 或热点均可).",
+    "summary": "时钟农历天气 + 想法速记 + 电台 VU + 行情分时 + 工具箱 + 音乐 + 电视直播(95台)",
+    "description": "为 M5Stack CardputerZero 打造的一体化工具箱, 零本地服务依赖, 数据全部公网直连.\n\n· 主页: 大时钟+农历、天气(Open-Meteo)、每日一句、新闻跑马灯\n· 想法: 键盘速记 (拼音 IME), 本地存储\n· 电台: 20 个电台直连流(中/英), 12 条实时频谱 VU, 断流自愈, O 键输出到局域网 AirPlay 音箱\n· 行情: 自选股+8 大指数+贵金属实时报价(红涨绿跌), 分时/250日K折线 (腾讯行情)\n· 新闻: 7 个中文 RSS 源 (IT之家/少数派/Solidot 等)\n· 工具: 汇率、单位换算、万年历(农历)、双色球(中彩官网)、计时器\n· 音乐: 本地曲库 + QQ 音乐/网易云直连(扫码绑定), 歌词同步 (LRCLIB+网易)\n· 电视: 95 个实测可用直播频道 (央视/卫视/地方/国际), H.264 硬解, ↑↓ 换台\n· 4 套主题色, Fn 组合键系统音量调节\n\n数据源: Open-Meteo / 腾讯行情 / 中彩官网 / 东方财富 / open.er-api.com /\nhitokoto / LRCLIB / 各电台与音乐公开接口 / 公共电视直播源. 需要联网 (家庭 WiFi 或热点均可).",
     "categories": [
       "Utilities"
     ],
@@ -31,7 +31,7 @@
     "locales": {
       "zh-CN": {
         "title": "ONEAPP",
-        "summary": "时钟农历天气 + 想法速记 + 电台 VU + 行情分时 + 工具箱 + 音乐"
+        "summary": "时钟农历天气 + 想法速记 + 电台 VU + 行情分时 + 工具箱 + 音乐 + 电视直播"
       }
     }
   }

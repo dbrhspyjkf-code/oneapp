@@ -1429,6 +1429,208 @@ def test_net_live():
     print("  lrc lines", len((lrc.get("synced") or "").splitlines()))
 
 
+def test_tv():
+    """电视: 台表完整性 + argv 形状 + 播放状态机 (打桩 spawn) + 键位/持久化."""
+    import dash
+    import tv_channels
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.TV_LAST_CACHE = os.path.join(tmp, "tv_last.json")
+
+    # ── 台表: 95 条实测源, 4 组齐全, 无空名/坏协议/短时效 token ──
+    assert len(tv_channels.CHANNELS) == 95
+    assert tv_channels.GROUPS == ["央视", "卫视", "地方", "国际"]
+    for g in tv_channels.GROUPS:
+        assert any(c[1] == g for c in tv_channels.CHANNELS), g
+    names = [c[0] for c in tv_channels.CHANNELS]
+    assert len(set(names)) == len(names), "频道重名"
+    for n, g, u in tv_channels.CHANNELS:
+        assert n and u.startswith(("http://", "https://")), (n, u)
+        assert g in tv_channels.GROUPS
+        assert "txSecret" not in u and "user_session_id" not in u, n
+
+    # ── argv: 硬解 copy 前缀 + 解码器旗标; 软解无; 关音频 -an ──
+    app = dash.App(FakeNet())
+    app.page = 5
+    app.tool = "tv"
+    a_hw = app.tv_argv("http://x/live.m3u8", True, True)
+    assert "-c:v" in a_hw and "h264_v4l2m2m" in a_hw
+    assert "-num_capture_buffers" in a_hw
+    vf = a_hw[a_hw.index("-vf") + 1]
+    assert vf.startswith("copy,fps=12,scale=320:170"), vf
+    assert a_hw[a_hw.index("-pix_fmt") + 1] == "rgb24"
+    assert a_hw[a_hw.index("-f") + 1:][:2] == ["rawvideo", "pipe:1"]
+    assert a_hw[-3:] == ["-f", "pulse", "default"]
+    a_sw = app.tv_argv("http://x/live.m3u8", False, True)
+    assert "h264_v4l2m2m" not in a_sw
+    assert a_sw[a_sw.index("-vf") + 1].startswith("fps=12,scale=320:170")
+    a_an = app.tv_argv("http://x/live.m3u8", False, False)
+    assert a_an[-1] == "-an" and "pulse" not in a_an
+    # Mac 无 v4l2 设备 → 自动探测 False (设备上有 bcm2835-codec-decode)
+    assert dash.App.tv_hwdec_available() is False
+
+    # ── 播放状态机: 打桩 spawn, 管道喂真帧字节 → 读帧线程只留最新 ──
+    class FakeProc:
+        def __init__(self):
+            self.returncode = None
+            self.o_r, self.o_w = os.pipe()     # stdout: 测试端写帧
+            self.e_r, self.e_w = os.pipe()     # stderr
+            self.stdout = os.fdopen(self.o_r, "rb", buffering=0)
+            self.stderr = os.fdopen(self.e_r, "rb", buffering=0)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    procs = []
+    open_w = []                                # 测试退出兜底关管道
+
+    def fake_spawn(self, cmd):
+        p = FakeProc()
+        procs.append((p, cmd))
+        open_w.extend((p.o_w, p.e_w))
+        return p
+
+    real_spawn = dash.App._tv_spawn
+    dash.App._tv_spawn = fake_spawn
+    app2 = None
+    try:
+        lst = app.tv_list()
+        assert len(lst) == 19 and lst[0][0] == "CCTV1"   # 央视组
+        app.draw(canvas)                       # 列表页渲染不崩
+        # Enter 起播 → 读帧线程消费管道帧
+        app.tv_key(pygame.K_RETURN)
+        assert app.tv_playing and app.tv_playing[0] == "CCTV1"
+        assert app.tv_playing[2] in procs[0][1]
+        frame1 = bytes([64]) * (dash.W * dash.H * 3)
+        frame2 = bytes([200]) * (dash.W * dash.H * 3)
+        os.write(procs[-1][0].o_w, frame1 + frame2)
+        for _ in range(60):                    # ≤3s 等读帧线程
+            if app.tv_frames >= 2:
+                break
+            _time.sleep(0.05)
+        assert app.tv_frames == 2, app.tv_frames
+        assert app.tv_frame == frame2          # 只留最新帧
+        assert app.tv_first_at is not None
+        app.draw(canvas)                       # 播放页渲染 (真 frombuffer 路径)
+        # 播放态 ↑ 换台: 杀旧起新 (央视组循环 → 上一台 = 组内最后台)
+        app.tv_key(pygame.K_UP)
+        assert app.tv_playing[0] == lst[-1][0]
+        assert len(procs) == 2
+        assert procs[0][0].returncode is not None       # 旧进程已停
+        # 播放态 Esc → 回列表 (tool 仍是 tv)
+        app.key(pygame.K_ESCAPE)
+        assert app.tv_playing is None and app.tool == "tv"
+        assert len(procs) == 2                 # Esc 不再起新进程
+
+        # ── 看门狗: 起播超时 (软解/无 stderr) → 报错回列表 ──
+        app.tv_err = ""
+        app.tv_key(pygame.K_RETURN)
+        app.tv_started = _time.monotonic() - 13.0
+        app.tv_watchdog()
+        assert app.tv_playing is None and app.tv_err, app.tv_err
+        assert procs[-1][0].returncode is not None
+
+        # ── 看门狗: 硬解零帧退出 (v4l2 报错) → 自动切软解重试 ──
+        app.tv_err = ""
+        ch = app.tv_list()[0]
+        app.tv_play(ch, hw=True, audio=True, att=0)      # 手工指定硬解
+        assert procs[-1][0].returncode is None
+        procs[-1][0].returncode = 1                      # 模拟进程已退
+        app.tv_dead = {"rc": 1, "err": "h264_v4l2m2m: unknown decoder"}
+        app.tv_watchdog()
+        assert app.tv_playing and app.tv_att == 1        # 软解重试中
+        assert "h264_v4l2m2m" not in procs[-1][1]
+        # 再挂: 无音频流 → -an 重试 (梯级 2)
+        procs[-1][0].returncode = 1
+        app.tv_dead = {"rc": 1,
+                       "err": "Stream map '0:a:0' matches no streams"}
+        app.tv_watchdog()
+        assert app.tv_playing and app.tv_att == 2
+        assert procs[-1][1][-1] == "-an"
+        # 梯级用尽 → 报错回列表
+        procs[-1][0].returncode = 1
+        app.tv_dead = {"rc": 1, "err": "Server returned 404"}
+        app.tv_watchdog()
+        assert app.tv_playing is None
+        assert "404" in app.tv_err, app.tv_err
+        # 播放中断流 (出过帧 + 8s 无新帧) → 信号中断, 不重试
+        app.tv_play(ch)
+        os.write(procs[-1][0].o_w, frame1)
+        for _ in range(60):
+            if app.tv_frames >= 1:
+                break
+            _time.sleep(0.05)
+        assert app.tv_frames == 1
+        app.tv_last_at = _time.monotonic() - 9.0
+        app.tv_watchdog()
+        assert app.tv_playing is None and "信号中断" in app.tv_err
+        app.tv_stop()                                    # 清场
+
+        # ── 音频焦点: 电台起播把电视踢停 ──
+        app.tv_play(ch)
+        real_popen = dash.subprocess.Popen
+        dash.subprocess.Popen = lambda *a, **k: (_ for _ in ()).throw(
+            FileNotFoundError("no ffplay in test"))
+        try:
+            app.radio_play({"key": "k", "name": "n",
+                            "url": "http://x/1.m3u8", "freq": 0})
+        finally:
+            dash.subprocess.Popen = real_popen
+        assert app.tv_playing is None
+
+        # ── 键位: 分组循环切换 + 每组光标独立 + 持久化/恢复 ──
+        app.tv_grp = 0                        # 前段换台改过光标, 重置走键位
+        app.tv_sel = 0
+        app.tv_sels = {0: 0}
+        app.tv_key(pygame.K_RIGHT)            # 央视→卫视
+        assert app.tv_grp == 1
+        app.tv_sel = 5
+        app.tv_key(pygame.K_RIGHT)            # → 地方 (卫视光标记 5)
+        assert app.tv_grp == 2 and app.tv_sel == 0
+        app.tv_key(pygame.K_RIGHT)
+        app.tv_key(pygame.K_RIGHT)            # 国际 → 央视 (循环)
+        assert app.tv_grp == 0 and app.tv_sel == 0
+        app.tv_key(pygame.K_LEFT)             # 央视 → 国际 (反向循环)
+        assert app.tv_grp == 3
+        app.tv_key(pygame.K_LEFT)             # → 地方
+        app.tv_key(pygame.K_LEFT)             # → 卫视恢复光标 5
+        assert app.tv_grp == 1 and app.tv_sel == 5
+        app.tv_sel = 3
+        app.tv_key(pygame.K_RETURN)           # 起播即存档
+        assert netmod.load_json_file(dash.TV_LAST_CACHE, None) \
+            == {"grp": 1, "sel": 3}
+        app.tv_stop()
+        app2 = dash.App(FakeNet())            # 新会话恢复
+        app2.tool = "tv"
+        app2.tv_restore()
+        assert app2.tv_grp == 1 and app2.tv_sel == 3
+        app2.draw(canvas)                     # 恢复位列表渲染不崩
+        app2.key(pygame.K_ESCAPE)             # 列表 Esc → 回工具网格 (外层链)
+        assert app2.tool is None
+    finally:
+        dash.App._tv_spawn = real_spawn
+        app.tv_stop()
+        if app2:
+            app2.tv_stop()
+        for fd in open_w:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    print("tv OK  (95 源 · 状态机/看门狗/重试梯级/焦点/持久化)")
+
+
 if __name__ == "__main__":
     test_lunar()
     test_wx()
@@ -1440,6 +1642,7 @@ if __name__ == "__main__":
     test_music()
     test_mu_airplay()
     test_radio_out()
+    test_tv()
     test_voice()
     test_ime()
     test_mail_parse()
