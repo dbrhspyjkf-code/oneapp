@@ -781,7 +781,9 @@ def test_mail_utf7():
     for s in ("已发送", "草稿箱", "草稿&箱", "Notes", "收&件箱2"):
         assert mailmod._decode_imap_utf7(mailmod._encode_imap_utf7(s)) == s, s
     assert mailmod.should_skip("&g0l6P3ux-") and mailmod.should_skip("草稿箱")
+    assert mailmod.should_skip("Junk")            # QQ 垃圾夹 (英文名)
     assert not mailmod.should_skip("INBOX") and not mailmod.should_skip("已发送")
+    assert not mailmod.should_skip("Sent Messages")   # QQ 已发送保留
     print("mail utf7 OK (163 folder names/roundtrip)")
 
 

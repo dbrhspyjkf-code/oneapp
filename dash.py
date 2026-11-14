@@ -2961,8 +2961,13 @@ class App:
                           else "")
             text(surf, cur or ph, 13, hi if val else dim, (62, y + 8))
             y += 38
-        textc(surf, "163: 网页版 设置 → POP3/SMTP/IMAP → 开启并生成授权码",
-              9, dim, W // 2, 102)
+        dom = self.mail_acct_buf.rsplit("@", 1)[-1].lower() \
+            if "@" in self.mail_acct_buf else ""
+        if dom.endswith("qq.com") or dom.endswith("foxmail.com"):
+            hint = "QQ: 网页版 设置 → 账号 → POP3/IMAP/SMTP 服务 → 生成授权码"
+        else:
+            hint = "163: 网页版 设置 → POP3/SMTP/IMAP → 开启并生成授权码"
+        textc(surf, hint, 9, dim, W // 2, 102)
         textc(surf, "Enter 下一项 / 登录 · ←→ 切字段 · Esc 返回", 10, soft,
               W // 2, 118)
         self.tool_foot(surf, ["Enter 确认", "Esc 返回"])
