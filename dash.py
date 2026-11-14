@@ -3185,7 +3185,7 @@ class App:
             rr = pygame.Rect(cx, top, cw2, chh)
             pygame.draw.rect(surf, self.card(i + 1), rr, border_radius=6)
             pygame.draw.rect(surf, border, rr, 1, border_radius=6)
-            text(surf, lab, 8, dim, (rr.x + 8, rr.y + 3))
+            text(surf, lab, 13, dim, (rr.x + 8, rr.y + 2))   # 与农历同字号
         # 每日一句: 单行跑马灯 (溢出卡宽即滚动, 同新闻卡)
         top0 = tops[0]
         hk = self.data.get("hitokoto") or {}
