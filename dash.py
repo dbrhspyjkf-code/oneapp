@@ -427,6 +427,53 @@ WATCH_SEED = {"items": [
     {"code": "sz300750", "name": "宁德时代"},
     {"code": "sh688981", "name": "中芯国际"},
 ]}
+VOICES_DIR = os.path.join(STATE_DIR, "voices")   # 语音想法 (本地 wav)
+# 录音 (ES8389 麦克风; amixer 路由照抄 xiaozhi_launcher 已知良好配置 —
+# 驱动默认态=错误路由, 底噪 RMS 2767, 配置后 258; 每次录音前重置, 默认会漂)
+REC_DEV = "plughw:CARD=ES8389Audio,DEV=0"
+REC_MAX = 60                             # 秒, 自动截断 (arecord -d 自己停)
+REC_MIXER = [
+    ["ADC MUX", "AMIC"], ["PGAL Select", "DifferentialL"],
+    ["PGAR Select", "DifferentialR"],
+    ["ADCL", "160"], ["ADCR", "160"],
+    ["ADCL PGA", "6"], ["ADCR PGA", "6"],
+    ["ADC2DAC Mixer", "0"],
+]
+
+
+def trim_silence_head(path, thr=800, keep=0.3):
+    """裁掉录音开头静音 (人声前空拍): 连续 3 个 100ms 窗 RMS 超 thr 才算
+    开口 (单发起录爆音不算), 保留前 keep 秒. 返回裁后时长秒, 失败 None."""
+    try:
+        import wave as _w
+        w = _w.open(path)
+        n, sr = w.getnframes(), w.getframerate()
+        import array as _a
+        data = _a.array("h", w.readframes(n))
+        w.close()
+        win = sr // 10                          # 100ms
+        speak = None
+        hot = 0
+        for i in range(0, len(data) - win, win):
+            seg = data[i:i + win]
+            rms = math.sqrt(sum(x * x for x in seg) / len(seg))
+            hot = hot + 1 if rms > thr else 0
+            if hot >= 3:
+                speak = i - 2 * win             # 回到连续段起点
+                break
+        cut = 0
+        if speak is not None and speak >= int(keep * sr):
+            cut = speak - int(keep * sr)        # 人声前留 keep 秒
+        out = data[cut:].tobytes()
+        w2 = _w.open(path, "wb")
+        w2.setnchannels(1)
+        w2.setsampwidth(2)
+        w2.setframerate(sr)
+        w2.writeframes(out)                     # 同时重写正确 WAV 头
+        w2.close()
+        return round(len(out) / 2 / sr)
+    except Exception:
+        return None
 
 # 换算表 (与 car-dash 换算 / tab5 app_settings 同表)
 FX_CODES = ["USD", "CNY", "EUR", "JPY", "GBP", "HKD", "KRW", "AUD"]
@@ -772,6 +819,12 @@ class App:
         self.ideas = netmod.load_json_file(IDEAS_FILE, {"texts": []})
         self.watch = netmod.load_json_file(WATCH_FILE, WATCH_SEED)
         self.wx_loc = netmod.load_json_file(WX_LOC_FILE, None) or dict(WX_HOME)
+        # 语音想法: 录音 (arecord) + 本地播放 (ffplay)
+        self.rec_proc = None                  # arecord 录音进程
+        self.rec_started = 0.0
+        self.rec_path = "/tmp/oneapp_rec.wav"
+        self.playing_voice = None             # 正在播放的语音条目
+        self._voice_at = 0.0                  # 播放起点 (monotonic)
         # 想法页状态
         self.in_input = False                 # 输入模式
         self.buf = ""
@@ -934,6 +987,12 @@ class App:
                 self.net.job("news", news_rss.news_fetch_all, 600)
             if self.page == 5:
                 self.poll_tool()
+            if self.rec_proc and time.monotonic() - self.rec_started >= REC_MAX:
+                self.rec_stop()                # 60s 自动截断
+            if self.player and self.playing_voice \
+                    and self.player.poll() is not None:
+                self.player = None             # 语音播完自动收
+                self.playing_voice = None
             if self.playing_key:
                 if self.player is not None and self.player.poll() is not None:
                     self.radio_stop()          # ffplay 已退出 (断流/出错)
@@ -956,6 +1015,11 @@ class App:
                   "text": it.get("text", ""),
                   "createdAt": it.get("createdAt", 0)}
                  for it in self.ideas.get("texts", [])]
+        for it in self.ideas.get("voices", []):
+            items.append({"kind": "voice", "id": it.get("id"),
+                          "file": it.get("file", ""),
+                          "dur": it.get("dur", 0),
+                          "createdAt": it.get("createdAt", 0)})
         items.sort(key=lambda x: -x["createdAt"])
         return items
 
@@ -1708,11 +1772,110 @@ class App:
         if not (0 <= self.sel < len(items)):
             return
         it = items[self.sel]
-        self.ideas["texts"] = [x for x in self.ideas.get("texts", [])
-                               if x.get("id") != it["id"]]
+        if it["kind"] == "voice":
+            self.ideas["voices"] = [x for x in self.ideas.get("voices", [])
+                                    if x.get("id") != it["id"]]
+            try:
+                if it.get("file") and os.path.exists(it["file"]):
+                    os.remove(it["file"])
+            except Exception:
+                pass
+            if self.playing_voice and self.playing_voice.get("id") == it["id"]:
+                self.stop_player()
+                self.playing_voice = None
+        else:
+            self.ideas["texts"] = [x for x in self.ideas.get("texts", [])
+                                   if x.get("id") != it["id"]]
         netmod.save_json_file(IDEAS_FILE, self.ideas)
         self.sel = max(0, self.sel - 1)
         self.osd = ("已删除", time.monotonic() + 1.2)
+
+    # ── 语音想法: 录音存本地 / 本地播放 ──
+    def rec_toggle(self):
+        """5/r: 开始或停止录音. 录完裁静音头 → voices/<id>.wav + ideas 索引."""
+        if self.rec_proc:
+            self.rec_stop()
+            return
+        if self.playing_key:                  # 音频焦点: 电台/音乐让路
+            self.radio_stop()
+        if self.mu_proc or self.mu_playing:
+            self.mu_stop()
+        try:
+            if os.path.exists(self.rec_path):
+                os.remove(self.rec_path)
+            os.makedirs(VOICES_DIR, exist_ok=True)
+            pre = ["sh", "-c", "exec " + " ; ".join(
+                "amixer -c 1 sset '%s' '%s' 2>/dev/null" % (k, v)
+                for k, v in REC_MIXER)]
+            subprocess.run(pre, timeout=5, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.rec_proc = subprocess.Popen(
+                ["arecord", "-D", REC_DEV, "-f", "S16_LE",
+                 "-r", "16000", "-c", "1", "-d", str(REC_MAX),
+                 self.rec_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=_AUDIO_ENV, **_FFPLAY_KW)
+            self.rec_started = time.monotonic()
+            self.osd = ("录音中… 5 停止", time.monotonic() + 2)
+        except Exception:
+            self.rec_proc = None
+            self.osd = ("录音不可用", time.monotonic() + 1.5)
+
+    def rec_stop(self):
+        if not self.rec_proc:
+            return
+        try:
+            self.rec_proc.terminate()
+            self.rec_proc.wait(timeout=5)     # arecord 写 WAV 尾
+        except Exception:
+            pass
+        self.rec_proc = None
+        dur = int(time.monotonic() - self.rec_started)
+        if dur < 1:
+            self.osd = ("太短未保存", time.monotonic() + 1.2)
+            return
+        real = trim_silence_head(self.rec_path) or dur   # 裁静音头
+        vid = "%d-%s" % (int(time.time() * 1000),
+                         "".join(random.choice("0123456789abcdef")
+                                 for _ in range(6)))
+        dst = os.path.join(VOICES_DIR, vid + ".wav")
+        try:
+            shutil.move(self.rec_path, dst)
+        except Exception:
+            self.osd = ("保存失败", time.monotonic() + 1.5)
+            return
+        self.ideas.setdefault("voices", []).append(
+            {"id": vid, "file": dst, "dur": real,
+             "createdAt": int(time.time() * 1000)})
+        netmod.save_json_file(IDEAS_FILE, self.ideas)
+        self.osd = ("语音已保存 %ds" % real, time.monotonic() + 1.5)
+
+    def play_voice(self, item):
+        """8/Enter (选中语音条): 播放本地 wav; 再按 = 停."""
+        if self.playing_voice                 and self.playing_voice.get("id") == item.get("id"):
+            self.stop_player()
+            self.playing_voice = None
+            return
+        if self.playing_key:
+            self.radio_stop()
+        if self.mu_proc or self.mu_playing:
+            self.mu_stop()
+        self.stop_player()
+        f = item.get("file") or ""
+        if not f or not os.path.exists(f):
+            self.osd = ("音频缺失", time.monotonic() + 1.5)
+            return
+        try:
+            self.player = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "-vn", f],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=_AUDIO_ENV, **_FFPLAY_KW)
+        except Exception:
+            self.osd = ("播放失败", time.monotonic() + 1.2)
+            return
+        self.playing_voice = item
+        self._voice_at = time.monotonic()
 
     # ── 键 ──
     def key(self, k, ch=""):
@@ -1853,6 +2016,8 @@ class App:
             elif self.fdetail:                # 图表详情 → 关图表
                 self.fdetail = None
             elif self.page != 0:
+                if self.rec_proc:
+                    self.rec_stop()           # 离开想法页自动收音保存
                 self.page = 0                 # 回主页
                 self.in_input = False
                 self.osd = ("返回主页", time.monotonic() + 1.0)
@@ -1865,8 +2030,15 @@ class App:
                 self.ime_clear()
                 self.in_input = True
                 self.buf = ""
+            elif k == pygame.K_r or k == pygame.K_5:    # 录音 (再按停止)
+                self.rec_toggle()
             elif (k == pygame.K_d or k == pygame.K_7) and items:   # 删除
                 self.dialog = ("del", items[self.sel] if self.sel < len(items) else None)
+            elif (k == pygame.K_8 or k in (pygame.K_RETURN,
+                                           pygame.K_KP_ENTER)) and items \
+                    and self.sel < len(items) \
+                    and items[self.sel]["kind"] == "voice":
+                self.play_voice(items[self.sel])          # 播放/停止
         elif self.page == 2:
             digit = k - pygame.K_0
             if pygame.K_1 <= k <= pygame.K_8:
@@ -2442,8 +2614,39 @@ class App:
             if not have:
                 continue
             it = items[idx]
-            lines = self._wrap_lines(it.get("text") or "", BODY, GW - 16, 3)
+            playing = (self.playing_voice
+                       and it.get("id") == self.playing_voice.get("id"))
             ts = time.localtime(it["createdAt"] / 1000.0)
+            if it["kind"] == "voice":
+                # 语音卡: ▶ 图标 + 时长; 播放中 = 底部进度条
+                ty = r.y + 10
+                text(surf, "%02d-%02d %02d:%02d" % (ts.tm_mon, ts.tm_mday,
+                                                    ts.tm_hour, ts.tm_min),
+                     10, dim, (r.x + 8, ty))
+                pygame.draw.polygon(surf, acc if (playing or sel) else soft, [
+                    (r.x + 10, ty + 16), (r.x + 10, ty + 27),
+                    (r.x + 19, ty + 21)])
+                text(surf, "语音 %ds" % (it.get("dur") or 0), BODY,
+                     hi if sel else soft, (r.x + 26, ty + 15))
+                if playing:
+                    total = it.get("dur") or 0
+                    elapsed = time.monotonic() - self._voice_at
+                    bx, bw2 = r.x + 10, GW - 20
+                    by = r.y + GH - 12
+                    now = time.monotonic()
+                    for bi in range(3):           # 均衡图标
+                        hgt = 4 + int(3 * (1 + math.sin(now * 7 + bi * 2.1)) / 2)
+                        pygame.draw.rect(surf, acc,
+                                         (bx + bi * 5, by - hgt + 6, 3, hgt))
+                    pygame.draw.rect(surf, self.th("track"),
+                                     (bx + 20, by, bw2 - 20, 6), border_radius=3)
+                    frac = min(1.0, elapsed / total) if total > 0 else 0.0
+                    if frac > 0:
+                        pygame.draw.rect(surf, acc,
+                                         (bx + 20, by, max(3, int((bw2 - 20) * frac)), 6),
+                                         border_radius=3)
+                continue
+            lines = self._wrap_lines(it.get("text") or "", BODY, GW - 16, 3)
             n_lines = len(lines)
             blk = 12 + 2 + n_lines * 14 - 2        # 时间行 + 间距 + 内容块
             ty = r.y + max(4, (GH - blk) // 2 - 3)  # 垂直居中偏上 3px (顶部保底 4px)
@@ -2456,7 +2659,22 @@ class App:
                 ly += 14
 
         if not items:
-            textc(surf, "暂无想法 · 按 n 记一条", BODY, dim, W // 2, 70)
+            textc(surf, "暂无想法 · n 文字 / 5 语音", BODY, dim, W // 2, 70)
+
+        # 录音卡 (第 4 卡槽): 红点闪烁 + 计时
+        if self.rec_proc and not self.in_input:
+            r = pygame.Rect(M, 116, W - 2 * M, 27)
+            pygame.draw.rect(surf, self.card(0), r, border_radius=5)
+            pygame.draw.rect(surf, self.th("danger"), r, 1, border_radius=5)
+            if int(time.monotonic() * 2) % 2 == 0:      # 红点闪烁
+                pygame.draw.circle(surf, self.th("danger"),
+                                   (r.x + 16, r.y + 27 // 2), 5)
+            el = int(time.monotonic() - self.rec_started)
+            text(surf, "录音中", BODY, hi, (r.x + 28, r.y + 8))
+            text(surf, "%d:%02d" % (el // 60, el % 60), BODY,
+                 self.th("danger"), (r.x + 86, r.y + 8))
+            text(surf, "5 停止并保存", 10, dim, (r.right - 8, r.y + 10),
+                 right=True)
 
         # 输入行 (第 4 张卡的位置, 底 141 不越菜单, 框内元素全部收在框里)
         if self.in_input:
@@ -2478,7 +2696,7 @@ class App:
         # 底部快捷键提示 (拼音候选条激活时让位; 左侧留 2 字符宽)
         if not (self.in_input and self.ime_bar(surf, 146)):
             hx = 6 + textw("我我", 13)
-            for lab in ("4 增加", "7 删除"):
+            for lab in ("4 增加", "5 录音", "7 删除", "8 播放"):
                 text(surf, lab, 13, soft, (hx, 151))
                 hx += textw(lab, 13) + textw("我我我", 13)
 
@@ -3889,6 +4107,8 @@ def main():
     app.radio_stop()                           # 杀 ffplay + 停电平流
     app.stop_player()
     app.mu_stop()                              # 音乐 ffplay
+    if app.rec_proc:
+        app.rec_stop()                         # 录音收尾保存
     netins.close()
     if fb:
         fb.close()

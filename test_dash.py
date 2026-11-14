@@ -463,6 +463,72 @@ def test_music():
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def test_voice():
+    """语音想法: 索引合并 / 本地播放 / 删除连文件 / 静音裁剪 (录音本体设备实测)."""
+    import shutil as _sh
+    import wave as _wave
+    import struct as _struct
+    import math as _math
+    import dash
+
+    tmp = tempfile.mkdtemp(prefix="onevoice")
+    dash.VOICES_DIR = os.path.join(tmp, "voices")
+    dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
+    os.makedirs(dash.VOICES_DIR, exist_ok=True)
+
+    def mkwav(path, sec, pre_silence=0.0):
+        sr = 8000
+        w = _wave.open(path, "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        n = int(sr * sec)
+        frames = []
+        for i in range(n):
+            t = i / sr
+            v = 0 if t < pre_silence else int(9000 * _math.sin(2 * 3.14159 * 440 * t))
+            frames.append(v)
+        w.writeframes(_struct.pack("<%dh" % n, *frames))
+        w.close()
+
+    try:
+        pygame.init()
+        pygame.display.set_mode((1, 1))
+        app = dash.App(FakeNet())
+        app.ideas = {"texts": [{"id": "t1", "text": "文字", "createdAt": 100}]}
+        vf = os.path.join(dash.VOICES_DIR, "v1.wav")
+        mkwav(vf, 1.0)
+        app.ideas["voices"] = [{"id": "v1", "file": vf, "dur": 1,
+                                "createdAt": 200}]
+        items = app.idea_items()
+        assert [i["kind"] for i in items] == ["voice", "text"], items
+        # 播放 (真 ffplay, SDL dummy 静音; 再按停)
+        app.sel = 0
+        app.play_voice(items[0])
+        assert app.playing_voice and app.playing_voice["id"] == "v1"
+        assert app.player is not None and app.player.poll() is None
+        _time.sleep(0.3)
+        app.play_voice(items[0])               # 再按 = 停
+        assert app.playing_voice is None and app.player is None
+        # 删除: 文件 + 索引一起清
+        assert os.path.exists(vf)
+        app.delete_selected()
+        assert not os.path.exists(vf)
+        assert app.ideas.get("voices") == []
+        assert [i["kind"] for i in app.idea_items()] == ["text"]
+        # 静音裁剪: 0.5s 静音头 + 1s 音 → ~1.2s 内
+        f2 = os.path.join(tmp, "rec.wav")
+        mkwav(f2, 1.5, pre_silence=0.5)
+        dur = dash.trim_silence_head(f2, keep=0.1)
+        assert dur is not None and 0.9 <= dur <= 1.4, dur
+        # 文字与语音互不影响
+        app.submit_idea()
+        assert len(app.idea_items()) == 1
+        print("voice OK (index/play/delete/trim)")
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 def test_ime():
     """拼音 IME: 词表/候选/联想 + 音乐搜索框路由."""
     import dash
@@ -570,6 +636,7 @@ if __name__ == "__main__":
     test_render()
     test_tools()
     test_music()
+    test_voice()
     test_ime()
     if os.environ.get("RUN_NET"):
         test_net_live()
