@@ -346,6 +346,16 @@ def test_render():
     app2.on_net("mode", "online", None)            # 模式切换也不丢
     assert app2.data.get("wx", {}).get("current_weather", {})\
         .get("temperature") == 24.6
+    # 主页自选股卡: quotes 缓存 + 渲染
+    app.on_net("text", "quotes",
+               'v_sh600519="51~贵州茅台~600519~1513.00~1521.00~-8.00~'
+               '100~200~300~~20261114~~-8.00~-0.53~1514~1508"')
+    assert os.path.exists(os.path.join(dash.CACHE_DIR, "quotes.json"))
+    app3 = dash.App(FakeNet())
+    app3.watch = {"items": [{"code": "sh600519", "name": ""}]}
+    assert app3.fin_items()[0].get("price") == 1513.0   # 缓存秒显合并行情
+    app3.page = 0
+    app3.draw(canvas)
     # 快捷键 4-8 → 页 1-5 (主页触发; 新闻/电台页数字为功能键)
     pg = pygame
     for key, page in [(pg.K_4, 1), (pg.K_5, 2), (pg.K_6, 3),

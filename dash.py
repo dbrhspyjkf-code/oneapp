@@ -462,7 +462,7 @@ def daily_sentence():
     en, cn = _SENTENCES[datetime.date.today().toordinal() % len(_SENTENCES)]
     return {"ok": True, "text": cn, "from": en}
 # 主页卡缓存标签: 进 app 秒显上次数据, 后台刷新后再覆盖 (用户要求免"获取中")
-HOME_CACHE_TAGS = ("wx", "news", "ipo")   # hitokoto 已内置本地文件
+HOME_CACHE_TAGS = ("wx", "news", "ipo", "quotes")
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")        # 自选股 (本地)
 EM_KEY_FILE = os.path.join(STATE_DIR, "em_key.json")      # 东财妙想 API-KEY
 # 自选股种子 (qt.gtimg.cn 代码; watch.json 存在则整体覆盖)
@@ -1028,6 +1028,7 @@ class App:
         self.fin_input = False                # 添加自选股输入态 (n 键)
         self.fin_sync = False                 # 东财 API-KEY 设置态 (s 键)
         self._hk_at = 0.0                     # 每日一句跑马灯相位
+        self._wk_at = 0.0                     # 主页自选股跑马灯相位
         self._tk_at = 0.0                     # 行情顶部跑马灯相位
         self.fsel = 0
         self.fscroll = 0
@@ -1163,6 +1164,13 @@ class App:
             self.data[a] = b
             if b and a in ("quotes", "idx"):
                 self.fin_ts = time.strftime("%H:%M:%S")
+            if b and a == "quotes":           # 主页自选股卡缓存
+                try:
+                    os.makedirs(CACHE_DIR, exist_ok=True)
+                    netmod.save_json_file(
+                        os.path.join(CACHE_DIR, "quotes.json"), b)
+                except Exception:
+                    pass
         elif kind == "bin":
             if b:
                 self.data[a] = b                 # 封面字节
@@ -1177,6 +1185,9 @@ class App:
         if self.net.mode == "online":
             if self.page == 0:
                 self.net.job("news", news_rss.news_fetch_all, 600)   # 主页新闻卡
+                if self._qt_codes():          # 自选股卡行情
+                    self.net.pub_text(QT_BASE + ",".join(
+                        c for c in self._qt_codes()), "quotes", 12)
                 self.net.job("wxloc", fetchers.wx_locate, 1800)      # IP 归属地 30min 重探
                 self.net.pub(wx_url(self.wx_loc), "wx", 600, direct=True)
             if self.page == 2:
@@ -3167,9 +3178,10 @@ class App:
         cx = M + LW + M                            # 124
         cw2 = W - cx - M                           # 192
         chh, gap = 43, M
-        tops = (M, M + chh + gap)
+        tops = (M, M + chh + gap, M + 2 * (chh + gap))
         now = time.monotonic()
-        for i, (lab, top) in enumerate(zip(("每日一句", "新闻"), tops)):
+        for i, (lab, top) in enumerate(zip(("每日一句", "新闻", "自选股"),
+                                           tops)):
             rr = pygame.Rect(cx, top, cw2, chh)
             pygame.draw.rect(surf, self.card(i + 1), rr, border_radius=6)
             pygame.draw.rect(surf, border, rr, 1, border_radius=6)
@@ -3227,6 +3239,32 @@ class App:
         else:
             text(surf, "获取中" if self.net.mode != "offline" else "离线",
                  BODY, dim, (cx + 8, top1 + 16))
+        # 自选股行情卡 (新闻下方): 单行跑马灯
+        top2 = tops[2]
+        its = self.fin_items()
+        parts = ["%s %.2f %+.2f%%" % ((it.get("name") or it["code"])[:6],
+                                      it.get("price") or 0,
+                                      it.get("pchg") or 0)
+                 for it in its if it.get("price")]
+        if parts:
+            txt = " · ".join(parts)
+            vw = cw2 - 16
+            tw = textw(txt, BODY)
+            vy = top2 + 13 + (chh - 13 - BODY) // 2
+            if tw <= vw:
+                text(surf, txt, BODY, soft, (cx + 8, vy))
+            else:
+                SPEED = 28.0
+                span = tw + vw + 24
+                if now - self._wk_at > span / SPEED + 1.0:
+                    self._wk_at = now
+                off = (now - self._wk_at) * SPEED
+                surf.set_clip((cx + 8, top2, vw, chh))
+                text(surf, txt, BODY, soft, (cx + 8 + vw - off, vy))
+                surf.set_clip(None)
+        else:
+            text(surf, "获取中" if self.net.mode == "online" else "--",
+                 BODY, dim, (cx + 8, top2 + 13 + (chh - 13 - BODY) // 2))
 
     # ── 行情页: 自选/指数/商品 三子页 ──
     FIN_TABS = ["自选股", "指数", "商品"]
