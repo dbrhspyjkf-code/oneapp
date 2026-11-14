@@ -3242,25 +3242,40 @@ class App:
         # 自选股行情卡 (新闻下方): 单行跑马灯
         top2 = tops[2]
         its = self.fin_items()
-        parts = ["%s %.2f %+.2f%%" % ((it.get("name") or it["code"])[:6],
-                                      it.get("price") or 0,
-                                      it.get("pchg") or 0)
-                 for it in its if it.get("price")]
-        if parts:
-            txt = " · ".join(parts)
+        segs = []                              # 分段着色: 涨红跌绿
+        for it in its:
+            if not it.get("price"):
+                continue
+            segs.append(("%s %.2f %+.2f%%" % (
+                (it.get("name") or it["code"])[:6],
+                it.get("price") or 0, it.get("pchg") or 0),
+                self._chg_col(it.get("pchg") or 0)))
+        if segs:
             vw = cw2 - 16
-            tw = textw(txt, BODY)
+            SEP = " · "
+            sep_w = textw(SEP, BODY)
+            widths = [textw(t, BODY) for t, _ in segs]
+            tw = sum(widths) + sep_w * (len(segs) - 1)
             vy = top2 + 13 + (chh - 13 - BODY) // 2
-            if tw <= vw:
-                text(surf, txt, BODY, soft, (cx + 8, vy))
-            else:
+            if tw <= vw:                       # 不溢出: 静态分行内逐段画
+                x = cx + 8
+                for (t, c), w in zip(segs, widths):
+                    text(surf, t, BODY, c, (x, vy))
+                    x += w + sep_w
+            else:                              # 跑马灯: 逐段平移, 分隔符 dim
                 SPEED = 28.0
                 span = tw + vw + 24
                 if now - self._wk_at > span / SPEED + 1.0:
                     self._wk_at = now
                 off = (now - self._wk_at) * SPEED
                 surf.set_clip((cx + 8, top2, vw, chh))
-                text(surf, txt, BODY, soft, (cx + 8 + vw - off, vy))
+                x = cx + 8 + vw - off
+                for i, ((t, c), w) in enumerate(zip(segs, widths)):
+                    if x + w > cx + 8 and x < cx + 8 + vw:
+                        text(surf, t, BODY, c, (x, vy))
+                    if i < len(segs) - 1:
+                        text(surf, SEP, BODY, dim, (x + w, vy))
+                    x += w + sep_w
                 surf.set_clip(None)
         else:
             text(surf, "获取中" if self.net.mode == "online" else "--",
