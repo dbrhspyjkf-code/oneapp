@@ -3328,16 +3328,11 @@ class App:
                 pass
 
     def _draw_fin_ticker(self, surf):
-        """顶部标题跑马灯: 自选股行情 + 新股 (主页卡不再显示, 挪这里)."""
+        """顶部标题跑马灯: 仅新股申购信息 (个股行情在卡片列表里, 不重复)."""
         parts = []
-        for it in self.fin_items():
-            if it.get("price"):
-                parts.append("%s %.2f %+.2f%%" % (
-                    (it.get("name") or it["code"])[:8], it["price"],
-                    it.get("pchg") or 0))
         ipo = self.data.get("ipo") or {}
-        for it in (ipo.get("items") or [])[:2]:
-            parts.append("新股 %s %s%s" % (
+        for it in (ipo.get("items") or []):
+            parts.append("新股申购 %s %s%s" % (
                 (it.get("name") or "")[:8], it.get("date") or "",
                 "(今)" if it.get("today") else ""))
         if not parts:
