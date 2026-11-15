@@ -685,6 +685,7 @@ TOOL_APPS = [("fx", "汇率"), ("unit", "换算"),
 TOOL_GRID = 5                            # 每行卡片数
 MAIL_BODY_ROWS = 5                       # 邮件详情每屏正文行数 (13px, 用户定版原生字号)
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")   # 设置: API KEY + 主页卡片显隐
+SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")   # 设置: API KEY + 主页卡片显隐
 
 # 音乐 app: 本地曲库 (mp3/flac/wav 直读) + QQ/网易云直连 provider (musrc.py,
 # 扫码绑定后走同一播放页), 输出仅本机 (商店版无 AirPlay/音箱遥控)。
@@ -1437,7 +1438,7 @@ class App:
         self.set_cat = 0                       # 设置左列分类 (0=卡片 1=主题)
         self.set_lv = "cats"                   # cats=左列 detail=右侧选项
         self.set_sel = 0                       # detail 行光标
-        self.set_edit = None                   # None=常态 "glm"/"ds"=KEY 弹窗
+        self.set_edit = None                   # None=常态 glm/ds=KEY 弹窗
         self.set_buf = ""
         self._usage_at = 0.0
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
@@ -1558,6 +1559,8 @@ class App:
     def poll(self):
         if self.page == 0 and not self.tool:
             self.poll_usage()
+        if self.page == 0 and not self.tool:
+            self.poll_usage()
         """按页取数: 只拉当前页所需, 页面切换即时响应不排队."""
         self.mu_tick()                        # 音乐连播: 任意页/离线都要走 (本地曲库)
         if self.net.mode == "online":
@@ -1604,6 +1607,26 @@ class App:
                         and time.monotonic() - self.play_at > 50:
                     self.radio_stop()          # RAOP 预读+连接 50s 没到 = 挂死
                     self.osd = ("AirPlay 未连上", time.monotonic() + 2.0)
+
+    def poll_usage(self):
+        """主页 USAGE 卡: 每 300s 拉一次 GLM/DeepSeek (有 KEY 才拉)."""
+        nowm = time.monotonic()
+        if nowm - self._usage_at <= 300:
+            return
+        self._usage_at = nowm
+        if self.cfg.get("glm_key"):
+            self.net.job("usage:glm", self._usage_fn("glm"), 300)
+        if self.cfg.get("ds_key"):
+            self.net.job("usage:ds", self._usage_fn("ds"), 300)
+
+    def _usage_fn(self, which):
+        key = self.cfg.get("glm_key" if which == "glm" else "ds_key", "")
+
+        def f():
+            if which == "glm":
+                return fetchers.glm_usage(key)
+            return fetchers.ds_balance(key)
+        return f
 
     def poll_usage(self):
         """主页 USAGE 卡: 每 300s 拉一次 GLM/DeepSeek (有 KEY 才拉)."""
@@ -4040,7 +4063,6 @@ class App:
 
 
     def tool_open(self, tid):
-
         self.tool = tid
         self.cv_armed = False
         self.osd = None
