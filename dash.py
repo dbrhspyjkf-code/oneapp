@@ -3917,6 +3917,11 @@ class App:
                 cur = self.cfg["cards"].get(ck, ck != "usage")
                 self.cfg["cards"][ck] = not cur
                 self.cfg_save()
+                if self.cfg["cards"][ck]:
+                    on = sum(1 for v in self.cfg["cards"].values() if v)
+                    if on > 3:
+                        self.osd = ("主页最多显示 3 卡",
+                                    time.monotonic() + 2.5)
             return True
         return True
 
@@ -5528,19 +5533,9 @@ class App:
                 if hk.get("from"):
                     txt += " — " + hk["from"]
                 vw = cw2 - 16
-                tw = textw(txt, BODY)
                 vy = top0 + 13 + (chh - 13 - BODY) // 2
-                if tw <= vw:
-                    text(surf, txt, BODY, soft, (cx + 8, vy))
-                else:
-                    SPEED = 28.0
-                    span = tw + vw + 24
-                    if now - self._hk_at > span / SPEED + 1.0:
-                        self._hk_at = now
-                    off = (now - self._hk_at) * SPEED
-                    surf.set_clip((cx + 8, top0, vw, chh))
-                    text(surf, txt, BODY, soft, (cx + 8 + vw - off, vy))
-                    surf.set_clip(None)
+                text(surf, clip_text(txt, BODY, vw), BODY, soft,
+                     (cx + 8, vy))                # 静态 (跑马灯已去)
             else:
                 text(surf, "获取中" if self.net.mode == "online" else "--",
                      BODY, dim, (cx + 8, top0 + 13 + (chh - 13 - BODY) // 2))

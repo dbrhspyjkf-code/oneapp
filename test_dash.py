@@ -1330,6 +1330,46 @@ def test_mail_accounts():
     print("mail accounts OK (0600/upsert/provider)")
 
 
+def test_settings_app():
+    """设置页: KEY 掩码编辑保存 (0600) / 卡片勾选与超 3 提醒 / USAGE 渲染."""
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    app = dash.App(FakeNet())
+    app.tool = "set"
+    # KEY 编辑: GLM KEY 第 0 行
+    app.key(pygame.K_RETURN)                      # 进入编辑
+    for c in "abc123":
+        app.key(0, c)
+    app.key(pygame.K_RETURN)                      # 保存退出编辑
+    assert app.cfg["glm_key"] == "abc123"
+    import stat as stat_mod
+    assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
+    # 卡片勾选: 移到 USAGE 行 (第 5) 开启; 4 个全开 → 提醒 OSD
+    app.set_sel = 5
+    app.key(pygame.K_RETURN)
+    assert app.cfg["cards"].get("usage") is True
+    on = sum(1 for v in app.cfg["cards"].values() if v)
+    assert on <= 4
+    # 默认三卡全开时再开第 4 → osd 提醒
+    app.cfg["cards"].update(hitokoto=True, news=True, fin=True, usage=True)
+    app.cfg_save()
+    app.key(pygame.K_RETURN)                      # toggle 关
+    app.key(pygame.K_RETURN)                      # toggle 开 → 超过 3
+    assert app.osd and "最多" in app.osd[0], app.osd
+    app.draw(canvas)                              # 设置页渲染冒烟
+    # 主页: USAGE 开启 → 4 卡渲染 + 轮播双源
+    app.tool = None
+    app.page = 0
+    app.data["usage_glm"] = {"ok": True, "p5": 12, "pw": 34}
+    app.data["usage_ds"] = {"ok": True, "cny": "110.00"}
+    app.draw(canvas)
+    print("settings app OK (key edit 0600/toggle/remind/usage render)")
+
+
 def test_mail_keys():
     """邮件 app 键流: 网格直开 → 登录表单 → 文件夹 → 列表 → 详情 → 逐层 Esc."""
     import mail as mailmod
@@ -2328,6 +2368,7 @@ if __name__ == "__main__":
     test_mail_parse()
     test_mail_utf7()
     test_mail_accounts()
+    test_settings_app()
     test_mail_keys()
     test_mail_all()
     test_mail_sess()
