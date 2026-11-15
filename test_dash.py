@@ -1588,6 +1588,22 @@ def test_tv():
             and "http://b/2.m3u8" in procs[-1][1]
         app.tv_stop()                                    # 清场
 
+        # ── 播放态 ←→ 手动换线路 (卡顿自救); 单路提示 ──
+        app.tv_play(two, hw=False)
+        app.tv_key(pygame.K_RIGHT)             # 1路 → 2路
+        assert app.tv_playing and app.tv_url_i == 1
+        assert "http://b/2.m3u8" in procs[-1][1]
+        app.tv_key(pygame.K_RIGHT)             # 2路 → 循环回 1路
+        assert app.tv_url_i == 0 and "http://a/1.m3u8" in procs[-1][1]
+        app.tv_key(pygame.K_LEFT)              # 反向回 2路
+        assert app.tv_url_i == 1
+        app.tv_stop()
+        app.tv_play(one, hw=False)             # 单路频道: 提示不换
+        app.tv_key(pygame.K_RIGHT)
+        assert app.tv_url_i == 0 and app.osd \
+            and "无备用线路" in app.osd[0]
+        app.tv_stop()                                    # 清场
+
         # ── 同线路可修优先: 硬解 v4l2 报错 → 软解 (不换路) ──
         app.tv_err = ""
         ch = app.tv_list()[0]                          # CCTV1 (多路)

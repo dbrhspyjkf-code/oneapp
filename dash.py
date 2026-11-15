@@ -3245,6 +3245,16 @@ class App:
                 self.tv_sels[self.tv_grp] = self.tv_sel
                 self.tv_play(lst[self.tv_sel])
                 self.tv_save()
+            elif k in (pygame.K_LEFT, pygame.K_RIGHT):
+                # 卡顿自救: ←→ 手动换当前频道的线路 (循环, 单路提示)
+                ch = self.tv_playing
+                if len(ch[2]) < 2:
+                    self.osd = ("无备用线路", time.monotonic() + 1.2)
+                else:
+                    ni = (self.tv_url_i + (1 if k == pygame.K_RIGHT else -1))                         % len(ch[2])
+                    self.tv_play(ch, url_i=ni)
+                    self.osd = ("线路 %d/%d" % (ni + 1, len(ch[2])),
+                                time.monotonic() + 1.5)
             elif k == pygame.K_5:
                 self.tv_fav_toggle()
             return True
@@ -3291,13 +3301,13 @@ class App:
         gx = 6
         for i, g in enumerate(self.tv_tabs()):
             sel = i == self.tv_grp
+            lab = ("★ " + g) if i == 0 else g   # 框/字/步进同宽 (星号入框)
             if sel:
-                r = pygame.Rect(gx - 3, 26, textw(g, 11) + 6, 15)
+                r = pygame.Rect(gx - 3, 26, textw(lab, 11) + 6, 15)
                 pygame.draw.rect(surf, self.card(0), r, border_radius=3)
                 pygame.draw.rect(surf, acc, r, 1, border_radius=3)
-            text(surf, ("★ " + g) if i == 0 else g, 11,
-                 hi if sel else soft, (gx, 28))
-            gx += textw(("★ " + g) if i == 0 else g, 11) + 13
+            text(surf, lab, 11, hi if sel else soft, (gx, 28))
+            gx += textw(lab, 11) + 13
         if not lst:                             # 空收藏组提示
             textc(surf, "还没有收藏", 13, dim, W // 2, 72)
             textc(surf, "列表里按 5 收藏喜欢的频道", 10, dim, W // 2, 94)
@@ -3349,7 +3359,8 @@ class App:
             textc(surf, "线路 %d/%d" % (self.tv_url_i + 1, len(ch[2])),
                   10, self.th("dim"), W // 2, 76)
         textc(surf, ch[0], 12, self.th("soft"), W // 2, 94)
-        textc(surf, "F/X 换台 · Esc 返回", 9, self.th("dim"), W // 2, 136)
+        textc(surf, "F/X 换台 · Z/C 换线路 · Esc 返回", 9,
+              self.th("dim"), W // 2, 136)
 
     def _tv_log(self, line):
         """诊断轨迹 /tmp/oneapp_tv.log (E2E 证据: 首帧耗时/帧数/错误)."""
