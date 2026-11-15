@@ -1480,6 +1480,12 @@ def test_mail_sess():
             self.logouts += 1
             return ("OK", ["b"])
 
+        def socket(self):                     # NOOP 探活短超时用 (5s 修复)
+            return self
+
+        def settimeout(self, t):
+            pass
+
         def xatom(self, *a):
             return ("OK", [])
 

@@ -1489,6 +1489,16 @@ class App:
                 self.mu_lyr = self._pl_lrc_parse(b.get("synced") or "")
             if a.startswith("mail_") and isinstance(b, dict):
                 self.on_mail_net(a, b)
+        elif kind == "error":                 # worker 里 fn 抛异常 (None) —
+            if a.startswith("mail_list"):     # 以前静默吞, 失败根本不可见
+                self.mail_err = "网络异常 · 稍后刷新"
+            elif a.startswith("mail_body"):
+                self.mail_body = "获取失败: 网络异常"
+            elif a == "mail_send":
+                self.mail_c_busy = False
+                self.osd = ("发送失败: 网络异常", time.monotonic() + 3)
+            elif a.startswith("mail_"):
+                self.osd = ("网络异常", time.monotonic() + 2.5)
         elif kind == "text":
             self.data[a] = b
             if b and a in ("quotes", "idx"):

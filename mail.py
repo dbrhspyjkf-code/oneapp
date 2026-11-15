@@ -353,6 +353,10 @@ _SESS_TTL = 240                               # 秒; NOOP 兜底校验服务端�
 
 def _drop_sess():
     if _SESS["M"] is not None:
+        try:                              # 死会话 logout 别等满 socket 超时
+            _SESS["M"].socket().settimeout(3)
+        except Exception:
+            pass
         try:
             _SESS["M"].logout()
         except Exception:
@@ -383,7 +387,10 @@ def _connect(acct):
     if s["M"] is not None and s["email"] == addr \
             and time.monotonic() - s["at"] < _SESS_TTL:
         try:
-            if s["M"].noop()[0] == "OK":
+            s["M"].socket().settimeout(5)     # 探活短超时 (会话被服务端掐后
+            ok = s["M"].noop()[0] == "OK"     # NOOP 别顶满 12s, 163 实测会挂)
+            s["M"].socket().settimeout(_TIMEOUT)
+            if ok:
                 s["at"] = time.monotonic()
                 return s["M"], None
         except Exception:
@@ -475,8 +482,23 @@ def list_folders(acct):
         _release(M)
 
 
+def _search_uf(M):
+    """未读+旗标 uid 并集 (升序, 尾部=最新).
+    QQ 对 OR UNSEEN FLAGGED 返回空 (2026-11-15 实测: STATUS UNSEEN=29 而
+    OR=0, 腾讯 IMAP 的 OR 兼容性问题) — 两次单键搜索取并集, 163/QQ 通吃."""
+    out = set()
+    for key in ("UNSEEN", "FLAGGED"):
+        try:
+            st, data = M.uid("SEARCH", key)
+            if st == "OK" and data and data[0]:
+                out.update(data[0].split())
+        except Exception:
+            pass
+    return sorted(out, key=int)
+
+
 def fetch_msgs(acct, raw_q, limit=30):
-    """未读+旗标邮件列表 (最新在前, 服务端 OR 搜索, 不拉全量):
+    """未读+旗标邮件列表 (最新在前, 服务端搜索, 不拉全量):
     FLAGS + 前 16KB 原文, PEEK 不置已读."""
     M, err = _connect(acct)
     if err:
@@ -485,8 +507,7 @@ def fetch_msgs(acct, raw_q, limit=30):
         st, _ = M.select(raw_q, readonly=True)
         if st != "OK":
             return {"ok": False, "err": "文件夹打开失败"}
-        st, data = M.uid("SEARCH", "OR", "UNSEEN", "FLAGGED")
-        ids = data[0].split() if st == "OK" and data and data[0] else []
+        ids = _search_uf(M)
         recent = ids[-limit:]
         if not recent:
             return {"ok": True, "msgs": [], "total": 0}
