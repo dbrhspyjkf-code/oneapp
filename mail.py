@@ -664,7 +664,8 @@ def fetch_msgs(acct, raw_q, limit=10, page=0):
                 "seen": "\\Seen" in flags,
                 "flagged": "\\Flagged" in flags,
             })
-        return {"ok": True, "msgs": msgs, "total": len(ids)}
+        return {"ok": True, "msgs": msgs, "total": len(ids),
+                "page": page, "has_more": has_more}
     except Exception as e:
         return {"ok": False, "err": _friendly_err(e)}
     finally:
