@@ -1405,8 +1405,10 @@ def test_mail_keys():
     assert app.mail_lv == "compose" and app.mail_c_reply
     assert app.mail_c["to"] == "a@b.com" and app.mail_c["subject"] == "Re: 你好"
     assert app.mail_c_quote.startswith("在 11-14 09:00，a@b.com 写道：\n> 第一行")
+    assert app._silk_input_active()               # 写信态: F/X/Z/C 保持字母
     app.key(pygame.K_ESCAPE)                      # Esc 回详情 (入口层)
     assert app.mail_lv == "detail"
+    assert not app._silk_input_active()           # 列表/详情态: 丝印方向生效
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "list"
     # 列表 5: 写新邮件 (空白) → Esc 回列表

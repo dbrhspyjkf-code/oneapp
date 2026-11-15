@@ -9,7 +9,7 @@ pygame 直写 /dev/fb_lcd + 裸 evdev 键盘 (与 sudokuzero 同款基建);
   电台 内置站台直连流 · 音乐 QQ/网易云 直连 (musrc.py) + 本地曲库
   歌词 LRCLIB + 网易兜底 (musrc.lrc_fetch)
 
-键位:  1-5 切页   fn+Z/C/F/X(←→↑↓) 翻页   t 换主题(仅主页)
+键位:  1-5 切页   Z/C/F/X(丝印←→↑↓,非输入态) 翻页   t 换主题(仅主页)
        Fn+S/Fn+D 音量±  Fn+A 静音        主页长按 Esc 1s 退出
 """
 
@@ -660,7 +660,7 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
                 ("solidot", "Solidot"), ("ifanr", "爱范儿"),
                 ("leiphone", "雷峰网"), ("wscn", "华尔街见闻")]
 
-# ── 工具页: app 卡片入口 (卡片=名字+快捷键, 5×2 网格, fn+Z/C/F/X(←→↑↓) 移动
+# ── 工具页: app 卡片入口 (卡片=名字+快捷键, 5×2 网格, Z/C/F/X(丝印←→↑↓) 移动
 #    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
 TOOL_APPS = [("fx", "汇率"), ("unit", "单位换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
@@ -2812,7 +2812,7 @@ class App:
         if k in (pygame.K_4, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_p):
             self.mu_pause_toggle()        # 4=暂停 (2026-11-14 用户定版, 对齐
                                           #   实体键 4; P 保留)
-        elif k in (pygame.K_x, pygame.K_8):
+        elif k == pygame.K_8:
             self.mu_stop()
             self.mu_view = "src"          # 8=停止 (跨页统一)
         elif k == pygame.K_7:
@@ -3440,7 +3440,7 @@ class App:
             textc(surf, "线路 %d/%d" % (self.tv_url_i + 1, len(ch[2])),
                   10, self.th("dim"), W // 2, 76)
         textc(surf, ch[0], 12, self.th("soft"), W // 2, 94)
-        textc(surf, "fn+F/X 换台 · fn+Z/C 换线路 · Esc 返回", 9,
+        textc(surf, "F/X 换台 · Z/C 换线路 · Esc 返回", 9,
               self.th("dim"), W // 2, 136)
 
     def _tv_log(self, line):
@@ -3455,7 +3455,22 @@ class App:
             pass
 
     # ── 键 ──
+    def _silk_input_active(self):
+        """输入态 (F/Z/X/C 保持字母, 丝印方向让位): 想法/行情添加/行情
+        KEY 设置/音乐搜索/邮件登录/邮件写信."""
+        return (self.in_input or self.fin_input or self.fin_sync
+                or self.mu_input
+                or (self.tool == "mail"
+                    and self.mail_lv in ("login", "compose")))
+
     def key(self, k, ch=""):
+        # 丝印方向 (非输入态): F/X/Z/C = ↑↓←→ (fn+ 同效, 输入态保持字母)
+        if k in (pygame.K_f, pygame.K_x, pygame.K_z, pygame.K_c) \
+                and not self._silk_input_active():
+            k = {pygame.K_f: pygame.K_UP, pygame.K_x: pygame.K_DOWN,
+                 pygame.K_z: pygame.K_LEFT,
+                 pygame.K_c: pygame.K_RIGHT}[k]
+            ch = ""
         if self.dialog:
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 if self.dialog[0] == "exit":
@@ -3782,7 +3797,7 @@ class App:
                     self.ime_mode = False     # API-KEY 英文直输
                     self.buf = netmod.load_json_file(EM_KEY_FILE, {})\
                         .get("key", "")
-                elif (k == pygame.K_d or k == pygame.K_x) \
+                elif (k == pygame.K_d) \
                         and self.fin_view == 0 and self.fin_items():
                     items = self.fin_items()
                     if 0 <= self.fsel < len(items):
@@ -4133,10 +4148,6 @@ class App:
             return self.mail_login_key(k, ch)
         if lv == "compose":
             return self.mail_compose_key(k, ch)
-        if lv in ("acct", "folders", "list") and k in (pygame.K_f,
-                                                       pygame.K_x):
-            k = pygame.K_UP if k == pygame.K_f else pygame.K_DOWN   # 丝印方向
-            ch = ""                        # 列表层 F/X=↑/↓ (输入层是字母)
         if k in (pygame.K_UP, pygame.K_DOWN):
             if lv == "detail":
                 n = max(0, len(self._mail_body_lines()) - MAIL_BODY_ROWS)
