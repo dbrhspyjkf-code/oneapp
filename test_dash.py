@@ -1357,14 +1357,36 @@ def test_mail_keys():
     assert app.mail_auth_buf == "authcode1"
     app.key(pygame.K_RETURN)
     assert ("job", "mail_login") in app.net.got
-    # 登录成功 → 落盘 0600 + 直进 全部未读 聚合视图 (跨夹搜索)
+    # 登录成功 → 落盘 0600 + 直进文件夹页 (虚拟夹: 未读/红旗; INBOX 提升)
     app.on_net("data", "mail_login", {"ok": True, "unread": 3,
                                       "email": "user@163.com",
                                       "auth": "authcode1"})
-    assert app.mail_lv == "list" and app.mail_folder == "@unread" \
+    assert app.mail_lv == "folders" \
         and app.mail_cur.get("email") == "user@163.com"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(mailmod.MAIL_FILE).st_mode) == 0o600
+    assert ("job", "mail_folders:user@163.com") in app.net.got
+    app.on_net("data", "mail_folders:user@163.com", {"ok": True, "folders": [
+        {"raw": "INBOX", "name": "INBOX", "unread": 3, "total": 12},
+        {"raw": "\"&XfJT0ZAB-\"", "name": "已发送", "unread": 0, "total": 4}]})
+    assert [f["raw"] for f in app.mail_folders][:2] == ["@unread", "@flagged"]
+    assert app.mail_folders[2]["raw"] == "INBOX"          # 收件箱提至第一行
+    assert app.mail_folders[3]["name"] == "已发送"
+    assert app.mail_unread_n["user@163.com"] == 3  # 绘制时拼 "未读 3" (0 不显示)
+    app.mail_sel = 2                              # INBOX (第三列)
+    # 三列网格导航: ←→ 同行 ±1, ↑↓ 跨行 ±3
+    app.key(pygame.K_RIGHT)
+    assert app.mail_sel == 3
+    app.key(pygame.K_LEFT)
+    assert app.mail_sel == 2
+    app.key(pygame.K_UP)
+    assert app.mail_sel == 0
+    app.key(pygame.K_DOWN)
+    assert app.mail_sel == 3
+    app.mail_sel = 0
+    # 全部未读: Enter → 聚合视图 (跨夹搜索)
+    app.key(pygame.K_RETURN)
+    assert app.mail_lv == "list" and app.mail_folder == "@unread"
     assert ("job", "mail_all:user@163.com:unread") in app.net.got
     app.on_net("data", "mail_all:user@163.com:unread", {"ok": True, "total": 2,
                                                     "msgs": [
@@ -1424,8 +1446,7 @@ def test_mail_keys():
     app.on_net("data", "mail_folders", {"ok": True, "folders": [
         {"raw": "INBOX", "name": "INBOX", "unread": 3, "total": 12},
         {"raw": "\"&XfJT0ZAB-\"", "name": "已发送", "unread": 0, "total": 4}]})
-    assert [f["name"] for f in app.mail_folders] == \
-        ["全部未读", "全部红旗", "INBOX", "已发送"]
+    assert [f["raw"] for f in app.mail_folders][:2] == ["@unread", "@flagged"]
     app.mail_sel = 2                              # INBOX (第三列)
     app.key(pygame.K_RIGHT)                   # 三列网格: → 同行 +1
     assert app.mail_sel == 3

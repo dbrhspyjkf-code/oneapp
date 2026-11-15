@@ -1404,6 +1404,8 @@ class App:
         self.mail_total = 0                    # 文件夹邮件总数
         self.mail_page = 0                     # 单夹列表分页 (0=最近10封)
         self.mail_has_more = False             # 还有更早邮件 (6 加载)
+        self.mail_unread_n = {}                # {email: 全账号未读数}
+        self.mail_flag_n = {}                  # {email: 全账号红旗数}
         self.mail_err = ""                     # 列表获取失败文案 (空态显示)
         self._mail_body_cache = (None, [])     # (key, lines) 详情折行缓存
         self._mail_c_cache = (None, [])        # (key, lines) 写信正文折行缓存
@@ -3938,17 +3940,18 @@ class App:
         单文件夹: Esc → 文件夹层 (虚拟夹置顶) 或直接看列表归属."""
         em = (acct or {}).get("email", "")
         self.mail_cur = dict(acct)
-        self.mail_folder = "@unread"
+        self.mail_folder = None
         self.mail_msgs = []
         self.mail_total = 0
         self.mail_got = False
         self.mail_page = 0
         self.mail_has_more = False
-        self.mail_lv = "list"
+        self.mail_lv = "folders"               # 登录直进文件夹页 (用户常用入口)
+        self.mail_folders = []
         self.mail_sel = self.mail_scroll = 0
-        self.osd = ("搜索未读…", time.monotonic() + 8)
-        self.net.invalidate("mail_all:%s:unread" % em)
-        self.net.job("mail_all:%s:unread" % em, self._mail_all_fn("unread"), 300)
+        self.osd = ("连接中…", time.monotonic() + 3)
+        self.net.invalidate("mail_folders:%s" % em)
+        self.net.job("mail_folders:%s" % em, self._mail_folders_fn(), 600)
 
     def _mail_all_fn(self, which):
         cur = dict(self.mail_cur or {})
@@ -4034,8 +4037,11 @@ class App:
         if lv == "acct" and self.mail.get("accounts"):
             self.net.job("mail_unread", self._mail_unread_fn(), 60)
         elif lv == "folders" and self.mail_cur:
-            self.net.job("mail_folders:%s" % (self.mail_cur or {}).get("email", ""),
+            em = (self.mail_cur or {}).get("email", "")
+            self.net.job("mail_folders:%s" % em,
                  self._mail_folders_fn(), 600)
+            self.net.job("mail_all:%s:flagged" % em,
+                 self._mail_all_fn("flagged"), 300)   # 红旗数 + 预热缓存
         elif lv == "list" and self.mail_cur and self.mail_folder:
             em = (self.mail_cur or {}).get("email", "")
             if self.mail_folder.startswith("@"):
@@ -4067,9 +4073,16 @@ class App:
             if b.get("ok"):
                 # 虚拟聚合夹置顶 (163 网页版的 未读/红旗 智能视图 IMAP 不暴露,
                 # fetch_all 逐夹聚合); 真实文件夹随后
-                self.mail_folders = ([{"raw": "@unread", "name": "全部未读"},
-                                      {"raw": "@flagged", "name": "全部红旗"}]
-                                     + (b.get("folders") or []))
+                fs = b.get("folders") or []
+                inbox = next((f for f in fs
+                              if f["name"].upper() == "INBOX"), None)
+                rest = [f for f in fs if f is not inbox]
+                em = (self.mail_cur or {}).get("email", "")
+                self.mail_unread_n[em] = sum(max(0, f.get("unread", 0))
+                                             for f in fs)
+                self.mail_folders = ([{"raw": "@unread", "name": "未读"},
+                                      {"raw": "@flagged", "name": "红旗"}]
+                                     + ([inbox] if inbox else []) + rest)
                 self.mail_sel = min(self.mail_sel,
                                     max(0, len(self.mail_folders) - 1))
                 self.osd = None
@@ -4084,6 +4097,12 @@ class App:
                     for m in rows:
                         m.setdefault("fld", self.mail_folder)
                         m.setdefault("fldn", fldn)
+                em = tag.split(":")[1] if tag.startswith("mail_all") else ""
+                if em:
+                    if ":unread" in tag:
+                        self.mail_unread_n[em] = b.get("total", 0)
+                    elif ":flagged" in tag:
+                        self.mail_flag_n[em] = b.get("total", 0)
                 if b.get("page", 0) > 0:      # 加载更多: 追加
                     self.mail_msgs = self.mail_msgs + rows
                 else:
@@ -4551,6 +4570,13 @@ class App:
                 if idx >= nfol:
                     break
                 f = self.mail_folders[idx]
+                nm = f["name"]
+                if f["raw"] == "@unread":
+                    c = self.mail_unread_n.get(em, 0)
+                    nm = ("未读 %d" % c) if c else "未读"
+                elif f["raw"] == "@flagged":
+                    c = self.mail_flag_n.get(em, 0)
+                    nm = ("红旗 %d" % c) if c else "红旗"
                 x = 6 + c * cw
                 y = 18 + r * 30
                 cell = pygame.Rect(x + 1, y, cw - 2, 26)
@@ -4558,7 +4584,7 @@ class App:
                 pygame.draw.rect(surf, self.card(0), cell, border_radius=4)
                 pygame.draw.rect(surf, acc if sel else self.th("border"),
                                  cell, 2 if sel else 1, border_radius=4)
-                text(surf, clip_text(f["name"], 13, cw - 12), 13,
+                text(surf, clip_text(nm, 13, cw - 12), 13,
                      hi if sel else soft, (x + 6, y + 5))
                 if f.get("unread", 0) > 0:
                     text(surf, str(f["unread"]), 13, acc,
