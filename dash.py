@@ -3149,14 +3149,27 @@ class App:
         if ch:
             netmod.save_json_file(IDEAS_FILE, self.ideas)
 
+    def _cloud_has_pending(self):
+        """有无待上传/待删条目 (节流豁免依据)."""
+        for key in ("texts", "voices"):
+            for it in self.ideas.get(key, []):
+                if not it.get("up"):
+                    return True
+        return bool(self.ideas.get("cdel"))
+
     def cloud_sync_trigger(self):
-        """后台双写: 上传 pending + 处理 cdel + tombstone 对账 (15s 节流)."""
+        """后台双写: 上传 pending + 处理 cdel + tombstone 对账.
+        节流只限例行对账 — 有 pending 时不节流 (否则紧随上一轮的事件
+        会被窗口吞掉, 用户离开页面后无人补跑)."""
         url, tok = self._cloud_cfg()
         if not (url and tok):
             return
-        if time.monotonic() - self._cloud_trig < 15:
+        if self._cloud_has_pending():
+            self._cloud_trig = time.monotonic()   # pending 永不节流
+        elif time.monotonic() - self._cloud_trig < 15:
             return
-        self._cloud_trig = time.monotonic()
+        else:
+            self._cloud_trig = time.monotonic()
         if not self.cfg.get("cloud_user"):
             self.cloud_ping_trigger()      # 存量 token 补拉用户名
         self.ensure_cids()
@@ -3276,6 +3289,9 @@ class App:
         if ups or dels:
             self.osd = ("云同步 +%d -%d" % (len(ups), dels),
                         time.monotonic() + 1.5)
+        if self._cloud_has_pending():
+            self._cloud_trig = 0.0         # 同步期间新落的事件 → 补跑一轮
+            self.cloud_sync_trigger()
 
     def cloud_list_fetch(self):
         self.net.invalidate(("job", "cloudlist"))

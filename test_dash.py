@@ -1452,6 +1452,25 @@ def test_cloud():
     assert any(m == "DELETE" and it["cid"] in u for m, u in calls)
     app.on_net("data", "cloudsync", d)
     assert app.ideas.get("cdel") == []
+    # 节流不吞 pending: 节流窗口内新落的条目必须立即触发补传
+    n_jobs = len(app.net.jobs)
+    app._cloud_trig = _time.monotonic()        # 刚同步过 (窗口内)
+    app.ideas["texts"].append({"id": "x-2", "cid": "d" * 12,
+                               "text": "紧随其后", "createdAt": 2})
+    app.cloud_sync_trigger()
+    assert len(app.net.jobs) > n_jobs          # pending 豁免节流
+    netmod.http_raw = lambda url, **k: (
+        (200, json.dumps({"ok": 1}).encode()) if k.get("method") == "POST"
+        else (200, json.dumps({"ids": [], "now": 5.0}).encode()))
+    d = app.net.last_job("cloudsync")()
+    assert d["up_ids"] == ["d" * 12]
+    app.on_net("data", "cloudsync", d)
+    assert app.ideas["texts"][-1]["up"] == 1
+    n_jobs = len(app.net.jobs)
+    app._cloud_trig = _time.monotonic()
+    app.cloud_sync_trigger()                   # 无 pending → 节流生效
+    assert len(app.net.jobs) == n_jobs
+    netmod.http_raw = orig_raw
     # tombstone 对账: 云端删 → 本地条目+文件清, csync 持久化
     vp = os.path.join(tmp, "v1.wav")
     open(vp, "wb").write(b"RIFF....")
