@@ -1331,7 +1331,7 @@ def test_mail_accounts():
 
 
 def test_settings_app():
-    """设置页(左右分栏): KEY 弹窗编辑保存 (0600) / 卡片开关与超 3 提醒 / USAGE 渲染."""
+    """设置页(TAB): 页签切换 / KEY 弹窗编辑保存 (0600) / 卡片开关与超 3 提醒 / 主题应用."""
     import dash
     pygame.init()
     pygame.display.set_mode((1, 1))
@@ -1339,12 +1339,9 @@ def test_settings_app():
     tmp = tempfile.mkdtemp(prefix="oneapp")
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     app = dash.App(FakeNet())
-    app.tool = "set"                          # 左列分类层 (默认选 卡片)
-    assert app.set_lv == "cats" and app.set_cat == 0
-    # → 进右侧 detail (卡片分类)
-    app.key(pygame.K_RETURN)
-    assert app.set_lv == "detail" and app.set_sel == 0
-    # sel=0 = GLM KEY → Enter 弹窗 → 输入 → Enter 保存
+    app.tool = "set"                          # 卡片页签 (默认)
+    assert app.set_tab == 0
+    # 卡片页签: sel=0 = GLM KEY → Enter 弹窗 → 输入 → Enter 保存
     app.key(pygame.K_RETURN)
     assert app.set_edit == "glm"
     for c in "abc123":
@@ -1354,20 +1351,29 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # ↓ 到 sw:usage (第 5 行) → Enter 开启; 前三默认开 + usage = 4 → 超 3 提醒
+    # sw:usage 行 (sel=5) → Enter 开启; 全部 4 张 → 超 3 提醒
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
     app.set_sel = 5
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is True
     assert app.osd and "最多" in app.osd[0], app.osd
-    app.draw(canvas)                          # 设置页渲染冒烟 (含开关/KEY 掩码)
+    app.draw(canvas)                          # 设置页渲染冒烟 (KEY 掩码/开关)
+    # 主题页签: ←→ 切到 主题 → 选 纯黑 (theme:6) → theme_idx 应用
+    app.key(pygame.K_LEFT)                    # ← 左页签 (主题在左? 方向循环)
+    app.key(pygame.K_RIGHT)
+    app.set_tab = 1                           # 直接定位主题页签
+    app.set_sel = 6                           # theme:6 = 纯黑
+    app.key(pygame.K_RETURN)
+    assert app.theme_idx == 6, app.theme_idx
+    import json as json_mod
+    assert json_mod.load(open(dash.THEME_FILE)).get("idx") == 6
     # 主页: USAGE 卡渲染 (真实轮播数据)
     app.tool = None
     app.page = 0
     app.data["usage_glm"] = {"ok": True, "p5": 12, "pw": 34}
     app.data["usage_ds"] = {"ok": True, "cny": "110.00"}
     app.draw(canvas)
-    print("settings app OK (cats/detail/key popup 0600/toggle/remind/usage)")
+    print("settings app OK (tabs/key popup 0600/toggle/remind/theme apply/usage)")
 
 
 
