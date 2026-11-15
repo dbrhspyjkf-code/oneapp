@@ -3279,7 +3279,6 @@ class App:
         if self.tv_playing:
             self._draw_tv_play(surf)
             return
-        from urllib.parse import urlparse
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
         lst = self.tv_list()
@@ -3320,13 +3319,10 @@ class App:
             pygame.draw.rect(surf, acc if sel else self.th("border"), rct,
                              2 if sel else 1, border_radius=4)
             if name in self.tv_fav:             # 收藏星标
-                text(surf, "★", 11, acc, (9, y + 7))
-            text(surf, clip_text(name, 12, W - 130), 12,
-                 hi if sel else soft, (24, y + 1))
-            text(surf, urlparse(urls[0]).netloc +
-                 (" +备胎×%d" % (len(urls) - 1) if len(urls) > 1 else ""),
-                 9, dim, (24, y + 13))
-            text(surf, "%02d" % (i + 1), 10, acc, (W - 24, y + 7), right=True)
+                text(surf, "★", 11, acc, (9, y + 6))
+            text(surf, clip_text(name, 13, W - 90), 13,     # 只显频道名
+                 hi if sel else soft, (24, y + 4))
+            text(surf, "%02d" % (i + 1), 10, acc, (W - 24, y + 6), right=True)
         self.tool_foot(surf, ("←→ 组", "↑↓ 选", "5 ★", "Enter 播",
                               "Esc 返回"))
 
