@@ -254,6 +254,7 @@ def test_render():
     app.radio_grp = 4                             # 国际
     assert all(s["grp"] == "国际" for s in app.radio_list())
     app.radio_grp = 0                             # ★ (空)
+    app.radio_fav = []                    # 用户真机收藏不进测试 (渲染冒烟)
     assert app.radio_list() == []
     app.wx_loc = {"city": "深圳", "prov": "广东省"}  # 本地置顶: 同城>同省
     app.radio_grp = 3                             # 地方
