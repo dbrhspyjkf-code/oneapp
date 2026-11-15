@@ -530,6 +530,7 @@ def fetch_all(acct, which="uf", limit=30):
             folders.append((raw, disp))
         disp_of = dict(folders)
         hits = {}                              # raw → [uid...] (升序, 尾=新)
+        nu_t = nf_t = 0                        # 未读/旗标分类计数 (并集前)
         for raw, disp in folders:
             try:
                 if M.select(raw, readonly=True)[0] != "OK":
@@ -539,6 +540,10 @@ def fetch_all(acct, which="uf", limit=30):
                     st, data = M.uid("SEARCH", key)
                     if st == "OK" and data and data[0]:
                         uids.update(data[0].split())
+                        if key == "UNSEEN":
+                            nu_t += len(data[0].split())
+                        else:
+                            nf_t += len(data[0].split())
                 if uids:
                     hits[raw] = sorted(uids, key=int)
             except Exception:
@@ -573,7 +578,8 @@ def fetch_all(acct, which="uf", limit=30):
         cand.sort(key=lambda x: x[0], reverse=True)     # 最新在前
         chosen = cand[:limit]
         if not chosen:
-            return {"ok": True, "msgs": [], "total": total}
+            return {"ok": True, "msgs": [], "total": total,
+                "n_unseen": nu_t, "n_flagged": nf_t}
         # 阶段二: 选中邮件取 16KB 头 (预览), 逐夹批量
         need = {}
         for dk, raw, uid in chosen:
@@ -612,7 +618,8 @@ def fetch_all(acct, which="uf", limit=30):
                 "seen": "\\Seen" in flags,
                 "flagged": "\\Flagged" in flags,
             })
-        return {"ok": True, "msgs": msgs, "total": total}
+        return {"ok": True, "msgs": msgs, "total": total,
+                "n_unseen": nu_t, "n_flagged": nf_t}
     except Exception as e:
         return {"ok": False, "err": _friendly_err(e)}
     finally:

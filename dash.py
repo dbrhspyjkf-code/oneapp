@@ -4100,9 +4100,9 @@ class App:
                 em = tag.split(":")[1] if tag.startswith("mail_all") else ""
                 if em:
                     if ":unread" in tag:
-                        self.mail_unread_n[em] = b.get("total", 0)
-                    elif ":flagged" in tag:
-                        self.mail_flag_n[em] = b.get("total", 0)
+                        self.mail_unread_n[em] = b.get("n_unseen", 0)
+                    if ":flagged" in tag or ":unread" in tag:
+                        self.mail_flag_n[em] = b.get("n_flagged", 0)
                 if b.get("page", 0) > 0:      # 加载更多: 追加
                     self.mail_msgs = self.mail_msgs + rows
                 else:

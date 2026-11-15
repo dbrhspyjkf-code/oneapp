@@ -1372,7 +1372,8 @@ def test_mail_keys():
     assert [f["raw"] for f in app.mail_folders][:2] == ["@unread", "@flagged"]
     assert app.mail_folders[2]["raw"] == "INBOX"          # 收件箱提至第一行
     assert app.mail_folders[3]["name"] == "已发送"
-    assert app.mail_unread_n["user@163.com"] == 3  # 绘制时拼 "未读 3" (0 不显示)
+    assert app.mail_unread_n["user@163.com"] == 3  # STATUS 求和 (绘制拼 "未读 3")
+    # (folders 层再进入会以 STATUS 求和覆盖, 见后段)
     app.mail_sel = 2                              # INBOX (第三列)
     # 三列网格导航: ←→ 同行 ±1, ↑↓ 跨行 ±3
     app.key(pygame.K_RIGHT)
@@ -1388,7 +1389,8 @@ def test_mail_keys():
     app.key(pygame.K_RETURN)
     assert app.mail_lv == "list" and app.mail_folder == "@unread"
     assert ("job", "mail_all:user@163.com:unread") in app.net.got
-    app.on_net("data", "mail_all:user@163.com:unread", {"ok": True, "total": 2,
+    app.on_net("data", "mail_all:user@163.com:unread",
+               {"ok": True, "total": 2, "n_unseen": 1, "n_flagged": 1,
                                                     "msgs": [
         {"uid": "11", "subject": "你好", "from": "a@b.com",
          "date": "11-14 09:00", "preview": "内容", "seen": False,
@@ -1398,6 +1400,8 @@ def test_mail_keys():
          "flagged": True, "fld": "Bob", "fldn": "Bob"}]})
     assert app.mail_total == 2 and len(app.mail_msgs) == 2
     assert app.mail_got                     # 列表已落地 (区分空/加载中)
+    assert app.mail_unread_n["user@163.com"] == 1  # 聚合回填纯未读数
+    assert app.mail_flag_n["user@163.com"] == 1    # 红旗数 (绘制拼 "红旗 1")
     app.key(pygame.K_x)                           # 列表层丝印方向: X=↓
     assert app.mail_sel == 1
     app.key(pygame.K_f)                           # F=↑ (输入层仍是字母)
@@ -1611,6 +1615,7 @@ def test_mail_all():
         r = mailmod.fetch_all({"email": "t@163.com", "auth": "k"}, "uf", 30)
         assert r["ok"], r
         assert r["total"] == 4, r                       # INBOX 1 + Bob 2 + 已发送 1
+        assert (r.get("n_unseen"), r.get("n_flagged")) == (3, 2), r
         msgs = r["msgs"]
         assert [m["uid"] for m in msgs] == ["3", "2", "9", "5"], msgs  # Date 倒序 (INBOX 纳入)
         assert [m["fldn"] for m in msgs] == ["INBOX", "已发送", "Bob", "Bob"]
@@ -1624,6 +1629,7 @@ def test_mail_all():
         r2 = mailmod.fetch_all({"email": "t@163.com", "auth": "k"},
                                "flagged", 30)
         assert r2["ok"] and [m["uid"] for m in r2["msgs"]] == ["2", "9"]
+        assert (r2.get("n_unseen"), r2.get("n_flagged")) == (0, 2), r2
         r3 = mailmod.fetch_all({"email": "t@163.com", "auth": "k"},
                                "unread", 30)   # 默认列表口径 = 未读∪旗标
         assert r3["ok"] and [m["uid"] for m in r3["msgs"]] == ["3", "2", "9", "5"], r3
