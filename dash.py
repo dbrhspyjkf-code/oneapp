@@ -4558,11 +4558,11 @@ class App:
                 pygame.draw.rect(surf, self.card(0), cell, border_radius=4)
                 pygame.draw.rect(surf, acc if sel else self.th("border"),
                                  cell, 2 if sel else 1, border_radius=4)
-                text(surf, clip_text(f["name"], 11, cw - 12), 11,
-                     hi if sel else soft, (x + 6, y + 4))
+                text(surf, clip_text(f["name"], 13, cw - 12), 13,
+                     hi if sel else soft, (x + 6, y + 5))
                 if f.get("unread", 0) > 0:
-                    text(surf, str(f["unread"]), 10, acc,
-                         (x + cw - 6, y + 6), right=True)
+                    text(surf, str(f["unread"]), 13, acc,
+                         (x + cw - 6, y + 5), right=True)
         self.tool_foot(surf, ["←→↑↓ 选夹", "Enter 打开", "Esc 返回"])
 
     def draw_mail_list(self, surf):
@@ -4600,8 +4600,8 @@ class App:
             text(surf, clip_text(m.get("from", ""), 13, W - 100), 13,
                  hi if sel else soft, (14, y + 3))
             text(surf, m.get("date", ""), 10, dim, (W - 16, y + 5), right=True)
-            text(surf, clip_text(m.get("subject", ""), 12, W - 60), 12,
-                 hi if unread else dim, (14, y + 18))
+            text(surf, clip_text(m.get("subject", ""), 13, W - 60), 13,
+                 hi if unread else dim, (14, y + 17))
             if m.get("flagged"):
                 pygame.draw.polygon(surf, acc, [(W - 22, y + 18),
                                                 (W - 14, y + 21),
@@ -4611,8 +4611,8 @@ class App:
             pv = m.get("preview", "")
             if m.get("fldn") and m.get("fld") != self.mail_folder:
                 pv = "[%s] %s" % (m["fldn"], pv)   # 聚合视图标注来源夹
-            text(surf, clip_text(pv, 10, W - 28), 10,
-                 dim, (14, y + 31))
+            text(surf, clip_text(pv, 13, W - 28), 13,
+                 dim, (14, y + 30))
         foot = ["4 刷新", "5 写邮件"]
         if not (self.mail_folder or "").startswith("@") \
                 and self.mail_has_more:
