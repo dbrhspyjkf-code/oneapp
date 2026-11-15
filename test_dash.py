@@ -1536,13 +1536,16 @@ def test_mail_sess():
 
 
 def test_driver_sym():
-    """ZERO 键盘修饰层解码 (纯函数): sym+2=@ (内核 sym 层码 27 错位免疫),
-    数字行全上档符号, sym/shift+字母大写, 回车/退格/空格原语义."""
+    """ZERO 键盘修饰层解码 (纯函数): 官方 sym 层码表 (launcher
+    cp0_keyboard_keymap.c default_keymap 同源) — sym+2=@ sym+b=.,
+    字母行全是标点: q=~ w=` e=_ r=- t=+ y== u=[ i=] o={ p=}
+    a=; s=: d=' (f 无) g=< h=> j=> k=\\ l=| v=, b=. n=/ m=?"""
     import dash
     mods_sym = {383: True, 389: False, 42: False}
-    mods_none = {383: False, 389: False, 42: False}
+    mods_none = {383: False, 389: False, 42: True}
     mods_shift = {383: False, 389: False, 42: True}
-    # sym 层内核码 (27=sym+2) → 丝印上档; 不受 DT keymap1 与丝印错位影响
+    # 数字行 (内核 sym 层码 → 丝印符号; 27=sym+2 内核发 27 而非 3)
+    assert dash.keychar(26, "[", mods_sym) == "!"
     assert dash.keychar(27, "]", mods_sym) == "@"
     assert dash.keychar(39, ";", mods_sym) == "#"
     assert dash.keychar(40, "'", mods_sym) == "$"
@@ -1552,21 +1555,42 @@ def test_driver_sym():
     assert dash.keychar(52, ".", mods_sym) == "*"
     assert dash.keychar(53, "/", mods_sym) == "("
     assert dash.keychar(94, "", mods_sym) == ")"
-    assert dash.keychar(26, "[", mods_sym) == "!"     # sym+1 (格 (4,4))
-    # sym + 字母 (字母在 sym 层发 KP 段码, uni 为空 → 按物理格反查)
-    assert dash.keychar(55, "", mods_sym) == "Q"
-    assert dash.keychar(79, "", mods_sym) == "A"
+    # 字母行全标点 (官方表) — sym+b=91="." (用户报障案例), sym+q=55="~"
+    assert dash.keychar(55, "", mods_sym) == "~"
+    assert dash.keychar(69, "", mods_sym) == "`"
+    assert dash.keychar(70, "", mods_sym) == "_"
+    assert dash.keychar(71, "", mods_sym) == "-"
+    assert dash.keychar(72, "", mods_sym) == "+"
+    assert dash.keychar(73, "", mods_sym) == "="
+    assert dash.keychar(74, "", mods_sym) == "["
+    assert dash.keychar(75, "", mods_sym) == "]"
+    assert dash.keychar(76, "", mods_sym) == "{"
+    assert dash.keychar(77, "", mods_sym) == "}"
+    assert dash.keychar(79, "", mods_sym) == ";"
+    assert dash.keychar(80, "", mods_sym) == ":"
+    assert dash.keychar(81, "", mods_sym) == "'"
+    assert dash.keychar(82, "", mods_sym) == '"'
+    assert dash.keychar(83, "", mods_sym) == "<"
+    assert dash.keychar(85, "", mods_sym) == ">"
+    assert dash.keychar(86, "", mods_sym) == "\\"
+    assert dash.keychar(89, "", mods_sym) == "|"
+    assert dash.keychar(90, "", mods_sym) == ","
+    assert dash.keychar(91, "", mods_sym) == "."
+    assert dash.keychar(92, "", mods_sym) == "/"
+    assert dash.keychar(93, "", mods_sym) == "?"
     # 保留键: 退格/回车/空格 不被 sym 改写
     assert dash.keychar(14, "", mods_sym) == ""
     assert dash.keychar(28, "", mods_sym) == ""
     assert dash.keychar(57, " ", mods_sym) == " "
+    # sym + 未表项字母 (基层码直发时) → 大写兜底
+    assert dash.keychar(30, "a", mods_sym) == "A"
     # shift 不换码表: 字母大写, 数字原样
     assert dash.keychar(30, "a", mods_shift) == "A"
     assert dash.keychar(3, "2", mods_shift) == "2"
     # 无修饰: 原样
     assert dash.keychar(3, "2", mods_none) == "2"
     assert dash.keychar(27, "]", mods_none) == "]"
-    print("driver sym OK (sym@/shiftcaps/keepkeys)")
+    print("driver sym OK (official sym table/@/.:letters-punct/shiftcaps)")
 
 
 def test_mail_compose():
