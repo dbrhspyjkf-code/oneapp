@@ -28,6 +28,7 @@ class FakeNet:
     def __init__(self):
         self.mode = "offline"
         self.got = []
+        self.jobs = []                       # (tag, fn) 云同步测试直调
 
     def probe(self):
         pass
@@ -43,6 +44,11 @@ class FakeNet:
 
     def job(self, tag, fn, ttl=600):
         self.got.append(("job", tag))
+        self.jobs.append((tag, fn))
+
+    def last_job(self, tag):
+        hit = [fn for t, fn in self.jobs if t == tag]
+        return hit[-1] if hit else None
 
     def invalidate(self, key):
         pass
@@ -1357,18 +1363,13 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=5) → Enter 开启被拒 (前三已开, 上限 3) + OSD 提醒
+    # sw:usage 行 (sel=7; 云地址/云TOKEN 两行插入后位移) → 开启被拒
+    # (前三已开, 上限 3) + OSD 提醒
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
-    app.set_sel = 5
-    print("DBG pre-toggle: tab", app.set_tab, "lv", getattr(app, "set_lv", None),
-          "sel", app.set_sel, "rid", app._set_rows()[5][0],
-          "usage", app.cfg["cards"].get("usage"), flush=True)
+    assert app._set_rows()[7][0] == "sw:usage"
+    app.set_sel = 7
     app.key(pygame.K_RETURN)
-    print("DBG post: usage", app.cfg["cards"].get("usage"),
-          "osd FULL:", repr(app.osd), flush=True)
     assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
-    print("DBG2 osd repr:", repr(app.osd), flush=True)
-    print("DBG2 contains:", "先关" in app.osd[0] if app.osd else None, flush=True)
     assert app.osd and "先关" in app.osd[0], app.osd
     # 关掉新闻后 → usage 可开
     app.cfg["cards"]["news"] = False
@@ -1392,6 +1393,119 @@ def test_settings_app():
     app.draw(canvas)
     print("settings app OK (tabs/key popup 0600/toggle/remind/theme apply/usage)")
 
+
+
+def test_cloud():
+    """想法云同步: 设置行/云配置保存→ping/文字上云幂等/删除联动 cdel/
+    tombstone 对账双向删/云端视图键位 (9 进 Enter 播 7 删 Esc 回)."""
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
+    app = dash.App(FakeNet())
+    assert [r[0] for r in app._set_rows()].count("key:cloud") == 1
+    # 云配置弹窗保存 → cfg 落盘 + ping 入队
+    app.tool = "set"
+    app.set_edit = "cloud"
+    app.set_buf = "https://notes.apisz.top/"
+    app.key(pygame.K_RETURN)
+    assert app.cfg["cloud_url"] == "https://notes.apisz.top/"
+    app.set_edit = "tok"
+    app.set_buf = "a" * 24
+    app.key(pygame.K_RETURN)
+    assert app.cfg["cloud_tok"] == "a" * 24
+    assert app.net.last_job("cloudping") is not None
+    orig_raw = netmod.http_raw
+    calls = []
+    netmod.http_raw = lambda url, **k: (
+        calls.append((k.get("method", "GET"), url))
+        or (200, json.dumps({"ok": 1, "user": "zero"}).encode()))
+    d = app.net.last_job("cloudping")()
+    assert d["ok"] == 1 and d["user"] == "zero"
+    app.on_net("data", "cloudping", d)
+    assert app.osd and "云连接 ✓" in app.osd[0]
+    # 文字想法提交 → cid 12hex + cloudsync job → POST 幂等键
+    app.tool = None
+    app.buf = "第一条云想法"
+    app.submit_idea()
+    it = app.ideas["texts"][-1]
+    assert it.get("cid") and len(it["cid"]) == 12
+    calls.clear()                          # ping 的 GET 出栈, 只看上传
+    d = app.net.last_job("cloudsync")()
+    assert d["up_ids"] == [it["cid"]] and not d["err"]
+    assert any(m == "POST" and u.endswith("/v1/notes") for m, u in calls)
+    app.on_net("data", "cloudsync", d)
+    assert app.ideas["texts"][-1]["up"] == 1
+    assert json.load(open(dash.IDEAS_FILE))["texts"][-1]["up"] == 1
+    # 本地删除 (有 cid) → cdel 队列 → 同步 DELETE → 队列清空
+    app.sel = 0
+    app.delete_selected()
+    assert app.ideas.get("cdel") == [it["cid"]]
+    calls.clear()
+    app._cloud_trig = 0.0
+    app.cloud_sync_trigger()
+    d = app.net.last_job("cloudsync")()
+    assert d["del_done"] == [it["cid"]]
+    assert any(m == "DELETE" and it["cid"] in u for m, u in calls)
+    app.on_net("data", "cloudsync", d)
+    assert app.ideas.get("cdel") == []
+    # tombstone 对账: 云端删 → 本地条目+文件清, csync 持久化
+    vp = os.path.join(tmp, "v1.wav")
+    open(vp, "wb").write(b"RIFF....")
+    app.ideas["voices"].append({"id": "v1", "cid": "c" * 12, "file": vp,
+                                "dur": 3, "createdAt": 1, "up": 1})
+    def raw_tomb(url, **k):
+        if "/v1/tombstones" in url:
+            return 200, json.dumps({"ids": ["c" * 12],
+                                    "now": 12345.0}).encode()
+        return 0, b""
+    netmod.http_raw = raw_tomb
+    app._cloud_trig = 0.0
+    app.cloud_sync_trigger()
+    d = app.net.last_job("cloudsync")()
+    assert d["gone_tomb"] and d["csync"] == 12345.0
+    app.on_net("data", "cloudsync", d)
+    assert app.ideas["voices"] == [] and not os.path.exists(vp)
+    assert json.load(open(dash.IDEAS_FILE))["csync"] == 12345.0
+    # 云端视图: 9 进 (触发 sync+list) → 光标 → Enter 下载播 → 7 删云+本地孪生 → Esc 回
+    netmod.http_raw = orig_raw
+    app.on_net("data", "cloudlist", {"ok": 1, "notes": [
+        {"id": "t" * 12, "kind": "text", "text": "云端文字",
+         "ts": 1794700000.0},
+        {"id": "c" * 12, "kind": "voice", "dur": 4, "ts": 1794700100.0}]})
+    app.page = 1
+    app.key(pygame.K_9)
+    assert app.iview == "cloud"
+    assert app.net.last_job("cloudlist") is not None
+    app.draw(canvas)
+    app.key(pygame.K_DOWN)
+    assert app.csel == 1
+    netmod.http_raw = lambda url, **k: (
+        (200, b"RIFFWAVE") if "/v1/voice/" in url else (0, b""))
+    app.key(pygame.K_RETURN)
+    d = app.net.last_job("cloudvoice")()
+    assert d["id"] == "c" * 12 and d["data"] == b"RIFFWAVE"
+    app.on_net("data", "cloudvoice", d)
+    assert os.path.exists("/tmp/oneapp_cloud_%s.wav" % ("c" * 12))
+    vp2 = "/tmp/oneapp_cloud_%s.wav" % ("c" * 12)
+    app.ideas["voices"].append({"id": "v2", "cid": "c" * 12, "file": vp2,
+                                "dur": 4, "createdAt": 2, "up": 1})
+    netmod.http_raw = lambda url, **k: (
+        (200, b"{}") if k.get("method") == "DELETE" else (0, b""))
+    app.key(pygame.K_7)
+    d = app.net.last_job("clouddel")()
+    assert d["id"] == "c" * 12 and d["st"] == 200
+    app.on_net("data", "clouddel", d)
+    assert [x["id"] for x in app.cloud_notes] == ["t" * 12]
+    assert app.ideas["voices"] == []
+    netmod.http_raw = orig_raw
+    app.key(pygame.K_ESCAPE)
+    assert app.iview == "local"
+    print("cloud OK (settings/ping/upload idempotent/cdel/tombstone/"
+          "cloud view keys)")
 
 
 def test_mail_keys():
@@ -2393,6 +2507,7 @@ if __name__ == "__main__":
     test_mail_utf7()
     test_mail_accounts()
     test_settings_app()
+    test_cloud()
     test_mail_keys()
     test_mail_all()
     test_mail_sess()

@@ -66,6 +66,25 @@ def http_json(url, timeout=8, post=None, headers=None):
         return None, None
 
 
+def http_raw(url, method="GET", body=None, headers=None, timeout=15):
+    """通用 HTTP (DELETE / raw-body POST / 带鉴权头下载), worker 线程用.
+    返回 (status, bytes); 网络不可达 status=0."""
+    hdrs = {"User-Agent": _UA}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+    try:
+        with _OPENER.open(req, timeout=timeout) as r:
+            return r.status, r.read(6 * 1024 * 1024)
+    except urllib.error.HTTPError as e:      # 4xx/5xx 也要拿到状态码
+        try:
+            return e.code, e.read(65536)
+        except Exception:
+            return e.code, b""
+    except Exception:
+        return 0, b""
+
+
 def _pub_json_direct(url, timeout=10, headers=None):
     """无代理 GET JSON (Net._do_pub direct=True 用)."""
     hdrs = {"User-Agent": _UA}

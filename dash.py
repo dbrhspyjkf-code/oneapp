@@ -490,6 +490,11 @@ def _split_width_segs(txt, size, vw):
     return segs or [""]
 
 
+def _cloud_id():
+    """云端条目 id (12 hex): 客户端生成 → 幂等上传/断网重传不产生重复."""
+    return "".join(random.choice("0123456789abcdef") for _ in range(12))
+
+
 def clip_text(s, size, maxw):
     """截断到 maxw 像素宽, 超出加省略号.
     邮件 preview 是 800 字符全文, 逐字符回退测宽是 O(n²) 渲染
@@ -1277,6 +1282,10 @@ class App:
         self.dialog = None                    # ("exit",) | ("del", item)
         # 想法 (本地 json) / 自选股 (本地 json, 种子兜底)
         self.ideas = netmod.load_json_file(IDEAS_FILE, {"texts": []})
+        self.iview = "local"                  # 想法视图: local=本地卡 cloud=云端列表
+        self.csel = 0                         # 云端列表光标
+        self.cloud_notes = []                 # 云端条目快照 (job 拉取)
+        self._cloud_trig = 0.0                # 上次云同步触发 (节流)
         self.watch = netmod.load_json_file(WATCH_FILE, WATCH_SEED)
         self.wx_loc = netmod.load_json_file(WX_LOC_FILE, None) or dict(WX_HOME)
         # 语音想法: 录音 (arecord) + 本地播放 (ffplay)
@@ -1540,6 +1549,59 @@ class App:
                 self.mu_lyr = self._pl_lrc_parse(b.get("synced") or "")
             if a.startswith("mail_") and isinstance(b, dict):
                 self.on_mail_net(a, b)
+            if a == "cloudsync" and isinstance(b, dict):
+                self.on_cloud_done(b)
+            elif a == "cloudlist" and isinstance(b, dict) \
+                    and not b.get("skip"):
+                self.cloud_notes = b.get("notes") or []
+                self.csel = max(0, min(self.csel,
+                                       len(self.cloud_notes) - 1))
+                if self.iview == "cloud":
+                    self.osd = ("云端 %d 条" % len(self.cloud_notes),
+                                time.monotonic() + 1.2)
+            elif a == "cloudvoice" and isinstance(b, dict) \
+                    and b.get("data"):
+                p = "/tmp/oneapp_cloud_%s.wav" % b["id"]
+                try:
+                    with open(p, "wb") as f:
+                        f.write(b["data"])
+                    self.play_voice({"id": "cloud-" + b["id"], "file": p,
+                                     "dur": b.get("dur") or 0})
+                except OSError:
+                    self.osd = ("播放失败", time.monotonic() + 1.2)
+            elif a == "clouddel" and isinstance(b, dict) \
+                    and not b.get("skip"):
+                cid = b.get("id")
+                if b.get("st") in (200, 404):   # 404=云端已无, 同样算成
+                    self.cloud_notes = [x for x in self.cloud_notes
+                                        if x.get("id") != cid]
+                    for key in ("voices", "texts"):   # 本地孪生同删
+                        keep = []
+                        for it in self.ideas.get(key, []):
+                            if it.get("cid") == cid:
+                                if key == "voices" and it.get("file"):
+                                    try:
+                                        os.remove(it["file"])
+                                    except OSError:
+                                        pass
+                                continue
+                            keep.append(it)
+                        self.ideas[key] = keep
+                    netmod.save_json_file(IDEAS_FILE, self.ideas)
+                    self.csel = max(0, min(self.csel,
+                                           len(self.cloud_notes) - 1))
+                    self.osd = ("已删除", time.monotonic() + 1.2)
+                else:
+                    self.osd = ("删除失败 HTTP %s" % b.get("st"),
+                                time.monotonic() + 1.5)
+            elif a == "cloudping" and isinstance(b, dict) \
+                    and not b.get("skip"):
+                if b.get("ok"):
+                    self.osd = ("云连接 ✓ %s" % b.get("user"),
+                                time.monotonic() + 2)
+                else:
+                    self.osd = ("云连接 ✗ HTTP %s" % b.get("st"),
+                                time.monotonic() + 2.5)
         elif kind == "error":                 # worker 里 fn 抛异常 (None) —
             if a.startswith("mail_list"):     # 以前静默吞, 失败根本不可见
                 self.mail_err = "网络异常 · 稍后刷新"
@@ -1550,6 +1612,11 @@ class App:
                 self.osd = ("发送失败: 网络异常", time.monotonic() + 3)
             elif a.startswith("mail_"):
                 self.osd = ("网络异常", time.monotonic() + 2.5)
+            elif a == "cloudsync":
+                if getattr(self, "_cloud_pend_n", 0) > 0:
+                    self.osd = ("云同步失败", time.monotonic() + 2)
+            elif a == "cloudping":
+                self.osd = ("云连接 ✗ 网络异常", time.monotonic() + 2)
         elif kind == "text":
             self.data[a] = b
             if b and a in ("quotes", "idx"):
@@ -1679,11 +1746,13 @@ class App:
     # ── 想法列表 (文字+语音按时间倒序合并) ──
     def idea_items(self):
         items = [{"kind": "text", "id": it.get("id"),
+                  "cid": it.get("cid"),
                   "text": it.get("text", ""),
                   "createdAt": it.get("createdAt", 0)}
                  for it in self.ideas.get("texts", [])]
         for it in self.ideas.get("voices", []):
             items.append({"kind": "voice", "id": it.get("id"),
+                          "cid": it.get("cid"),
                           "file": it.get("file", ""),
                           "dur": it.get("dur", 0),
                           "createdAt": it.get("createdAt", 0)})
@@ -2961,11 +3030,13 @@ class App:
         self.ideas.setdefault("texts", []).append({
             "id": "%d-%s" % (int(time.time() * 1000),
                              "".join(random.choice("0123456789abcdef") for _ in range(6))),
+            "cid": _cloud_id(),               # 云端 id (纯 hex, 幂等上传键)
             "text": txt, "createdAt": int(time.time() * 1000),
         })
         netmod.save_json_file(IDEAS_FILE, self.ideas)
         self.buf = ""
         self.in_input = False
+        self.cloud_sync_trigger()             # 后台上云 (本地已即时可见)
         self.osd = ("已保存", time.monotonic() + 1.2)
 
     def delete_selected(self):
@@ -2973,6 +3044,9 @@ class App:
         if not (0 <= self.sel < len(items)):
             return
         it = items[self.sel]
+        if it.get("cid"):
+            self.ideas.setdefault("cdel", []).append(it["cid"])
+            self.cloud_sync_trigger()         # 云端联动删除 (cdel 队列)
         if it["kind"] == "voice":
             self.ideas["voices"] = [x for x in self.ideas.get("voices", [])
                                     if x.get("id") != it["id"]]
@@ -2990,6 +3064,213 @@ class App:
         netmod.save_json_file(IDEAS_FILE, self.ideas)
         self.sel = max(0, self.sel - 1)
         self.osd = ("已删除", time.monotonic() + 1.2)
+
+    # ── 想法云同步 (noteserver ECS: 双写上传 + tombstone 双向删除) ──
+    def _cloud_cfg(self):
+        return ((self.cfg.get("cloud_url") or "").strip().rstrip("/"),
+                (self.cfg.get("cloud_tok") or "").strip())
+
+    def ensure_cids(self):
+        """存量想法补 cid (首次上云前一次性补齐, UI 线程内落盘)."""
+        ch = False
+        for key in ("texts", "voices"):
+            for it in self.ideas.get(key, []):
+                if not it.get("cid"):
+                    it["cid"] = _cloud_id()
+                    ch = True
+        if ch:
+            netmod.save_json_file(IDEAS_FILE, self.ideas)
+
+    def cloud_sync_trigger(self):
+        """后台双写: 上传 pending + 处理 cdel + tombstone 对账 (15s 节流)."""
+        url, tok = self._cloud_cfg()
+        if not (url and tok):
+            return
+        if time.monotonic() - self._cloud_trig < 15:
+            return
+        self._cloud_trig = time.monotonic()
+        self.ensure_cids()
+        self._cloud_pend_n = (
+            sum(1 for it in self.ideas.get("texts", []) if not it.get("up"))
+            + sum(1 for it in self.ideas.get("voices", []) if not it.get("up"))
+            + len(self.ideas.get("cdel", [])))
+        self.net.invalidate(("job", "cloudsync"))
+        self.net.job("cloudsync", self._cloud_sync_fn, ttl=30)
+
+    def _cloud_sync_fn(self):
+        """worker 线程: 只读快照+网络 IO, 状态变更全在 on_cloud_done.
+        顺序 = tombstone 对账 → cdel → 上传 (对账最便宜且不能被
+        pending 上传的持续失败阻塞)."""
+        url, tok = self._cloud_cfg()
+        if not (url and tok):
+            return {"skip": 1}
+        H = {"Authorization": "Bearer " + tok}
+        d = {"up_ids": [], "gone": [], "miss": [], "del_done": [],
+             "gone_tomb": [], "csync": None, "skip": 0, "err": None}
+        st, body = netmod.http_raw(                # 云端删 → 本地对账
+            url + "/v1/tombstones?since=%s" % self.ideas.get("csync", 0),
+            headers=H)
+        if st == 200:
+            try:
+                j = json.loads(body.decode("utf-8", "replace"))
+            except ValueError:
+                j = {}
+            local = {}
+            for key in ("texts", "voices"):
+                for it in self.ideas.get(key, []):
+                    if it.get("cid"):
+                        local[it["cid"]] = (key, it.get("file"))
+            for cid in j.get("ids") or []:
+                if cid in local:
+                    d["gone_tomb"].append((cid,) + local[cid])
+            d["csync"] = j.get("now")
+        elif st:                                   # 对账失败: 继续删/传 (不早退)
+            d["err"] = "对账失败 HTTP %s" % st
+        for cid in self.ideas.get("cdel", []):     # 本地删 → 云端联动删
+            st, _ = netmod.http_raw(url + "/v1/notes/" + cid,
+                                    method="DELETE", headers=H)
+            if st in (200, 404):
+                d["del_done"].append(cid)
+            else:
+                d["err"] = "删除失败 HTTP %s" % st
+                return d
+        for key in ("texts", "voices"):
+            for it in self.ideas.get(key, []):
+                if it.get("up") or not it.get("cid"):
+                    continue
+                if it.get("cid") in d["up_ids"]:   # 同 cid 去重
+                    continue
+                if key == "texts":
+                    body = json.dumps({"id": it["cid"],
+                                       "text": it.get("text", ""),
+                                       "ts": (it.get("createdAt") or 0) / 1000.0}).encode()
+                    st, _ = netmod.http_raw(url + "/v1/notes", method="POST",
+                                            body=body,
+                                            headers=dict(H, **{"Content-Type": "application/json"}))
+                else:
+                    try:
+                        with open(it.get("file") or "", "rb") as f:
+                            raw = f.read()
+                    except OSError:
+                        d["miss"].append(it["cid"])
+                        continue
+                    st, _ = netmod.http_raw(
+                        url + "/v1/voice/%s?dur=%s" % (
+                            it["cid"], it.get("dur") or 0),
+                        method="POST", body=raw,
+                        headers=dict(H, **{"Content-Type": "audio/wav"}))
+                if st == 200:
+                    d["up_ids"].append(it["cid"])
+                elif st == 409:                    # delete-wins: 本地丢弃
+                    d["gone"].append(it["cid"])
+                else:
+                    d["err"] = "HTTP %s" % st if st else "网络不可达"
+                    return d                       # 已收集进度照常回放
+        return d
+
+    def on_cloud_done(self, d):
+        """UI 线程应用同步结果: 标 up / 执行删除 / 收 cdel / 存 csync."""
+        if not isinstance(d, dict) or d.get("skip"):
+            return
+        ups = set(d.get("up_ids") or [])
+        gone = set(d.get("gone") or [])
+        miss = set(d.get("miss") or [])
+        tombset = {t[0] for t in (d.get("gone_tomb") or [])}
+        for key in ("texts", "voices"):
+            for it in self.ideas.get(key, []):
+                if it.get("cid") in ups:
+                    it["up"] = 1
+        dels = 0
+        for key in ("voices", "texts"):
+            keep = []
+            for it in self.ideas.get(key, []):
+                cid = it.get("cid")
+                if cid in gone or cid in miss or cid in tombset:
+                    dels += 1
+                    if key == "voices" and it.get("file"):
+                        try:
+                            os.remove(it["file"])
+                        except OSError:
+                            pass
+                    continue
+                keep.append(it)
+            self.ideas[key] = keep
+        if d.get("del_done"):
+            done = set(d["del_done"])
+            self.ideas["cdel"] = [c for c in self.ideas.get("cdel", [])
+                                  if c not in done]
+            dels += len(done)
+        if d.get("csync"):
+            self.ideas["csync"] = d["csync"]
+        netmod.save_json_file(IDEAS_FILE, self.ideas)
+        if ups or dels:
+            self.osd = ("云同步 +%d -%d" % (len(ups), dels),
+                        time.monotonic() + 1.5)
+
+    def cloud_list_fetch(self):
+        self.net.invalidate(("job", "cloudlist"))
+        self.net.job("cloudlist", self._cloud_list_fn, ttl=30)
+
+    def _cloud_list_fn(self):
+        url, tok = self._cloud_cfg()
+        if not (url and tok):
+            return {"skip": 1}
+        st, body = netmod.http_raw(url + "/v1/notes?limit=100", headers={
+            "Authorization": "Bearer " + tok})
+        if st != 200:
+            return None
+        j = json.loads(body.decode("utf-8", "replace"))
+        return {"ok": 1, "notes": j.get("notes") or []}
+
+    def cloud_voice_sel(self):
+        self.net.invalidate(("job", "cloudvoice"))
+        self.net.job("cloudvoice", self._cloud_voice_fn, ttl=30)
+        self.osd = ("下载中…", time.monotonic() + 3)
+
+    def _cloud_voice_fn(self):
+        url, tok = self._cloud_cfg()
+        it = self.cloud_notes[self.csel] \
+            if 0 <= self.csel < len(self.cloud_notes) else None
+        if not (url and tok) or not it or it.get("kind") != "voice":
+            return {"skip": 1}
+        st, body = netmod.http_raw(url + "/v1/voice/" + it["id"],
+                                   headers={"Authorization": "Bearer " + tok})
+        if st != 200:
+            return None
+        return {"id": it["id"], "dur": it.get("dur") or 0, "data": body}
+
+    def cloud_del_sel(self):
+        self.net.invalidate(("job", "clouddel"))
+        self.net.job("clouddel", self._cloud_del_fn, ttl=30)
+
+    def _cloud_del_fn(self):
+        url, tok = self._cloud_cfg()
+        it = self.cloud_notes[self.csel] \
+            if 0 <= self.csel < len(self.cloud_notes) else None
+        if not (url and tok) or not it:
+            return {"skip": 1}
+        st, _ = netmod.http_raw(url + "/v1/notes/" + it["id"],
+                                method="DELETE",
+                                headers={"Authorization": "Bearer " + tok})
+        return {"id": it["id"], "st": st}
+
+    def cloud_ping_trigger(self):
+        self.net.invalidate(("job", "cloudping"))
+        self.net.job("cloudping", self._cloud_ping_fn, ttl=10)
+
+    def _cloud_ping_fn(self):
+        url, tok = self._cloud_cfg()
+        if not (url and tok):
+            return {"skip": 1}
+        st, body = netmod.http_raw(url + "/v1/ping", timeout=8,
+                                   headers={"Authorization": "Bearer " + tok})
+        if st == 200:
+            try:
+                j = json.loads(body.decode("utf-8", "replace"))
+            except ValueError:
+                j = {}
+            return {"ok": 1, "user": j.get("user") or "?"}
+        return {"ok": 0, "st": st}
 
     # ── 语音想法: 录音存本地 / 本地播放 ──
     def rec_toggle(self):
@@ -3050,9 +3331,10 @@ class App:
             dst = os.path.join(VOICES_DIR, vid + ".wav")
             shutil.move(self.rec_path, dst)
             self.ideas.setdefault("voices", []).append(
-                {"id": vid, "file": dst, "dur": real,
+                {"id": vid, "cid": _cloud_id(), "file": dst, "dur": real,
                  "createdAt": int(time.time() * 1000)})
             netmod.save_json_file(IDEAS_FILE, self.ideas)
+            self.cloud_sync_trigger()
             self.osd = ("语音已保存 %ds" % real, time.monotonic() + 1.5)
         except Exception:
             self.osd = ("保存失败", time.monotonic() + 1.5)
@@ -3762,7 +4044,10 @@ class App:
             if self.page == 5:
                 self.tool_grid_key(k)
             elif self.page == 1:
-                self.move_sel(-2 if k == pygame.K_UP else -1)
+                if self.iview == "cloud":
+                    self.csel = max(0, self.csel - (2 if k == pygame.K_UP else 1))
+                else:
+                    self.move_sel(-2 if k == pygame.K_UP else -1)
             elif self.page == 2:
                 if k == pygame.K_LEFT:
                     self.radio_grp_cycle(-1)   # ← 切分组 (↑ 仍移光标)
@@ -3785,7 +4070,12 @@ class App:
             if self.page == 5:
                 self.tool_grid_key(k)
             elif self.page == 1:
-                self.move_sel(2 if k == pygame.K_DOWN else 1)
+                if self.iview == "cloud":
+                    n = len(self.cloud_notes)
+                    self.csel = max(0, min(n - 1, self.csel
+                                           + (2 if k == pygame.K_DOWN else 1)))
+                else:
+                    self.move_sel(2 if k == pygame.K_DOWN else 1)
             elif self.page == 2:
                 if k == pygame.K_RIGHT:
                     self.radio_grp_cycle(1)    # → 切分组 (↓ 仍移光标)
@@ -3810,6 +4100,9 @@ class App:
                 self.news_detail = None
             elif self.fdetail:                # 图表详情 → 关图表
                 self.fdetail = None
+            elif self.page == 1 and self.iview == "cloud":
+                self.iview = "local"          # 云端列表 → 本地卡片 (逐层)
+                self.csel = 0
             elif self.page != 0:
                 if self.fin_input or self.fin_sync:   # 输入态: Esc 先退输入
                     self.fin_input = self.fin_sync = False
@@ -3825,7 +4118,23 @@ class App:
                 self.esc_hold_at = time.monotonic()
                 # 主页长按 Esc 1s 退出 app (取消确认框交互, 与音乐播放页同款)
         elif self.page == 1:
+            if self.iview == "cloud":         # 云端列表: 只剩 播/删/回本地
+                if k == pygame.K_9:
+                    self.iview = "local"
+                elif k in (pygame.K_d, pygame.K_7) and self.cloud_notes:
+                    self.cloud_del_sel()
+                elif (k == pygame.K_8 or k in (pygame.K_RETURN,
+                                               pygame.K_KP_ENTER)) \
+                        and self.cloud_notes \
+                        and self.csel < len(self.cloud_notes):
+                    self.cloud_voice_sel()
+                return True
             items = self.idea_items()
+            if k == pygame.K_9:               # 云端视图 (触发双写对账+拉列表)
+                self.iview = "cloud"
+                self.csel = 0
+                self.cloud_sync_trigger()
+                self.cloud_list_fetch()
             if k == pygame.K_n or k == pygame.K_4:      # 增加
                 self.ime_clear()
                 self.in_input = True
@@ -3947,6 +4256,7 @@ class App:
             return [("theme:%d" % i, t["name"])
                     for i, t in enumerate(THEMES)]
         return [("key:glm", "GLM KEY"), ("key:ds", "DS KEY"),
+                ("key:cloud", "云地址"), ("key:tok", "云TOKEN"),
                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
                 ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡")]
 
@@ -3954,14 +4264,20 @@ class App:
         netmod.save_json_file(SETTINGS_FILE, self.cfg)
         self._usage_at = 0.0                   # KEY 变更 → 下轮 poll 重取 usage
 
+    SET_CFGKEYS = {"glm": "glm_key", "ds": "ds_key",
+                   "cloud": "cloud_url", "tok": "cloud_tok"}
+
     def set_key(self, k, ch):
         if self.set_edit is not None:          # KEY 弹窗编辑态: ASCII 直输
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                cfgkey = "glm_key" if self.set_edit == "glm" else "ds_key"
-                self.cfg[cfgkey] = self.set_buf.strip()
+                self.cfg[self.SET_CFGKEYS.get(self.set_edit,
+                                              "glm_key")] = \
+                    self.set_buf.strip()
                 self.cfg_save()
                 self.set_edit = None
                 self.osd = ("已保存", time.monotonic() + 1.5)
+                if self.cfg.get("cloud_url") and self.cfg.get("cloud_tok"):
+                    self.cloud_ping_trigger()  # 云配置保存 → 即时验证
                 return True
             if k == pygame.K_ESCAPE:
                 self.set_edit = None
@@ -4058,9 +4374,14 @@ class App:
                                  border_radius=3)
             text(surf, lab, 13, hi if sel else soft, (16, y))
             if rid.startswith("key:"):
-                v = self.cfg.get("glm_key" if rid == "key:glm" else "ds_key",
-                                 "")
-                text(surf, clip_text(self._set_mask(v) or "未设置", 12, 110),
+                if rid == "key:cloud":         # 云地址不掩码 (可直接核对)
+                    v = self.cfg.get("cloud_url", "")
+                else:
+                    v = self.cfg.get(
+                        {"key:glm": "glm_key", "key:ds": "ds_key",
+                         "key:tok": "cloud_tok"}.get(rid, "glm_key"), "")
+                text(surf, clip_text((self._set_mask(v) if rid != "key:cloud"
+                                      else v) or "未设置", 12, 110),
                      12, hi if v else dim, (W - 14, y), right=True)
                 if sel:
                     text(surf, "输入", 10, acc, (W - 90, y), right=True)
@@ -4082,7 +4403,9 @@ class App:
                     text(surf, "✓", 12, hi, (W - 16, y), right=True)
         # ── KEY 输入弹窗 (覆盖) ──
         if self.set_edit is not None:
-            lab = "输入 GLM KEY" if self.set_edit == "glm" else "输入 DS KEY"
+            lab = {"glm": "输入 GLM KEY", "ds": "输入 DS KEY",
+                   "cloud": "输入云地址 URL", "tok": "输入云 TOKEN"}.get(
+                       self.set_edit, "输入")
             box = pygame.Rect(30, 50, W - 60, 64)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
@@ -5438,10 +5761,13 @@ class App:
         border = self.th("border")
         items = self.idea_items()
         BODY = 13                                # 与农历/主页正文同字号
+        self.cloud_sync_trigger()                # 在页期间 15s 节流双写对账
+        if self.iview == "cloud":
+            return self._draw_ideas_cloud(surf)
 
         # 头部
         text(surf, "想法", 12, hi, (6, 3))
-        text(surf, "· %d 条" % len(items), 10, dim,
+        text(surf, "· %d 条 · 9 云端" % len(items), 10, dim,
              (6 + textw("想法", 12) + 6, 5))
 
         # 卡片网格 2×2: 4 张卡常驻 (时间行 + 内容 ≤2 行), 工具条固定在下方
@@ -5546,6 +5872,44 @@ class App:
             for lab in ("4 增加", "5 录音", "7 删除", "8 播放"):
                 text(surf, lab, 13, soft, (hx, 151))
                 hx += textw(lab, 13) + textw("我我我", 13)
+
+    def _draw_ideas_cloud(self, surf):
+        """云端列表 (9 键进入): 时间 + 文字/语音, Enter 下载播放, 7 删."""
+        hi, soft, dim = self.th("hi"), self.th("soft"), self.th("dim")
+        acc = self.th("accent")
+        notes = self.cloud_notes
+        text(surf, "想法·云端", 12, hi, (6, 3))
+        text(surf, "· %d 条" % len(notes), 10, dim,
+             (6 + textw("想法·云端", 12) + 6, 5))
+        if not notes:
+            textc(surf, "云端暂无条目", 13, dim, W // 2, 70)
+        else:
+            start = max(0, min(self.csel - 7, len(notes) - 8))
+            for i in range(8):
+                idx = start + i
+                if idx >= len(notes):
+                    break
+                it = notes[idx]
+                sel = idx == self.csel
+                y = 18 + i * 15
+                if sel:
+                    pygame.draw.rect(surf, self.th("track"),
+                                     (4, y - 1, W - 8, 14), border_radius=3)
+                ts = time.localtime(it.get("ts") or 0)
+                text(surf, "%02d-%02d %02d:%02d" % (ts.tm_mon, ts.tm_mday,
+                                                    ts.tm_hour, ts.tm_min),
+                     10, dim, (8, y + 1))
+                if it.get("kind") == "voice":
+                    text(surf, "▶ 语音 %ds" % (it.get("dur") or 0), 13,
+                         hi if sel else soft, (50, y))
+                else:
+                    text(surf, clip_text(it.get("text") or "", 13, W - 62),
+                         13, hi if sel else soft, (50, y))
+                if self.playing_voice \
+                        and self.playing_voice.get("id") == "cloud-" + it.get("id", ""):
+                    pygame.draw.polygon(surf, acc, [
+                        (W - 16, y + 1), (W - 16, y + 11), (W - 9, y + 6)])
+        text(surf, "9 本地 · Enter 播 · 7 删云", 13, soft, (6, 151))
 
     def _news_items(self):
         j = self.data.get("news") or {}
