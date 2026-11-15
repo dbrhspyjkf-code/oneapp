@@ -3938,10 +3938,10 @@ class App:
             r = rows[min(self.set_sel, len(rows) - 1)][0]
             if r == "key:glm":
                 self.set_edit = "glm"
-                self.set_buf = self.cfg.get("glm_key", "")
+                self.set_buf = ""           # 清空重输 (预填旧值会拼接污染)
             elif r == "key:ds":
                 self.set_edit = "ds"
-                self.set_buf = self.cfg.get("ds_key", "")
+                self.set_buf = ""
             elif r.startswith("sw:"):
                 ck = r.split(":", 1)[1]
                 cur = self.cfg["cards"].get(ck, ck != "usage")
