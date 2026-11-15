@@ -5608,8 +5608,8 @@ class App:
         # USAGE 卡: GLM / DeepSeek 轮播 (4s 切换, 无跑马灯)
         topu = tops.get("USAGE")
         if topu is not None:
-            g = self.data.get("usage_glm") or {}
-            d = self.data.get("usage_ds") or {}
+            g = self.data.get("usage:glm") or {}
+            d = self.data.get("usage:ds") or {}
             has_g = bool(self.cfg.get("glm_key"))
             has_d = bool(self.cfg.get("ds_key"))
             opts = []
