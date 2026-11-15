@@ -1363,11 +1363,11 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=7; 云地址/云TOKEN 两行插入后位移) → 开启被拒
+    # sw:usage 行 (sel=8; 云地址/云TOKEN/注册 三行插入后位移) → 开启被拒
     # (前三已开, 上限 3) + OSD 提醒
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
-    assert app._set_rows()[7][0] == "sw:usage"
-    app.set_sel = 7
+    assert app._set_rows()[8][0] == "sw:usage"
+    app.set_sel = 8
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
     assert app.osd and "先关" in app.osd[0], app.osd
@@ -1506,6 +1506,67 @@ def test_cloud():
     assert app.iview == "local"
     print("cloud OK (settings/ping/upload idempotent/cdel/tombstone/"
           "cloud view keys)")
+
+
+def test_reg():
+    """注册表单: 设置行进入/两字段输入 (name 自动小写)/↑↓ 换行/空值提示/
+    提交 cloudreg → 成功自动配 token+关表单+ping / 失败保表单 OSD / Esc 关."""
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    app = dash.App(FakeNet())
+    assert "reg" in [r[0] for r in app._set_rows()]
+    # rid=reg 行 (sel=4) → Enter 开表单
+    app.tool = "set"
+    assert app._set_rows()[4][0] == "reg"
+    app.set_sel = 4
+    app.key(pygame.K_RETURN)
+    assert app.reg == {"name": "", "invite": "", "field": 0}
+    # 输入: name 字段自动小写; ↑↓ 换行; invite 字段
+    for c in "AbC_01":
+        app.key(0, c)
+    assert app.reg["name"] == "abc_01"
+    app.key(pygame.K_UP)
+    for c in "DEADbeef01":
+        app.key(0, c)
+    assert app.reg["invite"] == "deadbeef01"
+    app.draw(canvas)                       # 表单渲染冒烟
+    # 清空邀请码 → Enter 提示都要填
+    while app.reg["invite"]:
+        app.key(pygame.K_BACKSPACE)
+    app.key(pygame.K_RETURN)
+    assert app.osd and "都要填" in app.osd[0]
+    # 提交: http_raw 桩 200 → 自动配 token + 关表单 + ping 入队
+    app.reg["invite"] = "deadbeef01"       # 重填 (上面清空做过空值校验)
+    orig_raw = netmod.http_raw
+    netmod.http_raw = lambda url, **k: (200, json.dumps(
+        {"ok": 1, "user": "abc_01", "token": "t" * 24}).encode())
+    app.key(pygame.K_RETURN)
+    d = app.net.last_job("cloudreg")()
+    assert d["ok"] == 1 and d["token"] == "t" * 24
+    app.on_net("data", "cloudreg", d)
+    assert app.reg is None and app.cfg["cloud_tok"] == "t" * 24
+    assert app.cfg["cloud_url"] == dash.CLOUD_URL_DEFAULT  # 空云地址自动配
+    assert app.net.last_job("cloudping") is not None
+    assert app.osd and "注册成功" in app.osd[0]
+    json.load(open(dash.SETTINGS_FILE))    # settings.json 落盘可解析
+    # 失败: 403 邀请码无效 → 表单保留 + OSD
+    netmod.http_raw = lambda url, **k: (403, json.dumps(
+        {"err": "邀请码无效"}).encode())
+    app.reg = {"name": "bob", "invite": "xx", "field": 0}
+    app.key(pygame.K_RETURN)
+    d = app.net.last_job("cloudreg")()
+    assert d["ok"] == 0 and d["err"] == "邀请码无效"
+    app.on_net("data", "cloudreg", d)
+    assert app.reg == {"name": "bob", "invite": "xx", "field": 0}
+    assert app.osd and "注册失败" in app.osd[0]
+    netmod.http_raw = orig_raw
+    app.key(pygame.K_ESCAPE)               # Esc 关表单, 留在设置页
+    assert app.reg is None and app.tool == "set"
+    print("reg OK (form/fields/submit/auto-config/fail-retain/esc)")
 
 
 def test_mail_keys():
@@ -2508,6 +2569,7 @@ if __name__ == "__main__":
     test_mail_accounts()
     test_settings_app()
     test_cloud()
+    test_reg()
     test_mail_keys()
     test_mail_all()
     test_mail_sess()

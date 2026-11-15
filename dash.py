@@ -717,6 +717,7 @@ MU_OUT_CACHE = os.path.join(STATE_DIR, "mu_out.json")   # 音乐输出 (按设�
 TV_LAST_CACHE = os.path.join(STATE_DIR, "tv_last.json")  # 电视上次分组/光标
 TV_FAV_CACHE = os.path.join(STATE_DIR, "tv_fav.json")    # 电视收藏 (频道名表)
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
+CLOUD_URL_DEFAULT = "https://notes.apisz.top"   # 注册成功自动配 (可改设置)
 CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
 _SENT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "data", "daily_sentences.csv")   # 内置 1440 句 (217KB)
@@ -1461,6 +1462,8 @@ class App:
         self.set_tab = 0                       # 设置页签 (0=卡片 1=主题)
         self.set_sel = 0                       # 页签内行光标
         self.set_edit = None                   # None=常态 glm/ds=KEY 弹窗
+        self.reg = None                        # 注册表单态 {name,invite,field}
+        self.reg_busy = False                  # 注册提交中 (防重复)
         self.set_buf = ""
         self._usage_at = 0.0
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
@@ -1602,6 +1605,23 @@ class App:
                 else:
                     self.osd = ("云连接 ✗ HTTP %s" % b.get("st"),
                                 time.monotonic() + 2.5)
+            elif a == "cloudreg" and isinstance(b, dict):
+                self.reg_busy = False
+                if b.get("ok") and b.get("token"):
+                    if not self.cfg.get("cloud_url"):
+                        self.cfg["cloud_url"] = b.get("url") \
+                            or CLOUD_URL_DEFAULT
+                    self.cfg["cloud_tok"] = b["token"]
+                    self.cfg_save()
+                    self.reg = None            # 成功: 关表单 + ping 验证
+                    self.cloud_ping_trigger()
+                    self.osd = ("注册成功 已连接 %s" % b.get("user"),
+                                time.monotonic() + 2.5)
+                else:
+                    err = b.get("err") or ("HTTP %s" % b.get("st")
+                                           if b.get("st") else "网络异常")
+                    self.osd = ("注册失败 %s" % err,
+                                time.monotonic() + 2.5)
         elif kind == "error":                 # worker 里 fn 抛异常 (None) —
             if a.startswith("mail_list"):     # 以前静默吞, 失败根本不可见
                 self.mail_err = "网络异常 · 稍后刷新"
@@ -1617,6 +1637,9 @@ class App:
                     self.osd = ("云同步失败", time.monotonic() + 2)
             elif a == "cloudping":
                 self.osd = ("云连接 ✗ 网络异常", time.monotonic() + 2)
+            elif a == "cloudreg":
+                self.reg_busy = False
+                self.osd = ("注册失败 网络异常", time.monotonic() + 2.5)
         elif kind == "text":
             self.data[a] = b
             if b and a in ("quotes", "idx"):
@@ -3994,9 +4017,11 @@ class App:
         # 换肤键 t 仅主页 (工具内 t 是输入字符, 不劫持).
         if self.tool:
             if k == pygame.K_ESCAPE:
-                if self.tool == "set" and self.set_edit is not None:
-                    self.set_edit = None       # 关 KEY 弹窗, 保持在设置页
-                    self.set_buf = ""
+                if self.tool == "set" and (self.set_edit is not None
+                                           or self.reg is not None):
+                    self.set_edit = None       # 关 KEY 弹窗/注册表单,
+                    self.set_buf = ""          #   保持在设置页
+                    self.reg = None
                     return True
                 if self.tool == "tv" and self.tv_playing:
                     self.tv_stop()             # 播放态 Esc → 回列表 (不退 app)
@@ -4257,6 +4282,7 @@ class App:
                     for i, t in enumerate(THEMES)]
         return [("key:glm", "GLM KEY"), ("key:ds", "DS KEY"),
                 ("key:cloud", "云地址"), ("key:tok", "云TOKEN"),
+                ("reg", "注册新账号"),
                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
                 ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡")]
 
@@ -4268,6 +4294,8 @@ class App:
                    "cloud": "cloud_url", "tok": "cloud_tok"}
 
     def set_key(self, k, ch):
+        if self.reg is not None:               # 注册表单态: 两字段 ASCII
+            return self._reg_key(k, ch)
         if self.set_edit is not None:          # KEY 弹窗编辑态: ASCII 直输
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.cfg[self.SET_CFGKEYS.get(self.set_edit,
@@ -4327,7 +4355,57 @@ class App:
                 json.dump({"idx": self.theme_idx}, open(THEME_FILE, "w"))
                 self.osd = ("主题: " + THEMES[self.theme_idx]["name"],
                             time.monotonic() + 2)
+            elif rid == "reg":                 # 注册表单 (用户名+邀请码)
+                self.reg = {"name": "", "invite": "", "field": 0}
         return True
+
+    def _reg_key(self, k, ch):
+        """注册表单键流: ↑↓ 换字段 / ASCII 直输 (name 强制小写) /
+        Enter 提交 cloudreg / Esc 关表单."""
+        f = self.reg
+        if k == pygame.K_ESCAPE:
+            self.reg = None
+            return True
+        if k in (pygame.K_UP, pygame.K_DOWN):
+            f["field"] = (f["field"] + 1) % 2
+            return True
+        if k == pygame.K_BACKSPACE:
+            key = ("name", "invite")[f["field"]]
+            f[key] = f[key][:-1]
+            return True
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if self.reg_busy:
+                return True
+            if not f["name"] or not f["invite"]:
+                self.osd = ("用户名和邀请码都要填", time.monotonic() + 2)
+                return True
+            self.reg_busy = True
+            self.net.invalidate(("job", "cloudreg"))
+            self.net.job("cloudreg", self._cloud_reg_fn, ttl=10)
+            self.osd = ("注册中…", time.monotonic() + 5)
+            return True
+        if ch and 0x20 <= ord(ch) < 0x7F:
+            key = ("name", "invite")[f["field"]]
+            cap = 16 if f["field"] == 0 else 24
+            f[key] = (f[key] + ch.lower())[:cap]   # 用户名/邀请码都小写
+        return True
+
+    def _cloud_reg_fn(self):
+        """worker: POST /v1/register (免鉴权端点) → {ok,st,err,token,user}."""
+        f = self.reg or {}
+        url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
+        body = json.dumps({"name": f.get("name", ""),
+                           "invite": f.get("invite", "")}).encode()
+        st, rbody = netmod.http_raw(url + "/v1/register", method="POST",
+                                    body=body, timeout=10,
+                                    headers={"Content-Type":
+                                             "application/json"})
+        try:
+            j = json.loads(rbody.decode("utf-8", "replace"))
+        except ValueError:
+            j = {}
+        return {"ok": 1 if st == 200 else 0, "st": st, "err": j.get("err"),
+                "token": j.get("token"), "user": j.get("user"), "url": url}
 
     def _set_mask(self, v):
         return ("..." + v[-6:]) if len(v) > 10 else v
@@ -4414,6 +4492,31 @@ class App:
                  soft, (box.x + 12, box.y + 30))   # 尾窗 28 字符防溢出
             text(surf, "Enter 保存 · Esc 取消", 10, dim,
                  (box.x + 12, box.y + 46))
+        # ── 注册表单 (覆盖): 用户名 / 邀请码 两字段 ──
+        if self.reg is not None:
+            box = pygame.Rect(24, 44, W - 48, 94)
+            pygame.draw.rect(surf, self.card(0), box, border_radius=6)
+            pygame.draw.rect(surf, acc, box, 2, border_radius=6)
+            text(surf, "注册云端账号", 13, hi, (box.x + 12, box.y + 8))
+            for i, (lab2, key2) in enumerate((("用户名", "name"),
+                                              ("邀请码", "invite"))):
+                y2 = box.y + 30 + i * 18
+                cur = self.reg["field"] == i
+                text(surf, lab2, 12, acc if cur else dim, (box.x + 12, y2))
+                val = self.reg[key2]
+                shown = clip_text(val[-22:] + ("_" if cur else ""), 12, 150)
+                text(surf, shown, 12, hi if val else dim,
+                     (box.x + 62, y2))
+            text(surf, "↑↓ 换行 · Enter 注册 · Esc 取消", 10, dim,
+                 (box.x + 12, box.y + 68))
+            if self.reg_busy:
+                text(surf, "注册中…", 12, acc,
+                     (box.right - 12, box.y + 68), right=True)
+            elif self.osd and "失败" in self.osd[0]:
+                text(surf, clip_text(self.osd[0], 10, 130), 10,
+                     self.th("danger"), (box.right - 12, box.y + 69),
+                     right=True)
+
     def tool_open(self, tid):
         self.tool = tid
         self.cv_armed = False
