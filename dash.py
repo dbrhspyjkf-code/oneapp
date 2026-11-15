@@ -4572,11 +4572,11 @@ class App:
                 f = self.mail_folders[idx]
                 nm = f["name"]
                 if f["raw"] == "@unread":
-                    c = self.mail_unread_n.get(em, 0)
-                    nm = ("未读 %d" % c) if c else "未读"
+                    cnt = self.mail_unread_n.get(em, 0)
+                    nm = ("未读 %d" % cnt) if cnt else "未读"
                 elif f["raw"] == "@flagged":
-                    c = self.mail_flag_n.get(em, 0)
-                    nm = ("红旗 %d" % c) if c else "红旗"
+                    cnt = self.mail_flag_n.get(em, 0)
+                    nm = ("红旗 %d" % cnt) if cnt else "红旗"
                 x = 6 + c * cw
                 y = 18 + r * 30
                 cell = pygame.Rect(x + 1, y, cw - 2, 26)
