@@ -499,16 +499,16 @@ def _search_uf(M):
     return sorted(out, key=int)
 
 
-def fetch_all(acct, which="uf", limit=30):
+def fetch_all(acct, which="unread", limit=30):
     """全账号聚合: uf=未读+旗标 / unseen=仅未读 / flagged=仅红旗,
     跨全部文件夹含 INBOX (只跳垃圾/广告/订阅/草稿). 163 网页版的「未读邮件/
     红旗邮件」智能视图 IMAP 不暴露 (2026-11-15 实测 LIST 仅真实夹) —
     手动逐夹搜索聚合; 会话复用下 30+ 夹约 3-6s, UI 侧 TTL 缓解.
     返回 msgs 带 fld (raw 夹名) / fldn (显示名) — 详情/标记须按夹操作.
-    which: uf/unseen/unread = 未读∪旗标 (默认列表口径); flagged = 仅旗标."""
-    keys = {"flagged": ("FLAGGED",)}.get(which, ("UNSEEN", "FLAGGED"))
-    # 全部未读视图 = UNSEEN ∪ FLAGGED (旗标件是用户待办, 默认列表不丢;
-    # 仅"全部红旗"视图单键 FLAGGED)
+    which: unread/unseen = 仅未读 (默认); flagged = 仅旗标."""
+    keys = {"flagged": ("FLAGGED",)}.get(which, ("UNSEEN",))
+    # 视图口径 (用户定版): 全部未读 = 仅未读; 全部红旗 = 仅旗标 —
+    # 各自单键搜索 (曾用合并键致 "未读 1" 点开显示 8 封)
     M, err = _connect(acct)
     if err:
         return {"ok": False, "err": err}

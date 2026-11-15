@@ -1614,15 +1614,14 @@ def test_mail_all():
         mailmod._SESS.update(M=None, email="", at=0.0)
         r = mailmod.fetch_all({"email": "t@163.com", "auth": "k"}, "uf", 30)
         assert r["ok"], r
-        assert r["total"] == 4, r                       # INBOX 1 + Bob 2 + 已发送 1
-        assert (r.get("n_unseen"), r.get("n_flagged")) == (3, 2), r
+        assert r["total"] == 3, r                       # 仅未读: INBOX 1 + Bob 2 (已发送旗标不进未读视图)
+        assert (r.get("n_unseen"), r.get("n_flagged")) == (3, 0), r
         msgs = r["msgs"]
-        assert [m["uid"] for m in msgs] == ["3", "2", "9", "5"], msgs  # Date 倒序 (INBOX 纳入)
-        assert [m["fldn"] for m in msgs] == ["INBOX", "已发送", "Bob", "Bob"]
+        assert [m["uid"] for m in msgs] == ["3", "9", "5"], msgs       # Date 倒序 (仅未读)
+        assert [m["fldn"] for m in msgs] == ["INBOX", "Bob", "Bob"]
         assert not msgs[0]["flagged"] and not msgs[0]["seen"]   # INBOX 新未读
-        assert msgs[1]["flagged"] and msgs[1]["seen"]   # 已发送副本双旗态
-        assert msgs[2]["flagged"] and not msgs[2]["seen"]
-        assert msgs[3]["seen"] and not msgs[3]["flagged"]
+        assert msgs[1]["flagged"] and not msgs[1]["seen"]       # Bob 旗标件
+        assert msgs[2]["seen"] and not msgs[2]["flagged"]
         assert all(m["preview"].startswith("hello") for m in msgs)
         assert "INBOX" in selected                # INBOX 纳入聚合 (默认视图=聚合)
         assert "Junk" not in selected and "Drafts" not in selected
@@ -1631,8 +1630,8 @@ def test_mail_all():
         assert r2["ok"] and [m["uid"] for m in r2["msgs"]] == ["2", "9"]
         assert (r2.get("n_unseen"), r2.get("n_flagged")) == (0, 2), r2
         r3 = mailmod.fetch_all({"email": "t@163.com", "auth": "k"},
-                               "unread", 30)   # 默认列表口径 = 未读∪旗标
-        assert r3["ok"] and [m["uid"] for m in r3["msgs"]] == ["3", "2", "9", "5"], r3
+                               "unread", 30)   # UI 别名: 仅未读单键
+        assert r3["ok"] and [m["uid"] for m in r3["msgs"]] == ["3", "9", "5"], r3
     finally:
         mailmod.imaplib.IMAP4_SSL = orig_cls
         mailmod._SESS.update(M=None, email="", at=0.0)
