@@ -666,7 +666,7 @@ TOOL_APPS = [("fx", "汇率"), ("unit", "单位换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
              ("music", "音乐"), ("mail", "邮件"), ("tv", "电视")]
 TOOL_GRID = 5                            # 每行卡片数
-MAIL_BODY_ROWS = 6                       # 邮件详情每屏正文行数 (12px)
+MAIL_BODY_ROWS = 5                       # 邮件详情每屏正文行数 (13px, 用户定版原生字号)
 
 # 音乐 app: 本地曲库 (mp3/flac/wav 直读) + QQ/网易云直连 provider (musrc.py,
 # 扫码绑定后走同一播放页), 输出仅本机 (商店版无 AirPlay/音箱遥控)。
@@ -4351,7 +4351,7 @@ class App:
         if self._mail_body_cache[0] != key:
             lines = []
             for para in (self.mail_body or "获取中…").splitlines():
-                w = self._wrap_lines(para, 12, W - 14, 80)
+                w = self._wrap_lines(para, 13, W - 14, 80)
                 lines.extend(w if w else [""])
             self._mail_body_cache = (key, lines[:300])
         return self._mail_body_cache[1]
@@ -4506,7 +4506,7 @@ class App:
         surf.set_clip((0, by, W, 148 - by))
         for i, ln in enumerate(lines[self.mail_body_scroll:
                                      self.mail_body_scroll + MAIL_BODY_ROWS]):
-            text(surf, ln, 12, soft, (6, by + i * 15))
+            text(surf, ln, 13, soft, (6, by + i * 16))
         surf.set_clip(None)
         if self.mail_body_scroll > 0:          # 右上/右下滚动指示 (新闻详情同款)
             pygame.draw.polygon(surf, dim, [(W - 11, by + 4), (W - 4, by + 4),
