@@ -1351,12 +1351,23 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=5) → Enter 开启; 全部 4 张 → 超 3 提醒
+    # sw:usage 行 (sel=5) → Enter 开启被拒 (前三已开, 上限 3) + OSD 提醒
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
     app.set_sel = 5
+    print("DBG pre-toggle: tab", app.set_tab, "lv", getattr(app, "set_lv", None),
+          "sel", app.set_sel, "rid", app._set_rows()[5][0],
+          "usage", app.cfg["cards"].get("usage"), flush=True)
+    app.key(pygame.K_RETURN)
+    print("DBG post: usage", app.cfg["cards"].get("usage"),
+          "osd FULL:", repr(app.osd), flush=True)
+    assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
+    print("DBG2 osd repr:", repr(app.osd), flush=True)
+    print("DBG2 contains:", "先关" in app.osd[0] if app.osd else None, flush=True)
+    assert app.osd and "先关" in app.osd[0], app.osd
+    # 关掉新闻后 → usage 可开
+    app.cfg["cards"]["news"] = False
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is True
-    assert app.osd and "最多" in app.osd[0], app.osd
     app.draw(canvas)                          # 设置页渲染冒烟 (KEY 掩码/开关)
     # 主题页签: ←→ 切到 主题 → 选 纯黑 (theme:6) → theme_idx 应用
     app.key(pygame.K_LEFT)                    # ← 左页签 (主题在左? 方向循环)

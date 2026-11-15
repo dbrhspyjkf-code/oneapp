@@ -3976,14 +3976,18 @@ class App:
             elif rid.startswith("sw:"):
                 ck = rid.split(":", 1)[1]
                 cur = self.cfg["cards"].get(ck, ck != "usage")
-                self.cfg["cards"][ck] = not cur
-                self.cfg_save()
-                if self.cfg["cards"][ck]:
+                if cur:                          # ON → OFF 随意
+                    self.cfg["cards"][ck] = False
+                    self.cfg_save()
+                else:                            # OFF → ON 须 ≤3 张
                     on = sum(1 for v in self.cfg["cards"].values()
                              if v)
-                    if on > 3:
-                        self.osd = ("主页最多显示 3 卡",
+                    if on >= 3:
+                        self.osd = ("最多 3 卡, 请先关一个",
                                     time.monotonic() + 2.5)
+                    else:
+                        self.cfg["cards"][ck] = True
+                        self.cfg_save()
             elif rid.startswith("theme:"):
                 self.theme_idx = int(rid.split(":", 1)[1]) % len(THEMES)
                 json.dump({"idx": self.theme_idx}, open(THEME_FILE, "w"))
