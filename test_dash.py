@@ -1331,7 +1331,7 @@ def test_mail_accounts():
 
 
 def test_settings_app():
-    """设置页: KEY 掩码编辑保存 (0600) / 卡片勾选与超 3 提醒 / USAGE 渲染."""
+    """设置页(左右分栏): KEY 弹窗编辑保存 (0600) / 卡片开关与超 3 提醒 / USAGE 渲染."""
     import dash
     pygame.init()
     pygame.display.set_mode((1, 1))
@@ -1339,35 +1339,36 @@ def test_settings_app():
     tmp = tempfile.mkdtemp(prefix="oneapp")
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     app = dash.App(FakeNet())
-    app.tool = "set"
-    # KEY 编辑: GLM KEY 第 0 行
-    app.key(pygame.K_RETURN)                      # 进入编辑
+    app.tool = "set"                          # 左列分类层 (默认选 卡片)
+    assert app.set_lv == "cats" and app.set_cat == 0
+    # → 进右侧 detail (卡片分类)
+    app.key(pygame.K_RETURN)
+    assert app.set_lv == "detail" and app.set_sel == 0
+    # sel=0 = GLM KEY → Enter 弹窗 → 输入 → Enter 保存
+    app.key(pygame.K_RETURN)
+    assert app.set_edit == "glm"
     for c in "abc123":
         app.key(0, c)
-    app.key(pygame.K_RETURN)                      # 保存退出编辑
+    app.key(pygame.K_RETURN)                  # 保存
+    assert app.set_edit is None
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # 卡片勾选: 移到 USAGE 行 (第 5) 开启; 4 个全开 → 提醒 OSD
+    # ↓ 到 sw:usage (第 5 行) → Enter 开启; 前三默认开 + usage = 4 → 超 3 提醒
+    app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
     app.set_sel = 5
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is True
-    on = sum(1 for v in app.cfg["cards"].values() if v)
-    assert on <= 4
-    # 默认三卡全开时再开第 4 → osd 提醒
-    app.cfg["cards"].update(hitokoto=True, news=True, fin=True, usage=True)
-    app.cfg_save()
-    app.key(pygame.K_RETURN)                      # toggle 关
-    app.key(pygame.K_RETURN)                      # toggle 开 → 超过 3
     assert app.osd and "最多" in app.osd[0], app.osd
-    app.draw(canvas)                              # 设置页渲染冒烟
-    # 主页: USAGE 开启 → 4 卡渲染 + 轮播双源
+    app.draw(canvas)                          # 设置页渲染冒烟 (含开关/KEY 掩码)
+    # 主页: USAGE 卡渲染 (真实轮播数据)
     app.tool = None
     app.page = 0
     app.data["usage_glm"] = {"ok": True, "p5": 12, "pw": 34}
     app.data["usage_ds"] = {"ok": True, "cny": "110.00"}
     app.draw(canvas)
-    print("settings app OK (key edit 0600/toggle/remind/usage render)")
+    print("settings app OK (cats/detail/key popup 0600/toggle/remind/usage)")
+
 
 
 def test_mail_keys():

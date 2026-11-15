@@ -1418,8 +1418,10 @@ class App:
         self.cfg.setdefault("glm_key", "")
         self.cfg.setdefault("ds_key", "")
         self.cfg.setdefault("cards", {})
-        self.set_sel = 0
-        self.set_edit = None
+        self.set_cat = 0                       # 设置左列分类 (0=卡片 1=主题)
+        self.set_lv = "cats"                   # cats=左列 detail=右侧选项
+        self.set_sel = 0                       # detail 行光标
+        self.set_edit = None                   # None=常态 "glm"/"ds"=KEY 弹窗
         self.set_buf = ""
         self._usage_at = 0.0
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
@@ -3880,39 +3882,67 @@ class App:
         except Exception:
             pass
 
-    # ── 工具·设置: API KEY (ASCII 掩码编辑) + 主页卡片勾选 (settings.json 0600) ──
-    SET_ROWS = ("glm", "ds", "c:hitokoto", "c:news", "c:fin", "c:usage")
+    # ── 工具·设置: 左列分类 + 右侧选项 (API KEY 弹窗输入 / 卡片开关) ──
+    SET_CATS = ("卡片", "主题")
+    CAT_ROWS = {
+        "卡片": [("key:glm", "GLM KEY"), ("key:ds", "DS KEY"),
+                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
+                 ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡")],
+        "主题": [("theme", "切换主题")],
+    }
 
     def cfg_save(self):
         netmod.save_json_file(SETTINGS_FILE, self.cfg)
         self._usage_at = 0.0                   # KEY 变更 → 下轮 poll 重取 usage
 
     def set_key(self, k, ch):
-        if self.set_edit is not None:          # KEY 编辑态: ASCII 直输
-            if k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE):
-                key = ("glm_key", "ds_key")[self.set_edit]
-                self.cfg[key] = self.set_buf.strip()
+        if self.set_edit is not None:          # 弹窗编辑态: ASCII 直输
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                cfgkey = "glm_key" if self.set_edit == "glm" else "ds_key"
+                self.cfg[cfgkey] = self.set_buf.strip()
                 self.cfg_save()
                 self.set_edit = None
                 self.osd = ("已保存", time.monotonic() + 1.5)
+                return True
+            if k == pygame.K_ESCAPE:
+                self.set_edit = None
+                self.set_buf = ""
                 return True
             if k == pygame.K_BACKSPACE:
                 self.set_buf = self.set_buf[:-1]
             elif ch and 0x20 <= ord(ch) < 0x7F:
                 self.set_buf = (self.set_buf + ch)[:64]
             return True
+        rows = self.CAT_ROWS.get(self.SET_CATS[self.set_cat], ())
+        if self.set_lv == "cats":              # 左列分类选择
+            if k in (pygame.K_UP, pygame.K_DOWN):
+                d = 1 if k == pygame.K_DOWN else -1
+                self.set_cat = max(0, min(len(self.SET_CATS) - 1,
+                                          self.set_cat + d))
+                self.set_sel = 0
+                return True
+            if k in (pygame.K_RIGHT, pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.set_lv = "detail"
+                self.set_sel = 0
+                return True
+            return True
+        # ── detail 层: 行选择与动作 ──
+        if k in (pygame.K_LEFT, pygame.K_ESCAPE):
+            self.set_lv = "cats"
+            return True
         if k in (pygame.K_UP, pygame.K_DOWN):
             d = 1 if k == pygame.K_DOWN else -1
-            self.set_sel = max(0, min(len(self.SET_ROWS) - 1,
-                                      self.set_sel + d))
+            self.set_sel = max(0, min(len(rows) - 1, self.set_sel + d))
             return True
         if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            r = self.SET_ROWS[self.set_sel]
-            if r in ("glm", "ds"):
-                self.set_edit = 0 if r == "glm" else 1
-                self.set_buf = self.cfg.get(
-                    "glm_key" if r == "glm" else "ds_key", "")
-            else:                              # 卡片勾选 toggle
+            r = rows[min(self.set_sel, len(rows) - 1)][0]
+            if r == "key:glm":
+                self.set_edit = "glm"
+                self.set_buf = self.cfg.get("glm_key", "")
+            elif r == "key:ds":
+                self.set_edit = "ds"
+                self.set_buf = self.cfg.get("ds_key", "")
+            elif r.startswith("sw:"):
                 ck = r.split(":", 1)[1]
                 cur = self.cfg["cards"].get(ck, ck != "usage")
                 self.cfg["cards"][ck] = not cur
@@ -3922,43 +3952,77 @@ class App:
                     if on > 3:
                         self.osd = ("主页最多显示 3 卡",
                                     time.monotonic() + 2.5)
-            return True
+            elif r == "theme":
+                self.cycle_theme()
         return True
+
+    def _set_mask(self, v):
+        return ("..." + v[-6:]) if len(v) > 10 else v
 
     def draw_set(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
-        self.tool_head(surf, "设置", "%d 项" % len(self.SET_ROWS))
-        rows = [("GLM KEY", self.cfg.get("glm_key", ""), False),
-                ("DS KEY", self.cfg.get("ds_key", ""), False),
-                ("卡·每日一句", self.cfg["cards"].get("hitokoto", True), True),
-                ("卡·新闻", self.cfg["cards"].get("news", True), True),
-                ("卡·自选股", self.cfg["cards"].get("fin", True), True),
-                ("卡·USAGE", self.cfg["cards"].get("usage", False), True)]
-        y = 16
-        for i, (lab, val, is_ck) in enumerate(rows):
-            sel = i == self.set_sel
-            rr = pygame.Rect(6, y, W - 12, 20)
+        border = self.th("border")
+        self.tool_head(surf, "设置", "←→ 选分类/选项")
+        LX, LW2 = 6, 88                        # 左列分类
+        RX = LX + LW2 + 6                      # 右侧详情
+        RW2 = W - RX - 6
+        # ── 左列: 分类卡片 ──
+        for i, cat in enumerate(self.SET_CATS):
+            sel = self.set_lv == "cats" and i == self.set_cat
+            rr = pygame.Rect(LX, 18 + i * 30, LW2, 26)
             pygame.draw.rect(surf, self.card(0), rr, border_radius=4)
-            pygame.draw.rect(surf, acc if sel else self.th("border"), rr,
+            pygame.draw.rect(surf, acc if sel else border, rr,
                              2 if sel else 1, border_radius=4)
-            editing = sel and self.set_edit is not None
-            if is_ck:
-                mark = "[√]" if val else "[ ]"
-                text(surf, mark, 13, acc if val else dim, (12, y + 3))
-                text(surf, lab, 13, hi if sel else soft, (52, y + 3))
-            else:
-                text(surf, lab, 13, acc if sel else soft, (12, y + 3))
-                show = self.set_buf if editing else val
-                if show:
-                    show = ("..." + show[-6:]) if len(show) > 10 else show
-                cur = "_" if editing and int(time.monotonic() * 2) % 2 == 0 else ""
-                text(surf, clip_text(show + cur, 13, W - 110), 13,
-                     hi if show else dim, (W - 14, y + 3), right=True)
-            y += 21
-        hint = "输入 API KEY, Enter 保存" if self.set_edit is not None \
-            else "Enter 编辑/勾选 · 保存到本机"
-        textc(surf, hint, 10, dim, W // 2, 146)
+            text(surf, cat, 13, acc if sel else soft, (LX + 8, rr.y + 5))
+        # ── 右侧: 选中分类的选项 ──
+        cat = self.SET_CATS[self.set_cat]
+        rows = self.CAT_ROWS.get(cat, ())
+        pygame.draw.rect(surf, self.card(0),
+                         pygame.Rect(RX, 18, RW2, 18 + len(rows) * 26),
+                         border_radius=4)
+        pygame.draw.rect(surf, border,
+                         pygame.Rect(RX, 18, RW2, 18 + len(rows) * 26), 1,
+                         border_radius=4)
+        for i, (rid, lab) in enumerate(rows):
+            sel = self.set_lv == "detail" and i == self.set_sel
+            y = 24 + i * 26
+            text(surf, lab, 13, hi if sel else soft, (RX + 8, y))
+            if rid.startswith("key:"):
+                v = self.cfg.get("glm_key" if rid == "key:glm" else "ds_key",
+                                 "")
+                text(surf, clip_text(self._set_mask(v) or "未设置", 12,
+                                     RW2 - 90), 12,
+                     hi if v else dim, (RX + 80, y), right=True)
+                if sel:
+                    text(surf, "输入", 10, acc, (RX + RW2 - 8, y + 1),
+                         right=True)
+            elif rid.startswith("sw:"):
+                ck = rid.split(":", 1)[1]
+                on = self.cfg["cards"].get(ck, ck != "usage")
+                pill = pygame.Rect(RX + RW2 - 44, y - 1, 36, 16)
+                pygame.draw.rect(surf,
+                                 acc if on else self.th("track"), pill,
+                                 border_radius=8)
+                text(surf, "ON" if on else "OFF", 10,
+                     self.th("hi") if on else dim,
+                     (pill.centerx, y + 1), right=True)
+            elif rid == "theme":
+                text(surf, "%d/%d" % (self.theme_idx + 1, len(THEMES)),
+                     12, soft, (RX + RW2 - 8, y), right=True)
+        textc(surf, "←→ 选分类/选项 · Enter 确认", 10, dim, W // 2, 146)
+        # ── KEY 输入弹窗 (覆盖) ──
+        if self.set_edit is not None:
+            lab = "输入 GLM KEY" if self.set_edit == "glm" else "输入 DS KEY"
+            box = pygame.Rect(30, 50, W - 60, 64)
+            pygame.draw.rect(surf, self.card(0), box, border_radius=6)
+            pygame.draw.rect(surf, acc, box, 2, border_radius=6)
+            text(surf, lab, 13, hi, (box.x + 12, box.y + 8))
+            text(surf, self.set_buf + "_", 13, soft,
+                 (box.x + 12, box.y + 30))
+            text(surf, "Enter 保存 · Esc 取消", 10, dim,
+                 (box.x + 12, box.y + 46))
+
 
     def tool_open(self, tid):
 
