@@ -1129,7 +1129,9 @@ def test_voice():
                                 "createdAt": 200}]
         items = app.idea_items()
         assert [i["kind"] for i in items] == ["voice", "text"], items
-        # 播放 (真 ffplay, SDL dummy 静音; 再按停)
+        # 播放器按魔数选: wav → paplay / 假 webm → ffplay
+        assert dash._is_pcm_wav(vf) and not dash._is_pcm_wav(
+            os.path.join(dash.VOICES_DIR, "fake.webm"))
         app.sel = 0
         app.play_voice(items[0])
         assert app.playing_voice and app.playing_voice["id"] == "v1"

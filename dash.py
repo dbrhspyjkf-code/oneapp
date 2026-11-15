@@ -43,6 +43,16 @@ import news_rss
 W, H = 320, 170
 
 
+def _is_pcm_wav(path):
+    """按内容魔数判 PCM wav (paplay 只吃 PCM; 扩展名不可靠 — 云端懒下载
+    m4a/webm 曾统一落 .wav 名导致 paplay 播不了)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"RIFF"
+    except OSError:
+        return False
+
+
 def _ffplay_pre():
     """Linux: ffplay 随父进程死 (PR_SET_PDEATHSIG/SIGKILL), 防孤儿音频."""
     try:
@@ -3334,6 +3344,9 @@ class App:
                         it["text"] = cn.get("text") or it.get("text", "")
                         if cn.get("ts"):
                             it["createdAt"] = created
+                        if key == "voices":
+                            it["dur"] = round(cn.get("dur")
+                                              or it.get("dur", 0))
                 else:                          # 云端有本地无 (他端/换号前) → 镜像入
                     base = {"id": cid, "cid": cid, "owner": user, "up": 1,
                             "text": cn.get("text") or "",
@@ -3536,7 +3549,7 @@ class App:
             # wav → paplay (毫秒级启动; ffplay 冷启动 ~5s 于 CM0, 语音短
             # 进度条走完声音才出的根因); 非 wav (webm 等云端语音) 仍 ffplay;
             # paplay 缺席回退 ffplay (慢但能响)
-            if f.lower().endswith(".wav"):
+            if _is_pcm_wav(f):
                 cmd = ["paplay", f]
             else:
                 cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
