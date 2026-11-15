@@ -505,7 +505,8 @@ def fetch_all(acct, which="uf", limit=30):
     红旗邮件」智能视图 IMAP 不暴露 (2026-11-15 实测 LIST 仅真实夹) —
     手动逐夹搜索聚合; 会话复用下 30+ 夹约 3-6s, UI 侧 TTL 缓解.
     返回 msgs 带 fld (raw 夹名) / fldn (显示名) — 详情/标记须按夹操作."""
-    keys = {"unseen": ("UNSEEN",), "flagged": ("FLAGGED",)}.get(
+    keys = {"unseen": ("UNSEEN",), "unread": ("UNSEEN",),   # unread=unseen
+            "flagged": ("FLAGGED",)}.get(
         which, ("UNSEEN", "FLAGGED"))
     M, err = _connect(acct)
     if err:

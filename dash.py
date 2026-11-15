@@ -3942,7 +3942,7 @@ class App:
         self.mail_got = False
         self.mail_lv = "list"
         self.mail_sel = self.mail_scroll = 0
-        self.osd = ("搜索未读+旗标…", time.monotonic() + 8)
+        self.osd = ("搜索未读…", time.monotonic() + 8)
         self.net.invalidate("mail_all:%s:unread" % em)
         self.net.job("mail_all:%s:unread" % em, self._mail_all_fn("unread"), 300)
 
