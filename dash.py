@@ -3856,12 +3856,13 @@ class App:
     # ── 键 ──
     def _silk_input_active(self):
         """输入态 (F/Z/X/C 保持字母, 丝印方向让位): 想法/行情添加/行情
-        KEY 设置/音乐搜索/邮件登录/邮件写信."""
+        KEY 设置/音乐搜索/邮件登录/邮件写信/云注册表单."""
         return (self.in_input or self.fin_input or self.fin_sync
                 or self.mu_input
                 or (self.tool == "mail"
                     and self.mail_lv in ("login", "compose"))
-                or (self.tool == "set" and self.set_edit is not None))
+                or (self.tool == "set" and (self.set_edit is not None
+                                            or self.reg is not None)))
 
     def key(self, k, ch=""):
         # 丝印方向 (非输入态): F/X/Z/C = ↑↓←→ (fn+ 同效, 输入态保持字母)

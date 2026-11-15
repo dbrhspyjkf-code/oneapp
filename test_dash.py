@@ -1525,6 +1525,15 @@ def test_reg():
     app.set_sel = 4
     app.key(pygame.K_RETURN)
     assert app.reg == {"name": "", "invite": "", "field": 0}
+    # F/X/Z/C 真实键值 = 字母 (丝印方向让位, _silk_input_active 含 reg 表单;
+    # 若白名单缺失, k 会被换成 K_UP 且 ch 丢弃 → 断言炸)
+    for kk, c2 in ((pygame.K_f, "f"), (pygame.K_x, "x"),
+                   (pygame.K_z, "z"), (pygame.K_c, "c")):
+        app.key(kk, c2)
+    assert app.reg["name"] == "fxzc", app.reg
+    for _ in range(4):
+        app.key(pygame.K_BACKSPACE)
+    assert app.reg["name"] == ""
     # 输入: name 字段自动小写; ↑↓ 换行; invite 字段
     for c in "AbC_01":
         app.key(0, c)
