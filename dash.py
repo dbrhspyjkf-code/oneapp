@@ -1464,6 +1464,8 @@ class App:
         self.set_edit = None                   # None=常态 glm/ds=KEY 弹窗
         self.reg = None                        # 注册表单态 {name,invite,field}
         self.reg_busy = False                  # 注册提交中 (防重复)
+        self.login = None                      # 登录表单态 {tok}
+        self.login_busy = False                # 登录验证中 (防重复)
         self.set_buf = ""
         self._usage_at = 0.0
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
@@ -1600,6 +1602,10 @@ class App:
             elif a == "cloudping" and isinstance(b, dict) \
                     and not b.get("skip"):
                 if b.get("ok"):
+                    if b.get("user") and \
+                            self.cfg.get("cloud_user") != b["user"]:
+                        self.cfg["cloud_user"] = b["user"]   # 用户名回填
+                        self.cfg_save()
                     self.osd = ("云连接 ✓ %s" % b.get("user"),
                                 time.monotonic() + 2)
                 else:
@@ -1612,6 +1618,7 @@ class App:
                         self.cfg["cloud_url"] = b.get("url") \
                             or CLOUD_URL_DEFAULT
                     self.cfg["cloud_tok"] = b["token"]
+                    self.cfg["cloud_user"] = b.get("user") or ""
                     self.cfg_save()
                     self.reg = None            # 成功: 关表单 + ping 验证
                     self.cloud_ping_trigger()
@@ -1621,6 +1628,24 @@ class App:
                     err = b.get("err") or ("HTTP %s" % b.get("st")
                                            if b.get("st") else "网络异常")
                     self.osd = ("注册失败 %s" % err,
+                                time.monotonic() + 2.5)
+            elif a == "cloudlogin" and isinstance(b, dict):
+                self.login_busy = False
+                if b.get("ok"):
+                    self.cfg["cloud_tok"] = b["tok"]
+                    if not self.cfg.get("cloud_url"):
+                        self.cfg["cloud_url"] = b.get("url") \
+                            or CLOUD_URL_DEFAULT
+                    self.cfg["cloud_user"] = b.get("user") or ""
+                    self.cfg_save()
+                    self.login = None          # 成功: 关表单 + ping 复核
+                    self.cloud_ping_trigger()
+                    self.osd = ("已登录 %s" % b.get("user"),
+                                time.monotonic() + 2.5)
+                else:
+                    err = b.get("err") or ("HTTP %s" % b.get("st")
+                                           if b.get("st") else "网络异常")
+                    self.osd = ("登录失败 %s" % err,
                                 time.monotonic() + 2.5)
         elif kind == "error":                 # worker 里 fn 抛异常 (None) —
             if a.startswith("mail_list"):     # 以前静默吞, 失败根本不可见
@@ -1640,6 +1665,9 @@ class App:
             elif a == "cloudreg":
                 self.reg_busy = False
                 self.osd = ("注册失败 网络异常", time.monotonic() + 2.5)
+            elif a == "cloudlogin":
+                self.login_busy = False
+                self.osd = ("登录失败 网络异常", time.monotonic() + 2.5)
         elif kind == "text":
             self.data[a] = b
             if b and a in ("quotes", "idx"):
@@ -3112,6 +3140,8 @@ class App:
         if time.monotonic() - self._cloud_trig < 15:
             return
         self._cloud_trig = time.monotonic()
+        if not self.cfg.get("cloud_user"):
+            self.cloud_ping_trigger()      # 存量 token 补拉用户名
         self.ensure_cids()
         self._cloud_pend_n = (
             sum(1 for it in self.ideas.get("texts", []) if not it.get("up"))
@@ -3856,13 +3886,14 @@ class App:
     # ── 键 ──
     def _silk_input_active(self):
         """输入态 (F/Z/X/C 保持字母, 丝印方向让位): 想法/行情添加/行情
-        KEY 设置/音乐搜索/邮件登录/邮件写信/云注册表单."""
+        KEY 设置/音乐搜索/邮件登录/邮件写信/云注册+登录表单."""
         return (self.in_input or self.fin_input or self.fin_sync
                 or self.mu_input
                 or (self.tool == "mail"
                     and self.mail_lv in ("login", "compose"))
                 or (self.tool == "set" and (self.set_edit is not None
-                                            or self.reg is not None)))
+                                            or self.reg is not None
+                                            or self.login is not None)))
 
     def key(self, k, ch=""):
         # 丝印方向 (非输入态): F/X/Z/C = ↑↓←→ (fn+ 同效, 输入态保持字母)
@@ -4019,10 +4050,12 @@ class App:
         if self.tool:
             if k == pygame.K_ESCAPE:
                 if self.tool == "set" and (self.set_edit is not None
-                                           or self.reg is not None):
-                    self.set_edit = None       # 关 KEY 弹窗/注册表单,
+                                           or self.reg is not None
+                                           or self.login is not None):
+                    self.set_edit = None       # 关 KEY 弹窗/注册/登录表单,
                     self.set_buf = ""          #   保持在设置页
                     self.reg = None
+                    self.login = None
                     return True
                 if self.tool == "tv" and self.tv_playing:
                     self.tv_stop()             # 播放态 Esc → 回列表 (不退 app)
@@ -4282,7 +4315,7 @@ class App:
             return [("theme:%d" % i, t["name"])
                     for i, t in enumerate(THEMES)]
         return [("key:glm", "GLM KEY"), ("key:ds", "DS KEY"),
-                ("key:cloud", "云地址"), ("key:tok", "云TOKEN"),
+                ("key:cloud", "想法云地址"), ("login", "登录"),
                 ("reg", "注册新账号"),
                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
                 ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡")]
@@ -4295,6 +4328,8 @@ class App:
                    "cloud": "cloud_url", "tok": "cloud_tok"}
 
     def set_key(self, k, ch):
+        if self.login is not None:             # 登录表单态: TOKEN 单字段
+            return self._login_key(k, ch)
         if self.reg is not None:               # 注册表单态: 两字段 ASCII
             return self._reg_key(k, ch)
         if self.set_edit is not None:          # KEY 弹窗编辑态: ASCII 直输
@@ -4358,7 +4393,52 @@ class App:
                             time.monotonic() + 2)
             elif rid == "reg":                 # 注册表单 (用户名+邀请码)
                 self.reg = {"name": "", "invite": "", "field": 0}
+            elif rid == "login":               # 登录表单 (已有 TOKEN)
+                self.login = {"tok": ""}
         return True
+
+    def _login_key(self, k, ch):
+        """登录表单键流: 已有用户名+TOKEN 的用户 — 填 TOKEN → ping 验证."""
+        f = self.login
+        if k == pygame.K_ESCAPE:
+            self.login = None
+            return True
+        if k == pygame.K_BACKSPACE:
+            f["tok"] = f["tok"][:-1]
+            return True
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if self.login_busy:
+                return True
+            if not f["tok"].strip():
+                self.osd = ("先填 TOKEN", time.monotonic() + 2)
+                return True
+            self.login_busy = True
+            self.net.invalidate(("job", "cloudlogin"))
+            self.net.job("cloudlogin", self._cloud_login_fn, ttl=10)
+            self.osd = ("登录中…", time.monotonic() + 5)
+            return True
+        if ch and 0x20 <= ord(ch) < 0x7F:
+            f["tok"] = (f["tok"] + ch)[:40]
+        return True
+
+    def _cloud_login_fn(self):
+        """worker: 现有 TOKEN ping 验证 → {ok, user, tok, url}."""
+        tok = (self.login or {}).get("tok", "").strip()
+        url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
+        if not tok:
+            return {"ok": 0, "err": "先填 TOKEN", "st": 0}
+        st, body = netmod.http_raw(url + "/v1/ping", timeout=8,
+                                   headers={"Authorization": "Bearer " + tok})
+        try:
+            j = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            j = {}
+        if st == 200 and j.get("ok"):
+            return {"ok": 1, "user": j.get("user") or "?",
+                    "tok": tok, "url": url}
+        return {"ok": 0, "st": st,
+                "err": "TOKEN 无效" if st == 401 else
+                       ("HTTP %s" % st if st else "网络异常")}
 
     def _reg_key(self, k, ch):
         """注册表单键流: ↑↓ 换字段 / ASCII 直输 (name 强制小写) /
@@ -4464,6 +4544,13 @@ class App:
                      12, hi if v else dim, (W - 14, y), right=True)
                 if sel:
                     text(surf, "输入", 10, acc, (W - 90, y), right=True)
+            elif rid == "login":               # 登录行: 右侧显示当前用户
+                user = self.cfg.get("cloud_user") or ""
+                tok = self.cfg.get("cloud_tok") or ""
+                text(surf, ("@%s" % user) if tok else "未登录", 12,
+                     hi if tok else dim, (W - 14, y), right=True)
+                if sel:
+                    text(surf, "填 TOKEN", 10, acc, (W - 96, y), right=True)
             elif rid.startswith("sw:"):
                 ck = rid.split(":", 1)[1]
                 on = self.cfg["cards"].get(ck, ck != "usage")
@@ -4516,6 +4603,24 @@ class App:
             elif self.osd and "失败" in self.osd[0]:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
                      self.th("danger"), (box.right - 12, box.y + 69),
+                     right=True)
+        # ── 登录表单 (覆盖): 已有用户名+TOKEN 的用户 ──
+        if self.login is not None:
+            box = pygame.Rect(24, 52, W - 48, 76)
+            pygame.draw.rect(surf, self.card(0), box, border_radius=6)
+            pygame.draw.rect(surf, acc, box, 2, border_radius=6)
+            text(surf, "登录想法云", 13, hi, (box.x + 12, box.y + 8))
+            text(surf, "TOKEN", 12, dim, (box.x + 12, box.y + 30))
+            shown = clip_text(self.login["tok"][-24:] + "_", 12, 170)
+            text(surf, shown, 12, hi, (box.x + 66, box.y + 30))
+            text(surf, "Enter 登录 · Esc 取消", 10, dim,
+                 (box.x + 12, box.y + 52))
+            if self.login_busy:
+                text(surf, "验证中…", 12, acc,
+                     (box.right - 12, box.y + 52), right=True)
+            elif self.osd and "失败" in self.osd[0]:
+                text(surf, clip_text(self.osd[0], 10, 130), 10,
+                     self.th("danger"), (box.right - 12, box.y + 53),
                      right=True)
 
     def tool_open(self, tid):
@@ -5869,10 +5974,14 @@ class App:
         if self.iview == "cloud":
             return self._draw_ideas_cloud(surf)
 
-        # 头部
+        # 头部 (右侧: 登录用户名 / 未登录仅本地)
         text(surf, "想法", 12, hi, (6, 3))
-        text(surf, "· %d 条 · 9 云端" % len(items), 10, dim,
+        cuser = self.cfg.get("cloud_user") or ""
+        chead = ("@%s · 9 云端" % cuser) if self.cfg.get("cloud_tok") \
+            else "仅本地 · 9 云端"
+        text(surf, "· %d 条" % len(items), 10, dim,
              (6 + textw("想法", 12) + 6, 5))
+        text(surf, chead, 10, dim, (W - 6, 5), right=True)
 
         # 卡片网格 2×2: 4 张卡常驻 (时间行 + 内容 ≤2 行), 工具条固定在下方
         M, GW, GH, gap = 4, 154, 62, 4
@@ -5982,7 +6091,16 @@ class App:
         hi, soft, dim = self.th("hi"), self.th("soft"), self.th("dim")
         acc = self.th("accent")
         notes = self.cloud_notes
+        cuser = self.cfg.get("cloud_user") or ""
+        logged = bool(self.cfg.get("cloud_tok"))
         text(surf, "想法·云端", 12, hi, (6, 3))
+        text(surf, ("@%s" % cuser) if logged else "未登录", 10, dim,
+             (W - 6, 5), right=True)
+        if not logged:
+            textc(surf, "未登录 · 想法仅本地保存", 13, dim, W // 2, 62)
+            textc(surf, "设置里 登录 或 注册新账号", 12, acc, W // 2, 82)
+            text(surf, "9 本地", 13, soft, (6, 151))
+            return
         text(surf, "· %d 条" % len(notes), 10, dim,
              (6 + textw("想法·云端", 12) + 6, 5))
         if not notes:

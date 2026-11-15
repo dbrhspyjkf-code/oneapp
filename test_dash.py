@@ -1558,6 +1558,7 @@ def test_reg():
     assert d["ok"] == 1 and d["token"] == "t" * 24
     app.on_net("data", "cloudreg", d)
     assert app.reg is None and app.cfg["cloud_tok"] == "t" * 24
+    assert app.cfg["cloud_user"] == "abc_01"   # 注册成功存用户名
     assert app.cfg["cloud_url"] == dash.CLOUD_URL_DEFAULT  # 空云地址自动配
     assert app.net.last_job("cloudping") is not None
     assert app.osd and "注册成功" in app.osd[0]
@@ -1576,6 +1577,67 @@ def test_reg():
     app.key(pygame.K_ESCAPE)               # Esc 关表单, 留在设置页
     assert app.reg is None and app.tool == "set"
     print("reg OK (form/fields/submit/auto-config/fail-retain/esc)")
+
+
+def test_login():
+    """登录表单: 行进入/TOKEN 输入 (FXZC 字母可输)/空值提示/ping 验证成功
+    → 存 tok+user 关表单 / 401 失败保表单 / Esc 关 / 登录行右侧状态."""
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    app = dash.App(FakeNet())
+    rows = [r[0] for r in app._set_rows()]
+    assert rows.index("login") == 3 and rows.index("reg") == 4
+    assert rows[2] == ("key:cloud")
+    app.tool = "set"
+    app.draw(canvas)                       # 未登录: login 行右侧 "未登录"
+    app.set_sel = rows.index("login")
+    app.key(pygame.K_RETURN)
+    assert app.login == {"tok": ""}
+    # FXZC 真实键值 = 字母 (白名单含 login 表单)
+    for kk, c2 in ((pygame.K_f, "f"), (pygame.K_z, "z")):
+        app.key(kk, c2)
+    assert app.login["tok"] == "fz"
+    app.key(pygame.K_BACKSPACE)
+    app.key(pygame.K_BACKSPACE)
+    app.key(pygame.K_RETURN)               # 空 → 提示
+    assert app.osd and "先填" in app.osd[0]
+    for c in "8545eeb9e745ad046aec6333":
+        app.key(0, c)
+    assert app.login["tok"] == "8545eeb9e745ad046aec6333"
+    app.draw(canvas)                       # 表单渲染冒烟
+    orig_raw = netmod.http_raw
+    netmod.http_raw = lambda url, **k: (200, json.dumps(
+        {"ok": 1, "user": "zero"}).encode())
+    app.key(pygame.K_RETURN)
+    d = app.net.last_job("cloudlogin")()
+    assert d["ok"] == 1 and d["user"] == "zero" and d["tok"].startswith("8545")
+    app.on_net("data", "cloudlogin", d)
+    assert app.login is None
+    assert app.cfg["cloud_tok"] == "8545eeb9e745ad046aec6333"
+    assert app.cfg["cloud_user"] == "zero"
+    assert app.osd and "已登录" in app.osd[0]
+    assert app.net.last_job("cloudping") is not None
+    assert json.load(open(dash.SETTINGS_FILE))["cloud_user"] == "zero"
+    # 失败: 401 → 表单保留 + OSD
+    netmod.http_raw = lambda url, **k: (401, b"{}")
+    app.login = {"tok": "wrong"}
+    app.key(pygame.K_RETURN)
+    d = app.net.last_job("cloudlogin")()
+    assert d["ok"] == 0 and d["err"] == "TOKEN 无效"
+    app.on_net("data", "cloudlogin", d)
+    assert app.login == {"tok": "wrong"}
+    assert app.osd and "登录失败" in app.osd[0]
+    # ping 回填用户名 (cloud_user 变更才落盘)
+    app.on_net("data", "cloudping", {"ok": 1, "user": "zero2"})
+    assert app.cfg["cloud_user"] == "zero2"
+    netmod.http_raw = orig_raw
+    app.key(pygame.K_ESCAPE)
+    assert app.login is None and app.tool == "set"
+    print("login OK (form/fxzc/ping verify/persist/fail-retain/esc)")
 
 
 def test_mail_keys():
@@ -2579,6 +2641,7 @@ if __name__ == "__main__":
     test_settings_app()
     test_cloud()
     test_reg()
+    test_login()
     test_mail_keys()
     test_mail_all()
     test_mail_sess()
