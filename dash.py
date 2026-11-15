@@ -3698,6 +3698,10 @@ class App:
         # 换肤键 t 仅主页 (工具内 t 是输入字符, 不劫持).
         if self.tool:
             if k == pygame.K_ESCAPE:
+                if self.tool == "set" and self.set_edit is not None:
+                    self.set_edit = None       # 关 KEY 弹窗, 保持在设置页
+                    self.set_buf = ""
+                    return True
                 if self.tool == "tv" and self.tv_playing:
                     self.tv_stop()             # 播放态 Esc → 回列表 (不退 app)
                 elif self.tool == "music" and self.mu_input:

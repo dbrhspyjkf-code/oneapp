@@ -1344,6 +1344,12 @@ def test_settings_app():
     # 卡片页签: sel=0 = GLM KEY → Enter 弹窗 → 输入 → Enter 保存
     app.key(pygame.K_RETURN)
     assert app.set_edit == "glm"
+    # 弹窗内 Esc → 关弹窗保持设置页 (用户定版: 不退出设置)
+    app.key(pygame.K_ESCAPE)
+    assert app.set_edit is None and app.tool == "set"
+    # 重新进弹窗 → 输入 → 保存
+    app.key(pygame.K_RETURN)
+    assert app.set_edit == "glm"
     for c in "abc123":
         app.key(0, c)
     app.key(pygame.K_RETURN)                  # 保存
