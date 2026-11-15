@@ -1356,22 +1356,23 @@ def test_mail_keys():
     assert app.mail_auth_buf == "authcode1"
     app.key(pygame.K_RETURN)
     assert ("job", "mail_login") in app.net.got
-    # 登录成功 → 落盘 0600 + 直进 INBOX 列表 (免文件夹层中转, 提速)
+    # 登录成功 → 落盘 0600 + 直进 全部未读+旗标 聚合视图 (跨夹搜索)
     app.on_net("data", "mail_login", {"ok": True, "unread": 3,
                                       "email": "user@163.com",
                                       "auth": "authcode1"})
-    assert app.mail_lv == "list" and app.mail_folder == "INBOX" \
+    assert app.mail_lv == "list" and app.mail_folder == "@uf" \
         and app.mail_cur.get("email") == "user@163.com"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(mailmod.MAIL_FILE).st_mode) == 0o600
-    assert ("job", "mail_list:user@163.com") in app.net.got
-    app.on_net("data", "mail_list", {"ok": True, "total": 2, "msgs": [
+    assert ("job", "mail_all:user@163.com:uf") in app.net.got
+    app.on_net("data", "mail_all:user@163.com:uf", {"ok": True, "total": 2,
+                                                    "msgs": [
         {"uid": "11", "subject": "你好", "from": "a@b.com",
          "date": "11-14 09:00", "preview": "内容", "seen": False,
-         "flagged": False},
+         "flagged": False, "fld": "INBOX", "fldn": "INBOX"},
         {"uid": "10", "subject": "旧的", "from": "c@d.com",
          "date": "11-13 08:00", "preview": "", "seen": True,
-         "flagged": True}]})
+         "flagged": True, "fld": "Bob", "fldn": "Bob"}]})
     assert app.mail_total == 2 and len(app.mail_msgs) == 2
     assert app.mail_got                     # 列表已落地 (区分空/加载中)
     app.key(pygame.K_x)                           # 列表层丝印方向: X=↓
@@ -1384,20 +1385,22 @@ def test_mail_keys():
     app.mail_msgs[1]["flagged"] = False
     assert [m["uid"] for m in app._mail_view_msgs()] == ["11"]
     app.mail_msgs[1]["flagged"] = True
-    app.key(pygame.K_RETURN)                      # 开详情 → mail_body:11
+    app.key(pygame.K_RETURN)                      # 开详情 → mail_body:夹:uid
     assert app.mail_lv == "detail" and app.mail_body_uid == "11"
-    assert ("job", "mail_body:11") in app.net.got
-    app.on_net("data", "mail_body:11",
-               {"ok": True, "uid": "11", "text": "第一行\n第二行",
+    assert app.mail_body_fld == "INBOX"
+    assert ("job", "mail_body:INBOX:11") in app.net.got
+    app.on_net("data", "mail_body:INBOX:11",
+               {"ok": True, "uid": "11", "fld": "INBOX",
+                "text": "第一行\n第二行",
                 "subject": "你好", "msg_id": "<m11@163.com>",
                 "refs": "", "from_addr": "a@b.com", "date": "11-14 09:00"})
     assert app.mail_body == "第一行\n第二行"
     assert app.mail_c_meta.get("msg_id") == "<m11@163.com>"
-    # 详情 4/5/6: 标已读 / 红旗 / 回复 (tag 带 uid) + Esc 回列表
+    # 详情 4/5/6: 标已读 / 红旗 / 回复 (tag 带夹+uid) + Esc 回列表
     app.key(pygame.K_4)
-    assert ("job", "mail_act:11:mark_read") in app.net.got
+    assert ("job", "mail_act:INBOX:11:mark_read") in app.net.got
     app.key(pygame.K_5)
-    assert ("job", "mail_act:11:flag") in app.net.got
+    assert ("job", "mail_act:INBOX:11:flag") in app.net.got
     app.key(pygame.K_6)                           # 回复 → compose 预填
     assert app.mail_lv == "compose" and app.mail_c_reply
     assert app.mail_c["to"] == "a@b.com" and app.mail_c["subject"] == "Re: 你好"
@@ -1414,15 +1417,17 @@ def test_mail_keys():
     assert app.mail_lv == "list"
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "folders"
-    # 文件夹层 (列表 Esc 按需进入): 数据落地 → Enter INBOX 换夹回列表
+    # 文件夹层 (列表 Esc 按需进入): 虚拟夹置顶 → Enter 真实 INBOX 换夹
     app.on_net("data", "mail_folders", {"ok": True, "folders": [
         {"raw": "INBOX", "name": "INBOX", "unread": 3, "total": 12},
         {"raw": "\"&XfJT0ZAB-\"", "name": "已发送", "unread": 0, "total": 4}]})
-    assert [f["name"] for f in app.mail_folders] == ["INBOX", "已发送"]
+    assert [f["name"] for f in app.mail_folders] == \
+        ["全部未读+旗标", "全部未读", "全部红旗", "INBOX", "已发送"]
+    app.mail_sel = 3                              # INBOX (虚拟夹 3 个在后)
     app.key(pygame.K_RETURN)
     assert app.mail_lv == "list" and app.mail_folder == "INBOX"
     assert sum(1 for t in app.net.got
-               if t[0] == "job" and t[1].startswith("mail_list")) >= 2
+               if t[0] == "job" and t[1].startswith("mail_list")) >= 1
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "folders"
     app.key(pygame.K_ESCAPE)
@@ -1471,6 +1476,103 @@ def test_mail_keys():
     app.draw(canvas)
     app.ime_clear()
     print("mail keys OK (grid/login/list/folders/list/detail/compose/del/esc/render)")
+
+
+def test_mail_all():
+    """fetch_all 全账号聚合: 逐夹搜索合并 / Date 倒序 / fld+fldn 标注 /
+    垃圾草稿夹跳过 / INBOX 不重复 (163 网页版 智能视图的 IMAP 替代)."""
+    import mail as mailmod
+    orig_cls = mailmod.imaplib.IMAP4_SSL
+    selected = []
+
+    class FakeIMAP:
+        def __init__(self, host, port, timeout=None):
+            self.box = None
+
+        def login(self, u, p):
+            return ("OK", ["b"])
+
+        def noop(self):
+            return ("OK", ["b"])
+
+        def logout(self):
+            return ("OK", ["b"])
+
+        def socket(self):
+            return self
+
+        def settimeout(self, t):
+            pass
+
+        def xatom(self, *a):
+            return ("OK", [])
+
+        def list(self):
+            rows = []
+            for b in ("INBOX", "Bob", '"&XfJT0ZAB-"', "Junk", "Drafts"):
+                rows.append(('() "." %s' % b).encode())
+            return ("OK", rows)
+
+        def select(self, box, readonly=False):
+            self.box = box.strip('"')
+            selected.append(self.box)
+            return ("OK", [b"9"])
+
+        def uid(self, cmd, *args):
+            a = [cmd] + [x.decode() if isinstance(x, bytes) else x
+                         for x in args]
+            if "SEARCH" in a:
+                key = a[-1]
+                uids = {("Bob", "UNSEEN"): b"5 9",
+                        ("Bob", "FLAGGED"): b"9",
+                        ("&XfJT0ZAB-", "FLAGGED"): b"2"}.get(
+                            (self.box, key), b"")
+                return ("OK", [uids])
+            head = "(FLAGS BODY.PEEK[HEADER.FIELDS" in a[-1]
+            out = []
+            for tok in a[1].split(","):
+                if head:
+                    hdr = {("Bob", "5"): b"From: old@x.com\r\nSubject: old\r\n"
+                           b"Date: Mon, 09 Nov 2026 10:00:00 +0800\r\n\r\n",
+                           ("Bob", "9"): b"From: new@x.com\r\nSubject: new\r\n"
+                           b"Date: Sat, 14 Nov 2026 10:00:00 +0800\r\n\r\n",
+                           ("&XfJT0ZAB-", "2"): b"From: me@163.com\r\nSubject: sent\r\n"
+                           b"Date: Sun, 15 Nov 2026 09:00:00 +0800\r\n\r\n"}.get(
+                               (self.box, tok), b"")
+                    if hdr:
+                        out.append((b"%s (UID %s BODY[HEADER.FIELDS" % (
+                            tok.encode(), tok.encode()), hdr))
+                else:
+                    fl = {("Bob", "5"): b"\\Seen", ("Bob", "9"): b"\\Flagged",
+                          ("&XfJT0ZAB-", "2"): b"\\Flagged \\Seen"}.get(
+                              (self.box, tok), b"")
+                    out.append((b"%s (UID %s FLAGS (%s) BODY[]<0>" % (
+                        tok.encode(), tok.encode(), fl),
+                        b"Subject: t\r\n\r\nhello"))
+            return ("OK", out)
+
+    try:
+        mailmod.imaplib.IMAP4_SSL = FakeIMAP
+        mailmod._SESS.update(M=None, email="", at=0.0)
+        r = mailmod.fetch_all({"email": "t@163.com", "auth": "k"}, "uf", 30)
+        assert r["ok"], r
+        assert r["total"] == 3, r                       # Bob 2 + 已发送 1
+        msgs = r["msgs"]
+        assert [m["uid"] for m in msgs] == ["2", "9", "5"], msgs   # Date 倒序
+        assert [m["fldn"] for m in msgs] == ["已发送", "Bob", "Bob"]
+        assert msgs[0]["flagged"] and msgs[0]["seen"]   # 已发送副本双旗态
+        assert msgs[1]["flagged"] and not msgs[1]["seen"]
+        assert msgs[2]["seen"] and not msgs[2]["flagged"]
+        assert all(m["preview"].startswith("hello") for m in msgs)
+        assert not any(b == "INBOX" for b in selected)  # INBOX 不重复聚合
+        assert "Junk" not in selected and "Drafts" not in selected
+        r2 = mailmod.fetch_all({"email": "t@163.com", "auth": "k"},
+                               "flagged", 30)
+        assert r2["ok"] and [m["uid"] for m in r2["msgs"]] == ["2", "9"]
+    finally:
+        mailmod.imaplib.IMAP4_SSL = orig_cls
+        mailmod._SESS.update(M=None, email="", at=0.0)
+    print("mail all OK (aggregate/sort/skip/fld-tag)")
 
 
 def test_mail_sess():
@@ -2161,6 +2263,7 @@ if __name__ == "__main__":
     test_mail_utf7()
     test_mail_accounts()
     test_mail_keys()
+    test_mail_all()
     test_mail_sess()
     test_driver_sym()
     test_mail_compose()

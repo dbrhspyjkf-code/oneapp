@@ -1390,6 +1390,7 @@ class App:
         self.mail_got = False                  # 列表已收到过结果 (区分空/加载中)
         self.mail_body = None                  # 详情文本 (str) / None
         self.mail_body_uid = None              # 详情对应 uid (结果对号)
+        self.mail_body_fld = None              # 详情对应夹 (聚合视图逐夹操作)
         self.mail_body_scroll = 0
         self.mail_c_meta = None                # 详情元数据 (回回复信头/引用用)
         self.mail_c = {"to": "", "subject": "", "body": ""}   # 写信三字段
@@ -3913,19 +3914,27 @@ class App:
         return True
 
     def mail_open(self, acct):
-        """账号层 Enter: 直进 INBOX 列表 (免文件夹层中转, 打开即见邮件;
-        会话复用下 ~0.5s). 其他文件夹: 列表 Esc → 文件夹层按需取."""
+        """账号层 Enter: 直进 全部未读+旗标 聚合视图 (用户常用 = 163 网页版
+        的 未读邮件/红旗邮件 智能视图; IMAP 不暴露 → fetch_all 逐夹聚合).
+        单文件夹: Esc → 文件夹层 (虚拟夹置顶) 或直接看列表归属."""
+        em = (acct or {}).get("email", "")
         self.mail_cur = dict(acct)
-        self.mail_folder = "INBOX"
+        self.mail_folder = "@uf"
         self.mail_msgs = []
         self.mail_total = 0
         self.mail_got = False
         self.mail_lv = "list"
         self.mail_sel = self.mail_scroll = 0
-        self.osd = ("连接中…", time.monotonic() + 3)
-        self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))
-        self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
-                 self._mail_list_fn(), 180)
+        self.osd = ("搜索未读+旗标…", time.monotonic() + 8)
+        self.net.invalidate("mail_all:%s:uf" % em)
+        self.net.job("mail_all:%s:uf" % em, self._mail_all_fn("uf"), 300)
+
+    def _mail_all_fn(self, which):
+        cur = dict(self.mail_cur or {})
+
+        def f():
+            return mailmod.fetch_all(cur, which, 30)
+        return f
 
     def mail_del(self, email):
         """dialog 确认后删账号 → 落 mail.json."""
@@ -3967,11 +3976,14 @@ class App:
             return mailmod.fetch_msgs(cur, folder, 30)
         return f
 
-    def _mail_body_fn(self, uid):
-        cur, folder = self.mail_cur, self.mail_folder
+    def _mail_body_fn(self, uid, fld=None):
+        cur, folder = self.mail_cur, fld or self.mail_folder
 
         def f():
-            return mailmod.fetch_body(cur, folder, uid)
+            r = mailmod.fetch_body(cur, folder, uid)
+            if isinstance(r, dict):
+                r["fld"] = folder              # 回执对号 (聚合视图逐夹)
+            return r
         return f
 
     def _mail_login_fn(self, email, auth):
@@ -3982,11 +3994,14 @@ class App:
             return r
         return f
 
-    def _mail_act_fn(self, uid, action):
-        cur, folder = self.mail_cur, self.mail_folder
+    def _mail_act_fn(self, uid, action, fld=None):
+        cur, folder = self.mail_cur, fld or self.mail_folder
 
         def f():
-            return mailmod.mail_action(cur, folder, uid, action)
+            r = mailmod.mail_action(cur, folder, uid, action)
+            if isinstance(r, dict):
+                r["fld"] = folder              # 回滚对号 (聚合视图逐夹)
+            return r
         return f
 
     def poll_mail(self):
@@ -3998,8 +4013,13 @@ class App:
             self.net.job("mail_folders:%s" % (self.mail_cur or {}).get("email", ""),
                  self._mail_folders_fn(), 600)
         elif lv == "list" and self.mail_cur and self.mail_folder:
-            self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
-                 self._mail_list_fn(), 180)
+            em = (self.mail_cur or {}).get("email", "")
+            if self.mail_folder.startswith("@"):
+                self.net.job("mail_all:%s:%s" % (em, self.mail_folder[1:]),
+                     self._mail_all_fn(self.mail_folder[1:]), 300)
+            else:
+                self.net.job("mail_list:%s" % em,
+                     self._mail_list_fn(), 180)
 
     def on_mail_net(self, tag, b):
         if tag == "mail_login":
@@ -4021,15 +4041,27 @@ class App:
                 self.mail_unread[em] = n
         elif tag.startswith("mail_folders"):
             if b.get("ok"):
-                self.mail_folders = b.get("folders") or []
+                # 虚拟聚合夹置顶 (163 网页版的 未读/红旗 智能视图 IMAP 不暴露,
+                # fetch_all 逐夹聚合); 真实文件夹随后
+                self.mail_folders = ([{"raw": "@uf", "name": "全部未读+旗标"},
+                                      {"raw": "@unread", "name": "全部未读"},
+                                      {"raw": "@flagged", "name": "全部红旗"}]
+                                     + (b.get("folders") or []))
                 self.mail_sel = min(self.mail_sel,
                                     max(0, len(self.mail_folders) - 1))
                 self.osd = None
             else:
                 self.osd = (b.get("err") or "获取失败", time.monotonic() + 3)
-        elif tag.startswith("mail_list"):
+        elif tag.startswith("mail_list") or tag.startswith("mail_all"):
             if b.get("ok"):
-                self.mail_msgs = b.get("msgs") or []
+                rows = b.get("msgs") or []
+                if tag.startswith("mail_list"):   # 单夹列表: 盖章归属夹
+                    fldn = mailmod._decode_imap_utf7(
+                        (self.mail_folder or "").strip('"'))
+                    for m in rows:
+                        m.setdefault("fld", self.mail_folder)
+                        m.setdefault("fldn", fldn)
+                self.mail_msgs = rows
                 self.mail_total = b.get("total", 0)
                 self.mail_err = ""
                 self.mail_got = True
@@ -4038,8 +4070,9 @@ class App:
                 self.osd = None
             else:
                 self.mail_err = b.get("err") or "获取失败"
-        elif tag.startswith("mail_body"):     # tag 带 uid, 快速换信互不阻塞
-            if b.get("ok") and b.get("uid") == self.mail_body_uid:
+        elif tag.startswith("mail_body"):     # tag 带夹+uid, 快速换信互不阻塞
+            if b.get("ok") and b.get("uid") == self.mail_body_uid \
+                    and b.get("fld") == self.mail_body_fld:
                 self.mail_body = b.get("text") or "(空邮件)"
                 self.mail_c_meta = b          # 回复预填 + In-Reply-To 元数据
                 self.mail_body_scroll = 0
@@ -4058,12 +4091,14 @@ class App:
             else:
                 self.osd = ("发送失败: %s" % (b.get("err") or ""),
                             time.monotonic() + 3)
-        elif tag.startswith("mail_act"):      # tag 带 uid:action
+        elif tag.startswith("mail_act"):      # tag 带夹:uid:action
             if b.get("ok"):
                 self.osd = ("已标记", time.monotonic() + 1.2)
             else:                             # 乐观更新回滚
                 for m in self.mail_msgs:
-                    if m.get("uid") == b.get("uid"):
+                    if m.get("uid") == b.get("uid") \
+                            and m.get("fld", self.mail_folder) \
+                            == b.get("fld"):
                         if (b.get("action") or "").startswith("mark_"):
                             m["seen"] = not m.get("seen")
                         else:
@@ -4071,7 +4106,10 @@ class App:
                         break
                 self.osd = ("标记失败 " + (b.get("err") or ""),
                             time.monotonic() + 2.5)
-            self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))  # seen/flag 已变, 列表缓存作废
+            em = (self.mail_cur or {}).get("email", "")   # seen/flag 已变,
+            for t in ("mail_list:%s" % em, "mail_all:%s:uf" % em,       # 缓存
+                      "mail_all:%s:unseen" % em, "mail_all:%s:flagged" % em):
+                self.net.invalidate(t)
 
     def _mail_view_msgs(self):
         # 列表口径 = 未读或旗标 (与服务端 OR UNSEEN FLAGGED 同款; 本地
@@ -4128,31 +4166,47 @@ class App:
                     self.mail_got = False
                     self.mail_sel = self.mail_scroll = 0
                     self.mail_lv = "list"
-                    self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))
-                    self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
-                 self._mail_list_fn(), 180)
+                    em = (self.mail_cur or {}).get("email", "")
+                    if f["raw"].startswith("@"):
+                        w = f["raw"][1:]
+                        self.net.invalidate("mail_all:%s:%s" % (em, w))
+                        self.net.job("mail_all:%s:%s" % (em, w),
+                                     self._mail_all_fn(w), 300)
+                    else:
+                        self.net.invalidate("mail_list:%s" % em)
+                        self.net.job("mail_list:%s" % em,
+                                     self._mail_list_fn(), 180)
             elif lv == "list":
                 msgs = self._mail_view_msgs()
                 if msgs:
                     m = msgs[min(self.mail_sel, len(msgs) - 1)]
+                    fld = m.get("fld") or self.mail_folder
                     self.mail_body = None
                     self.mail_body_uid = m["uid"]
+                    self.mail_body_fld = fld
                     self.mail_body_scroll = 0
                     self.mail_lv = "detail"
-                    self.net.job("mail_body:%s" % m["uid"],
-                                 self._mail_body_fn(m["uid"]), 0)
+                    self.net.job("mail_body:%s:%s" % (fld, m["uid"]),
+                                 self._mail_body_fn(m["uid"], fld), 0)
             return True
         if lv == "acct" and k == pygame.K_d:
             accs = self.mail.get("accounts", [])
             if accs and self.mail_sel < len(accs):
                 self.dialog = ("delmail", accs[self.mail_sel].get("email", ""))
             return True
-        if lv == "list" and k == pygame.K_4:  # 强制刷新
+        if lv == "list" and k == pygame.K_4:  # 强制刷新 (聚合/单夹分流)
             self.mail_got = False
-            self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))
-            self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
-                 self._mail_list_fn(), 180)
-            self.osd = ("刷新中…", time.monotonic() + 1.5)
+            em = (self.mail_cur or {}).get("email", "")
+            if self.mail_folder.startswith("@"):
+                w = self.mail_folder[1:]
+                self.net.invalidate("mail_all:%s:%s" % (em, w))
+                self.net.job("mail_all:%s:%s" % (em, w),
+                             self._mail_all_fn(w), 300)
+            else:
+                self.net.invalidate("mail_list:%s" % em)
+                self.net.job("mail_list:%s" % em,
+                             self._mail_list_fn(), 180)
+            self.osd = ("刷新中…", time.monotonic() + 2.5)
             return True
         if lv == "list" and k == pygame.K_5:  # 写新邮件
             self.mail_compose_open(reply=False)
@@ -4211,8 +4265,10 @@ class App:
     def mail_mark(self, which):
         """详情 4/5: 已读/未读 与 红/取消旗 (乐观更新, 失败回滚).
         按 uid 定位开着的信 — 标已读会把行从视图挤掉, 按索引会错位."""
+        fld = self.mail_body_fld or self.mail_folder
         m = next((x for x in self.mail_msgs
-                  if x.get("uid") == self.mail_body_uid), None)
+                  if x.get("uid") == self.mail_body_uid
+                  and x.get("fld", self.mail_folder) == fld), None)
         if not m:
             return
         if which == "read":
@@ -4221,8 +4277,8 @@ class App:
         else:
             action = "unflag" if m.get("flagged") else "flag"
             m["flagged"] = not m.get("flagged")
-        self.net.job("mail_act:%s:%s" % (m["uid"], action),
-                     self._mail_act_fn(m["uid"], action), 0)
+        self.net.job("mail_act:%s:%s:%s" % (fld, m["uid"], action),
+                     self._mail_act_fn(m["uid"], action, fld), 0)
 
     # ── 邮件: 写信/回复 (compose 层; 三字段 IME 输入, Enter 下一项/发送) ──
     def mail_compose_open(self, reply=False):
@@ -4445,16 +4501,22 @@ class App:
                  hi if sel else soft, (14, y + 5))
             if f.get("unread", 0) > 0:
                 text(surf, "未读 %d" % f["unread"], 11, acc, (W - 76, y + 6))
-            text(surf, "共 %s" % f.get("total", "?"), 10, dim,
-                 (W - 14, y + 7), right=True)
+            if f.get("total") is not None:
+                text(surf, "共 %s" % f["total"], 10, dim,
+                     (W - 14, y + 7), right=True)
         self.tool_foot(surf, ["Enter 打开", "Esc 返回"])
 
     def draw_mail_list(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
-        disp = mailmod._decode_imap_utf7(
-            (self.mail_folder or "").strip('"')) if self.mail_folder else ""
-        self.tool_head(surf, "邮件 · %s · 未读+旗标" % clip_text(disp, 11, 100),
+        if (self.mail_folder or "").startswith("@"):
+            disp = {"uf": "全部未读+旗标", "unread": "全部未读",
+                    "flagged": "全部红旗"}.get(self.mail_folder[1:],
+                                               self.mail_folder[1:])
+        else:
+            disp = mailmod._decode_imap_utf7(
+                (self.mail_folder or "").strip('"'))
+        self.tool_head(surf, "邮件 · %s" % clip_text(disp, 11, 130),
                        "%d/%d 封" % (len(self._mail_view_msgs()),
                                      self.mail_total))
         msgs = self._mail_view_msgs()
@@ -4483,7 +4545,10 @@ class App:
                                                 (W - 22, y + 24)])
             if unread:
                 pygame.draw.circle(surf, acc, (W - 14, y + 22), 3)
-            text(surf, clip_text(m.get("preview", ""), 10, W - 28), 10,
+            pv = m.get("preview", "")
+            if m.get("fldn") and m.get("fld") != self.mail_folder:
+                pv = "[%s] %s" % (m["fldn"], pv)   # 聚合视图标注来源夹
+            text(surf, clip_text(pv, 10, W - 28), 10,
                  dim, (14, y + 31))
         self.tool_foot(surf, ["4 刷新", "5 写邮件", "Enter 读", "Esc 返回"])
 

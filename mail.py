@@ -487,7 +487,7 @@ def list_folders(acct):
 def _search_uf(M):
     """未读+旗标 uid 并集 (升序, 尾部=最新).
     QQ 对 OR UNSEEN FLAGGED 返回空 (2026-11-15 实测: STATUS UNSEEN=29 而
-    OR=0, 腾讯 IMAP 的 OR 兼容性问题) — 两次单键搜索取并集, 163/QQ 通吃."""
+    OR=0, 腾讯 IMAP 兼容性问题) — 两次单键搜索取并集, 163/QQ 通吃."""
     out = set()
     for key in ("UNSEEN", "FLAGGED"):
         try:
@@ -497,6 +497,124 @@ def _search_uf(M):
         except Exception:
             pass
     return sorted(out, key=int)
+
+
+def fetch_all(acct, which="uf", limit=30):
+    """全账号聚合: uf=未读+旗标 / unseen=仅未读 / flagged=仅红旗,
+    跨全部真实文件夹 (跳过垃圾/广告/订阅/草稿). 163 网页版的「未读邮件/
+    红旗邮件」智能视图 IMAP 不暴露 (2026-11-15 实测 LIST 仅真实夹) —
+    手动逐夹搜索聚合; 会话复用下 30+ 夹约 3-6s, UI 侧 TTL 缓解.
+    返回 msgs 带 fld (raw 夹名) / fldn (显示名) — 详情/标记须按夹操作."""
+    keys = {"unseen": ("UNSEEN",), "flagged": ("FLAGGED",)}.get(
+        which, ("UNSEEN", "FLAGGED"))
+    M, err = _connect(acct)
+    if err:
+        return {"ok": False, "err": err}
+    try:
+        st, lst = M.list()
+        if st != "OK":
+            return {"ok": False, "err": "LIST 失败"}
+        folders = []                           # (raw, disp)
+        for item in lst or []:
+            if not item:
+                continue
+            mm = _LIST_RE.match(item.decode("utf-8", "replace").strip())
+            if not mm:
+                continue
+            raw = mm.group("name").strip()
+            disp = _decode_imap_utf7(raw.strip('"'))
+            if should_skip(disp) or disp.upper() == "INBOX":
+                continue                       # INBOX 单独直进, 不重复
+            folders.append((raw, disp))
+        disp_of = dict(folders)
+        hits = {}                              # raw → [uid...] (升序, 尾=新)
+        for raw, disp in folders:
+            try:
+                if M.select(raw, readonly=True)[0] != "OK":
+                    continue
+                uids = set()
+                for key in keys:
+                    st, data = M.uid("SEARCH", key)
+                    if st == "OK" and data and data[0]:
+                        uids.update(data[0].split())
+                if uids:
+                    hits[raw] = sorted(uids, key=int)
+            except Exception:
+                continue                       # 单夹失败不拖垮聚合
+        total = sum(len(v) for v in hits.values())
+        # 阶段一: 每夹取最新 40 封头部 (Date 排序 + 行信息)
+        heads = {}                             # (raw, uid) → header bytes
+        for raw, uids in hits.items():
+            try:
+                M.select(raw, readonly=True)
+                st, fetched = M.uid(
+                    "FETCH", b",".join(uids[-40:]).decode("ascii"),
+                    "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+                if st != "OK":
+                    continue
+                for it in fetched or []:
+                    if isinstance(it, tuple) and it[1]:
+                        mm = re.search(rb"UID (\d+)", it[0])
+                        if mm:
+                            heads[(raw, mm.group(1))] = it[1]
+            except Exception:
+                continue
+        cand = []
+        for (raw, uid), head in heads.items():
+            msg = email_mod.message_from_bytes(head)
+            try:
+                dk = parsedate_to_datetime(msg.get("Date"))
+            except Exception:
+                import datetime as _dt
+                dk = _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+            cand.append((dk, raw, uid))
+        cand.sort(key=lambda x: x[0], reverse=True)     # 最新在前
+        chosen = cand[:limit]
+        if not chosen:
+            return {"ok": True, "msgs": [], "total": total}
+        # 阶段二: 选中邮件取 16KB 头 (预览), 逐夹批量
+        need = {}
+        for dk, raw, uid in chosen:
+            need.setdefault(raw, []).append(uid)
+        texts = {}                             # (raw, uid) → (resp, 16KB)
+        for raw, uids in need.items():
+            try:
+                M.select(raw, readonly=True)
+                st, fetched = M.uid(
+                    "FETCH", b",".join(uids).decode("ascii"),
+                    "(FLAGS BODY.PEEK[]<0.16384>)")
+                if st == "OK":
+                    for it in fetched or []:
+                        if isinstance(it, tuple) and it[1]:
+                            mm = re.search(rb"UID (\d+)", it[0])
+                            if mm:
+                                texts[(raw, mm.group(1))] = it
+            except Exception:
+                continue
+        msgs = []
+        for dk, raw, uid in chosen:
+            it = texts.get((raw, uid))
+            if not it:
+                continue
+            full = email_mod.message_from_bytes(it[1])
+            flags = it[0].decode("utf-8", "replace")
+            uid_s = uid.decode("ascii") if isinstance(uid, bytes) else uid
+            msgs.append({
+                "uid": uid_s,
+                "fld": raw,
+                "fldn": disp_of.get(raw, raw),
+                "subject": decode_subject(full["Subject"])[:80],
+                "from": decode_from(full["From"] or "")[:70],
+                "date": fmt_date(full.get("Date")),
+                "preview": extract_preview(full, 200),
+                "seen": "\\Seen" in flags,
+                "flagged": "\\Flagged" in flags,
+            })
+        return {"ok": True, "msgs": msgs, "total": total}
+    except Exception as e:
+        return {"ok": False, "err": _friendly_err(e)}
+    finally:
+        _release(M)
 
 
 def fetch_msgs(acct, raw_q, limit=30):
