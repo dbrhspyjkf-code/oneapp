@@ -4223,12 +4223,14 @@ class App:
     # ── 邮件: 写信/回复 (compose 层; 三字段 IME 输入, Enter 下一项/发送) ──
     def mail_compose_open(self, reply=False):
         """写信层入口: 列表 5=新邮件 (空白); 详情 6=回复 (预填收件人/
-        Re: 主题/顶部引用原文, 引用截 500 字). 用户文字永远在顶部."""
+        Re: 主题/顶部引用原文, 引用截 500 字). 用户文字永远在顶部.
+        默认英文直输 (首字段=收件人邮箱; / 切拼音)."""
         self.mail_c = {"to": "", "subject": "", "body": ""}
         self.mail_c_quote = ""
         self.mail_cf = 0
         self.mail_c_reply = reply
         self.mail_c_from = self.mail_lv        # 回跳锚 (list / detail)
+        self.ime_mode = False                  # 英文优先, 提示见底栏/字段标
         self.ime_clear()
         if reply:
             meta = self.mail_c_meta or {}
@@ -4535,8 +4537,11 @@ class App:
             text(surf, lab, 11, acc if sel else dim, (14, y + 7))
             cur = val + ("_" if sel and int(time.monotonic() * 2) % 2 == 0
                          else "")
-            text(surf, clip_text(cur, 12, W - 86), 12,
+            text(surf, clip_text(cur, 12, W - 100), 12,
                  hi if val else dim, (62, y + 7))
+            if sel:                           # 输入法模式标 (拼/EN)
+                text(surf, "拼" if self.ime_mode else "EN", 10, acc,
+                     (W - 14, y + 8), right=True)
             y += 32
         # 正文框: 用户文字亮色 (输入端永远在缓冲区尾), 引用块暗色只读
         sel = self.mail_cf == 2
@@ -4554,7 +4559,7 @@ class App:
             text(surf, ln, 12, dim if is_q else soft, (14, y + 5 + i * 15))
         surf.set_clip(None)
         if not (self.ime_bar(surf, 146)):      # 候选条在时让位底栏
-            self.tool_foot(surf, ["Enter 下一项/发送", "Esc 返回"])
+            self.tool_foot(surf, ["Enter 下一项/发送", "/ 中英", "Esc 返回"])
 
     # ── 汇率 / 单位换算 (共用字段模型: 0 金额 1 源 2 目标 3 类别) ──
     def cv_key(self, k, ch, is_fx):

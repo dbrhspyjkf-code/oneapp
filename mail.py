@@ -339,6 +339,8 @@ def _friendly_err(e):
     if isinstance(e, smtplib.SMTPAuthenticationError) \
             or "AUTHENTICATIONFAILED" in s or "LOGIN failed" in s:
         return "登录被拒 (授权码错或未开 IMAP/SMTP)"
+    if "DT:SPM" in s:
+        return "163 拒发 (疑垃圾/频率限制, 稍后再试)"
     if "Unsafe Login" in s:
         return "服务端拒连 (Unsafe Login)"
     if "timeout" in s.lower() or "timed out" in s.lower():

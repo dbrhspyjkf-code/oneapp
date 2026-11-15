@@ -1617,10 +1617,9 @@ def test_mail_compose():
     app.mail_cur = {"email": "me@163.com", "auth": "k"}
     app.mail_folder = "INBOX"
     app.mail_lv = "list"
-    # 列表 5 → 写新邮件; '/' 切英文直输
+    # 列表 5 → 写新邮件 (默认英文直输, 收件人邮箱优先; / 切拼音)
     app.key(pygame.K_5)
     assert app.mail_lv == "compose" and app.mail_cf == 0
-    app.key(pygame.K_SLASH)
     assert app.ime_mode is False
     for c in "friend@qq.com":
         app.key(0, c)
@@ -1679,7 +1678,6 @@ def test_mail_compose():
     assert app.mail_c_quote.startswith("在 11-15 10:00，boss@qq.com 写道：")
     app.key(pygame.K_RETURN)                      # to → subject
     app.key(pygame.K_RETURN)                      # subject → body
-    app.key(pygame.K_SLASH)                       # 切英文直输 (IME 会吃字母)
     app.key(0, "O")
     app.key(0, "K")
     app.key(pygame.K_RETURN)                      # 发送
