@@ -1374,6 +1374,10 @@ def test_mail_keys():
          "flagged": True}]})
     assert app.mail_total == 2 and len(app.mail_msgs) == 2
     assert app.mail_got                     # 列表已落地 (区分空/加载中)
+    app.key(pygame.K_x)                           # 列表层丝印方向: X=↓
+    assert app.mail_sel == 1
+    app.key(pygame.K_f)                           # F=↑ (输入层仍是字母)
+    assert app.mail_sel == 0
     # 未读+旗标口径: 已读且无旗标的行本地即时消失 (uid 10 已读但有旗 → 保留)
     view = app._mail_view_msgs()
     assert [m["uid"] for m in view] == ["11", "10"], view

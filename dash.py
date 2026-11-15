@@ -4095,6 +4095,10 @@ class App:
             return self.mail_login_key(k, ch)
         if lv == "compose":
             return self.mail_compose_key(k, ch)
+        if lv in ("acct", "folders", "list") and k in (pygame.K_f,
+                                                       pygame.K_x):
+            k = pygame.K_UP if k == pygame.K_f else pygame.K_DOWN   # 丝印方向
+            ch = ""                        # 列表层 F/X=↑/↓ (输入层是字母)
         if k in (pygame.K_UP, pygame.K_DOWN):
             if lv == "detail":
                 n = max(0, len(self._mail_body_lines()) - MAIL_BODY_ROWS)
