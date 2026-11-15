@@ -1625,8 +1625,8 @@ def test_mail_all():
                                "flagged", 30)
         assert r2["ok"] and [m["uid"] for m in r2["msgs"]] == ["2", "9"]
         r3 = mailmod.fetch_all({"email": "t@163.com", "auth": "k"},
-                               "unread", 30)   # UI 别名: 只搜 UNSEEN 单键
-        assert r3["ok"] and [m["uid"] for m in r3["msgs"]] == ["3", "9", "5"], r3
+                               "unread", 30)   # 默认列表口径 = 未读∪旗标
+        assert r3["ok"] and [m["uid"] for m in r3["msgs"]] == ["3", "2", "9", "5"], r3
     finally:
         mailmod.imaplib.IMAP4_SSL = orig_cls
         mailmod._SESS.update(M=None, email="", at=0.0)
