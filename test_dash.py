@@ -1356,16 +1356,16 @@ def test_mail_keys():
     assert app.mail_auth_buf == "authcode1"
     app.key(pygame.K_RETURN)
     assert ("job", "mail_login") in app.net.got
-    # 登录成功 → 落盘 0600 + 直进 全部未读+旗标 聚合视图 (跨夹搜索)
+    # 登录成功 → 落盘 0600 + 直进 全部未读 聚合视图 (跨夹搜索)
     app.on_net("data", "mail_login", {"ok": True, "unread": 3,
                                       "email": "user@163.com",
                                       "auth": "authcode1"})
-    assert app.mail_lv == "list" and app.mail_folder == "@uf" \
+    assert app.mail_lv == "list" and app.mail_folder == "@unread" \
         and app.mail_cur.get("email") == "user@163.com"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(mailmod.MAIL_FILE).st_mode) == 0o600
-    assert ("job", "mail_all:user@163.com:uf") in app.net.got
-    app.on_net("data", "mail_all:user@163.com:uf", {"ok": True, "total": 2,
+    assert ("job", "mail_all:user@163.com:unread") in app.net.got
+    app.on_net("data", "mail_all:user@163.com:unread", {"ok": True, "total": 2,
                                                     "msgs": [
         {"uid": "11", "subject": "你好", "from": "a@b.com",
          "date": "11-14 09:00", "preview": "内容", "seen": False,
@@ -1424,8 +1424,8 @@ def test_mail_keys():
         {"raw": "INBOX", "name": "INBOX", "unread": 3, "total": 12},
         {"raw": "\"&XfJT0ZAB-\"", "name": "已发送", "unread": 0, "total": 4}]})
     assert [f["name"] for f in app.mail_folders] == \
-        ["全部未读+旗标", "全部未读", "全部红旗", "INBOX", "已发送"]
-    app.mail_sel = 3                              # INBOX (虚拟夹 3 个在后)
+        ["全部未读", "全部红旗", "INBOX", "已发送"]
+    app.mail_sel = 2                              # INBOX (虚拟夹 2 个在前)
     app.key(pygame.K_RETURN)
     assert app.mail_lv == "list" and app.mail_folder == "INBOX"
     assert sum(1 for t in app.net.got

@@ -3921,6 +3921,8 @@ class App:
         elif lv == "folders":
             self.mail_lv = "acct"
             self.mail_cur = None               # 退出账号上下文 (poll 停拉)
+            self.mail_sel = min(self.mail_sel,               # 夹回账号行
+                                max(0, len(self.mail.get("accounts", [])) - 1))
         elif lv == "login":
             self.mail_lv = "acct"
             self.mail_acct_buf = self.mail_auth_buf = ""
@@ -3929,20 +3931,20 @@ class App:
         return True
 
     def mail_open(self, acct):
-        """账号层 Enter: 直进 全部未读+旗标 聚合视图 (用户常用 = 163 网页版
+        """账号层 Enter: 直进 全部未读 聚合视图 (用户常用 = 163 网页版
         的 未读邮件/红旗邮件 智能视图; IMAP 不暴露 → fetch_all 逐夹聚合).
         单文件夹: Esc → 文件夹层 (虚拟夹置顶) 或直接看列表归属."""
         em = (acct or {}).get("email", "")
         self.mail_cur = dict(acct)
-        self.mail_folder = "@uf"
+        self.mail_folder = "@unread"
         self.mail_msgs = []
         self.mail_total = 0
         self.mail_got = False
         self.mail_lv = "list"
         self.mail_sel = self.mail_scroll = 0
         self.osd = ("搜索未读+旗标…", time.monotonic() + 8)
-        self.net.invalidate("mail_all:%s:uf" % em)
-        self.net.job("mail_all:%s:uf" % em, self._mail_all_fn("uf"), 300)
+        self.net.invalidate("mail_all:%s:unread" % em)
+        self.net.job("mail_all:%s:unread" % em, self._mail_all_fn("unread"), 300)
 
     def _mail_all_fn(self, which):
         cur = dict(self.mail_cur or {})
@@ -4058,8 +4060,7 @@ class App:
             if b.get("ok"):
                 # 虚拟聚合夹置顶 (163 网页版的 未读/红旗 智能视图 IMAP 不暴露,
                 # fetch_all 逐夹聚合); 真实文件夹随后
-                self.mail_folders = ([{"raw": "@uf", "name": "全部未读+旗标"},
-                                      {"raw": "@unread", "name": "全部未读"},
+                self.mail_folders = ([{"raw": "@unread", "name": "全部未读"},
                                       {"raw": "@flagged", "name": "全部红旗"}]
                                      + (b.get("folders") or []))
                 self.mail_sel = min(self.mail_sel,
@@ -4122,8 +4123,8 @@ class App:
                 self.osd = ("标记失败 " + (b.get("err") or ""),
                             time.monotonic() + 2.5)
             em = (self.mail_cur or {}).get("email", "")   # seen/flag 已变,
-            for t in ("mail_list:%s" % em, "mail_all:%s:uf" % em,       # 缓存
-                      "mail_all:%s:unseen" % em, "mail_all:%s:flagged" % em):
+            for t in ("mail_list:%s" % em, "mail_all:%s:unread" % em,   # 缓存
+                      "mail_all:%s:flagged" % em):
                 self.net.invalidate(t)
 
     def _mail_view_msgs(self):
@@ -4521,7 +4522,7 @@ class App:
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
         if (self.mail_folder or "").startswith("@"):
-            disp = {"uf": "全部未读+旗标", "unread": "全部未读",
+            disp = {"unread": "全部未读",
                     "flagged": "全部红旗"}.get(self.mail_folder[1:],
                                                self.mail_folder[1:])
         else:
