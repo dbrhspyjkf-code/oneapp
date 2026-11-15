@@ -1349,7 +1349,7 @@ def test_mail_keys():
         and app.mail_cur.get("email") == "user@163.com"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(mailmod.MAIL_FILE).st_mode) == 0o600
-    assert ("job", "mail_list") in app.net.got
+    assert ("job", "mail_list:user@163.com") in app.net.got
     app.on_net("data", "mail_list", {"ok": True, "total": 2, "msgs": [
         {"uid": "11", "subject": "你好", "from": "a@b.com",
          "date": "11-14 09:00", "preview": "内容", "seen": False,
@@ -1402,7 +1402,8 @@ def test_mail_keys():
     assert [f["name"] for f in app.mail_folders] == ["INBOX", "已发送"]
     app.key(pygame.K_RETURN)
     assert app.mail_lv == "list" and app.mail_folder == "INBOX"
-    assert app.net.got.count(("job", "mail_list")) >= 2   # 换夹重新拉取
+    assert sum(1 for t in app.net.got
+               if t[0] == "job" and t[1].startswith("mail_list")) >= 2
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "folders"
     app.key(pygame.K_ESCAPE)

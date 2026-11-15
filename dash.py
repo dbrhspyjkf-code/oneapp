@@ -3913,9 +3913,11 @@ class App:
         self.mail_lv = "list"
         self.mail_sel = self.mail_scroll = 0
         self.osd = ("连接中…", time.monotonic() + 3)
-        self.net.invalidate("mail_list")
-        self.net.job("mail_list", self._mail_list_fn(), 180)
-        self.net.job("mail_folders", self._mail_folders_fn(), 600)
+        self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))
+        self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
+                 self._mail_list_fn(), 180)
+        self.net.job("mail_folders:%s" % (self.mail_cur or {}).get("email", ""),
+                 self._mail_folders_fn(), 600)
 
     def mail_del(self, email):
         """dialog 确认后删账号 → 落 mail.json."""
@@ -3985,9 +3987,11 @@ class App:
         if lv == "acct" and self.mail.get("accounts"):
             self.net.job("mail_unread", self._mail_unread_fn(), 60)
         elif lv == "folders" and self.mail_cur:
-            self.net.job("mail_folders", self._mail_folders_fn(), 600)
+            self.net.job("mail_folders:%s" % (self.mail_cur or {}).get("email", ""),
+                 self._mail_folders_fn(), 600)
         elif lv == "list" and self.mail_cur and self.mail_folder:
-            self.net.job("mail_list", self._mail_list_fn(), 180)
+            self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
+                 self._mail_list_fn(), 180)
 
     def on_mail_net(self, tag, b):
         if tag == "mail_login":
@@ -4007,7 +4011,7 @@ class App:
         elif tag == "mail_unread":
             for em, n in (b.get("map") or {}).items():
                 self.mail_unread[em] = n
-        elif tag == "mail_folders":
+        elif tag.startswith("mail_folders"):
             if b.get("ok"):
                 self.mail_folders = b.get("folders") or []
                 self.mail_sel = min(self.mail_sel,
@@ -4015,7 +4019,7 @@ class App:
                 self.osd = None
             else:
                 self.osd = (b.get("err") or "获取失败", time.monotonic() + 3)
-        elif tag == "mail_list":
+        elif tag.startswith("mail_list"):
             if b.get("ok"):
                 self.mail_msgs = b.get("msgs") or []
                 self.mail_total = b.get("total", 0)
@@ -4059,7 +4063,7 @@ class App:
                         break
                 self.osd = ("标记失败 " + (b.get("err") or ""),
                             time.monotonic() + 2.5)
-            self.net.invalidate("mail_list")  # seen/flag 已变, 列表缓存作废
+            self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))  # seen/flag 已变, 列表缓存作废
 
     def _mail_view_msgs(self):
         # 列表口径 = 未读或旗标 (与服务端 OR UNSEEN FLAGGED 同款; 本地
@@ -4112,8 +4116,9 @@ class App:
                     self.mail_got = False
                     self.mail_sel = self.mail_scroll = 0
                     self.mail_lv = "list"
-                    self.net.invalidate("mail_list")
-                    self.net.job("mail_list", self._mail_list_fn(), 180)
+                    self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))
+                    self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
+                 self._mail_list_fn(), 180)
             elif lv == "list":
                 msgs = self._mail_view_msgs()
                 if msgs:
@@ -4132,8 +4137,9 @@ class App:
             return True
         if lv == "list" and k == pygame.K_4:  # 强制刷新
             self.mail_got = False
-            self.net.invalidate("mail_list")
-            self.net.job("mail_list", self._mail_list_fn(), 180)
+            self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))
+            self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
+                 self._mail_list_fn(), 180)
             self.osd = ("刷新中…", time.monotonic() + 1.5)
             return True
         if lv == "list" and k == pygame.K_5:  # 写新邮件
