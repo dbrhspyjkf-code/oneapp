@@ -3926,8 +3926,6 @@ class App:
         self.net.invalidate("mail_list:%s" % (self.mail_cur or {}).get("email", ""))
         self.net.job("mail_list:%s" % (self.mail_cur or {}).get("email", ""),
                  self._mail_list_fn(), 180)
-        self.net.job("mail_folders:%s" % (self.mail_cur or {}).get("email", ""),
-                 self._mail_folders_fn(), 600)
 
     def mail_del(self, email):
         """dialog 确认后删账号 → 落 mail.json."""

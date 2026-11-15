@@ -168,7 +168,22 @@ def test_net_cache():
         net.job("t1", fn, ttl=2)              # 缓存新鲜 → 不重跑
         _time.sleep(0.4)
         assert len(calls) == 1, calls
-        print("net job cache OK")
+        net.invalidate("t1")                  # 强制作废 → 必须真重跑
+        # (旧版 invalidate 只弹字符串键, job 缓存键是 ("job", tag) 元组
+        #  → 从未生效; 邮件强刷被 TTL 缓存静默吞, 2026-11-15 真机定位)
+        net.job("t1", fn, ttl=2)
+        r2 = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                item = net.results.get(timeout=0.2)
+            except Exception:
+                continue
+            if item[0] == "data" and item[1] == "t1":
+                r2 = item
+                break
+        assert r2 and r2[2]["v"] == 2, (r2, calls)
+        print("net job cache OK (ttl/invalidate)")
     finally:
         net.close()
 

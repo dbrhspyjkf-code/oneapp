@@ -116,7 +116,13 @@ class Net:
         self._reqs.put(("job", tag, fn, ttl))
 
     def invalidate(self, key):
-        """作废缓存 (dict.pop 原子, UI 线程直调)."""
+        """作废缓存 (UI 线程直调). 缓存键是元组 ("job", tag) / ("pub", url)
+        等 — 旧版只弹字符串键, job 类 invalidate 从未生效 (邮件强刷/换号
+        被 TTL 缓存静默吞, 2026-11-15 真机定位); 两种键形都弹, 兼容存量."""
+        self._cache.pop(("job", key), None)
+        self._cache.pop(("pub", key), None)
+        self._cache.pop(("pubt", key), None)
+        self._cache.pop(("bin", key), None)
         self._cache.pop(key, None)
 
     def probe(self):
