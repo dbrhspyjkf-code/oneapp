@@ -5901,10 +5901,10 @@ class App:
                      10, dim, (8, y + 1))
                 if it.get("kind") == "voice":
                     text(surf, "▶ 语音 %ds" % (it.get("dur") or 0), 13,
-                         hi if sel else soft, (50, y))
+                         hi if sel else soft, (64, y))
                 else:
-                    text(surf, clip_text(it.get("text") or "", 13, W - 62),
-                         13, hi if sel else soft, (50, y))
+                    text(surf, clip_text(it.get("text") or "", 13, W - 78),
+                         13, hi if sel else soft, (64, y))
                 if self.playing_voice \
                         and self.playing_voice.get("id") == "cloud-" + it.get("id", ""):
                     pygame.draw.polygon(surf, acc, [
