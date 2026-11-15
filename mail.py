@@ -501,7 +501,7 @@ def _search_uf(M):
 
 def fetch_all(acct, which="uf", limit=30):
     """全账号聚合: uf=未读+旗标 / unseen=仅未读 / flagged=仅红旗,
-    跨全部真实文件夹 (跳过垃圾/广告/订阅/草稿). 163 网页版的「未读邮件/
+    跨全部文件夹含 INBOX (只跳垃圾/广告/订阅/草稿). 163 网页版的「未读邮件/
     红旗邮件」智能视图 IMAP 不暴露 (2026-11-15 实测 LIST 仅真实夹) —
     手动逐夹搜索聚合; 会话复用下 30+ 夹约 3-6s, UI 侧 TTL 缓解.
     返回 msgs 带 fld (raw 夹名) / fldn (显示名) — 详情/标记须按夹操作."""
@@ -524,8 +524,8 @@ def fetch_all(acct, which="uf", limit=30):
                 continue
             raw = mm.group("name").strip()
             disp = _decode_imap_utf7(raw.strip('"'))
-            if should_skip(disp) or disp.upper() == "INBOX":
-                continue                       # INBOX 单独直进, 不重复
+            if should_skip(disp):
+                continue
             folders.append((raw, disp))
         disp_of = dict(folders)
         hits = {}                              # raw → [uid...] (升序, 尾=新)

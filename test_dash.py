@@ -1516,6 +1516,7 @@ def test_mail_all():
                 rows.append(('() "." %s' % b).encode())
             return ("OK", rows)
 
+
         def select(self, box, readonly=False):
             self.box = box.strip('"')
             selected.append(self.box)
@@ -1526,7 +1527,8 @@ def test_mail_all():
                          for x in args]
             if "SEARCH" in a:
                 key = a[-1]
-                uids = {("Bob", "UNSEEN"): b"5 9",
+                uids = {("INBOX", "UNSEEN"): b"3",
+                        ("Bob", "UNSEEN"): b"5 9",
                         ("Bob", "FLAGGED"): b"9",
                         ("&XfJT0ZAB-", "FLAGGED"): b"2"}.get(
                             (self.box, key), b"")
@@ -1535,7 +1537,9 @@ def test_mail_all():
             out = []
             for tok in a[1].split(","):
                 if head:
-                    hdr = {("Bob", "5"): b"From: old@x.com\r\nSubject: old\r\n"
+                    hdr = {("INBOX", "3"): b"From: inbox@x.com\r\nSubject: inbox-new\r\n"
+                           b"Date: Mon, 16 Nov 2026 08:00:00 +0800\r\n\r\n",
+                           ("Bob", "5"): b"From: old@x.com\r\nSubject: old\r\n"
                            b"Date: Mon, 09 Nov 2026 10:00:00 +0800\r\n\r\n",
                            ("Bob", "9"): b"From: new@x.com\r\nSubject: new\r\n"
                            b"Date: Sat, 14 Nov 2026 10:00:00 +0800\r\n\r\n",
@@ -1546,7 +1550,7 @@ def test_mail_all():
                         out.append((b"%s (UID %s BODY[HEADER.FIELDS" % (
                             tok.encode(), tok.encode()), hdr))
                 else:
-                    fl = {("Bob", "5"): b"\\Seen", ("Bob", "9"): b"\\Flagged",
+                    fl = {("INBOX", "3"): b"", ("Bob", "5"): b"\\Seen", ("Bob", "9"): b"\\Flagged",
                           ("&XfJT0ZAB-", "2"): b"\\Flagged \\Seen"}.get(
                               (self.box, tok), b"")
                     out.append((b"%s (UID %s FLAGS (%s) BODY[]<0>" % (
@@ -1559,22 +1563,23 @@ def test_mail_all():
         mailmod._SESS.update(M=None, email="", at=0.0)
         r = mailmod.fetch_all({"email": "t@163.com", "auth": "k"}, "uf", 30)
         assert r["ok"], r
-        assert r["total"] == 3, r                       # Bob 2 + 已发送 1
+        assert r["total"] == 4, r                       # INBOX 1 + Bob 2 + 已发送 1
         msgs = r["msgs"]
-        assert [m["uid"] for m in msgs] == ["2", "9", "5"], msgs   # Date 倒序
-        assert [m["fldn"] for m in msgs] == ["已发送", "Bob", "Bob"]
-        assert msgs[0]["flagged"] and msgs[0]["seen"]   # 已发送副本双旗态
-        assert msgs[1]["flagged"] and not msgs[1]["seen"]
-        assert msgs[2]["seen"] and not msgs[2]["flagged"]
+        assert [m["uid"] for m in msgs] == ["3", "2", "9", "5"], msgs  # Date 倒序 (INBOX 纳入)
+        assert [m["fldn"] for m in msgs] == ["INBOX", "已发送", "Bob", "Bob"]
+        assert not msgs[0]["flagged"] and not msgs[0]["seen"]   # INBOX 新未读
+        assert msgs[1]["flagged"] and msgs[1]["seen"]   # 已发送副本双旗态
+        assert msgs[2]["flagged"] and not msgs[2]["seen"]
+        assert msgs[3]["seen"] and not msgs[3]["flagged"]
         assert all(m["preview"].startswith("hello") for m in msgs)
-        assert not any(b == "INBOX" for b in selected)  # INBOX 不重复聚合
+        assert "INBOX" in selected                # INBOX 纳入聚合 (默认视图=聚合)
         assert "Junk" not in selected and "Drafts" not in selected
         r2 = mailmod.fetch_all({"email": "t@163.com", "auth": "k"},
                                "flagged", 30)
         assert r2["ok"] and [m["uid"] for m in r2["msgs"]] == ["2", "9"]
         r3 = mailmod.fetch_all({"email": "t@163.com", "auth": "k"},
                                "unread", 30)   # UI 别名: 只搜 UNSEEN 单键
-        assert r3["ok"] and [m["uid"] for m in r3["msgs"]] == ["9", "5"], r3
+        assert r3["ok"] and [m["uid"] for m in r3["msgs"]] == ["3", "9", "5"], r3
     finally:
         mailmod.imaplib.IMAP4_SSL = orig_cls
         mailmod._SESS.update(M=None, email="", at=0.0)
