@@ -476,6 +476,20 @@ def _ball_glyph_cy(fs):
 
 
 _clip_cache = {}
+def _split_width_segs(txt, size, vw):
+    """按像素宽把文本切成 ≤vw 的段列表 (分段轮播显示用)."""
+    segs, cur = [], ""
+    for chx in txt:
+        if textw(cur + chx, size) <= vw:
+            cur += chx
+        else:
+            segs.append(cur)
+            cur = chx
+    if cur:
+        segs.append(cur)
+    return segs or [""]
+
+
 def clip_text(s, size, maxw):
     """截断到 maxw 像素宽, 超出加省略号.
     邮件 preview 是 800 字符全文, 逐字符回退测宽是 O(n²) 渲染
@@ -5650,8 +5664,9 @@ class App:
                     txt += " — " + hk["from"]
                 vw = cw2 - 16
                 vy = top0 + 13 + (chh - 13 - BODY) // 2
-                text(surf, clip_text(txt, BODY, vw), BODY, soft,
-                     (cx + 8, vy))                # 静态 (跑马灯已去)
+                segs = _split_width_segs(txt, BODY, vw)
+                si = int(now // 2) % len(segs)   # 2s 一段轮播
+                text(surf, segs[si], BODY, soft, (cx + 8, vy))
             else:
                 text(surf, "获取中" if self.net.mode == "online" else "--",
                      BODY, dim, (cx + 8, top0 + 13 + (chh - 13 - BODY) // 2))
