@@ -6096,11 +6096,11 @@ class App:
         if self.iview == "cloud":
             return self._draw_ideas_cloud(surf)
 
-        # 头部 (右侧: 登录用户名 / 未登录仅本地)
+        # 头部 (右侧: 登录用户名 / 未登录仅本地; "按9看云端"=键位提示)
         text(surf, "想法", 12, hi, (6, 3))
         cuser = self.cfg.get("cloud_user") or ""
-        chead = ("@%s · 9 云端" % cuser) if self.cfg.get("cloud_tok") \
-            else "仅本地 · 9 云端"
+        chead = ("@%s · 按9看云端" % cuser) if self.cfg.get("cloud_tok") \
+            else "仅本地 · 按9看云端"
         text(surf, "· %d 条" % len(items), 10, dim,
              (6 + textw("想法", 12) + 6, 5))
         text(surf, chead, 10, dim, (W - 6, 5), right=True)
