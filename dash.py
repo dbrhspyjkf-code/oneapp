@@ -1401,7 +1401,9 @@ class App:
         self.mail_c_busy = False               # 发送中 (worker 跑 SMTP)
         self.mail_c_busy_at = 0.0              # 发送看门狗锚
         self.mail_unread = {}                  # {email: 未读数} (账号层角标)
-        self.mail_total = 0                    # 未读+旗标搜索命中总数
+        self.mail_total = 0                    # 文件夹邮件总数
+        self.mail_page = 0                     # 单夹列表分页 (0=最近10封)
+        self.mail_has_more = False             # 还有更早邮件 (6 加载)
         self.mail_err = ""                     # 列表获取失败文案 (空态显示)
         self._mail_body_cache = (None, [])     # (key, lines) 详情折行缓存
         self._mail_c_cache = (None, [])        # (key, lines) 写信正文折行缓存
@@ -3940,6 +3942,8 @@ class App:
         self.mail_msgs = []
         self.mail_total = 0
         self.mail_got = False
+        self.mail_page = 0
+        self.mail_has_more = False
         self.mail_lv = "list"
         self.mail_sel = self.mail_scroll = 0
         self.osd = ("搜索未读…", time.monotonic() + 8)
@@ -3986,11 +3990,14 @@ class App:
             return mailmod.list_folders(cur)
         return f
 
-    def _mail_list_fn(self):
+    def _mail_list_fn(self, page=0):
         cur, folder = self.mail_cur, self.mail_folder
 
         def f():
-            return mailmod.fetch_msgs(cur, folder, 30)
+            r = mailmod.fetch_msgs(cur, folder, 10, page)
+            if isinstance(r, dict):
+                r["page"] = page
+            return r
         return f
 
     def _mail_body_fn(self, uid, fld=None):
@@ -4034,9 +4041,9 @@ class App:
             if self.mail_folder.startswith("@"):
                 self.net.job("mail_all:%s:%s" % (em, self.mail_folder[1:]),
                      self._mail_all_fn(self.mail_folder[1:]), 300)
-            else:
+            elif not self.mail_page:            # 分页浏览时暂停轮询
                 self.net.job("mail_list:%s" % em,
-                     self._mail_list_fn(), 180)
+                     self._mail_list_fn(0), 180)
 
     def on_mail_net(self, tag, b):
         if tag == "mail_login":
@@ -4077,12 +4084,16 @@ class App:
                     for m in rows:
                         m.setdefault("fld", self.mail_folder)
                         m.setdefault("fldn", fldn)
-                self.mail_msgs = rows
+                if b.get("page", 0) > 0:      # 加载更多: 追加
+                    self.mail_msgs = self.mail_msgs + rows
+                else:
+                    self.mail_msgs = rows
                 self.mail_total = b.get("total", 0)
+                self.mail_has_more = b.get("has_more", False)
                 self.mail_err = ""
                 self.mail_got = True
                 self.mail_sel = min(self.mail_sel,
-                                    max(0, len(self.mail_msgs) - 1))
+                                    max(0, len(self._mail_view_msgs()) - 1))
                 self.osd = None
             else:
                 self.mail_err = b.get("err") or "获取失败"
@@ -4128,10 +4139,11 @@ class App:
                 self.net.invalidate(t)
 
     def _mail_view_msgs(self):
-        # 列表口径 = 未读或旗标 (与服务端 OR UNSEEN FLAGGED 同款; 本地
-        # 过滤兜乐观更新 — 标已读且无旗标的行即时消失, 旗标行保留变已读)
-        return [m for m in self.mail_msgs
-                if (not m.get("seen")) or m.get("flagged")]
+        # 聚合视图 (全部未读/全部红旗) 保持口径; 单文件夹视图 = 最近全量
+        if self.mail_folder.startswith("@"):
+            return [m for m in self.mail_msgs
+                    if (not m.get("seen")) or m.get("flagged")]
+        return self.mail_msgs
 
     def _mail_rows(self):
         """当层可选行数 (acct/folders/list 通用)."""
@@ -4155,10 +4167,19 @@ class App:
                 d = 1 if k == pygame.K_DOWN else -1
                 self.mail_body_scroll = max(
                     0, min(n, self.mail_body_scroll + d))
+            elif lv == "folders":          # 三列网格: ↑↓ 跨行 ±3
+                d = 3 * (1 if k == pygame.K_DOWN else -1)
+                self.mail_sel = max(0, min(self._mail_rows() - 1,
+                                           self.mail_sel + d))
             else:
                 d = 1 if k == pygame.K_DOWN else -1
                 self.mail_sel = max(0, min(self._mail_rows() - 1,
                                            self.mail_sel + d))
+            return True
+        if lv == "folders" and k in (pygame.K_LEFT, pygame.K_RIGHT):
+            d = 1 if k == pygame.K_RIGHT else -1     # ←→ 同行 ±1
+            self.mail_sel = max(0, min(self._mail_rows() - 1,
+                                       self.mail_sel + d))
             return True
         if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
             if lv == "acct":
@@ -4176,6 +4197,8 @@ class App:
                     self.mail_msgs = []
                     self.mail_total = 0
                     self.mail_got = False
+                    self.mail_page = 0
+                    self.mail_has_more = False
                     self.mail_sel = self.mail_scroll = 0
                     self.mail_lv = "list"
                     em = (self.mail_cur or {}).get("email", "")
@@ -4187,7 +4210,7 @@ class App:
                     else:
                         self.net.invalidate("mail_list:%s" % em)
                         self.net.job("mail_list:%s" % em,
-                                     self._mail_list_fn(), 180)
+                                     self._mail_list_fn(0), 180)
             elif lv == "list":
                 msgs = self._mail_view_msgs()
                 if msgs:
@@ -4208,6 +4231,8 @@ class App:
             return True
         if lv == "list" and k == pygame.K_4:  # 强制刷新 (聚合/单夹分流)
             self.mail_got = False
+            self.mail_page = 0
+            self.mail_has_more = False
             em = (self.mail_cur or {}).get("email", "")
             if self.mail_folder.startswith("@"):
                 w = self.mail_folder[1:]
@@ -4222,6 +4247,14 @@ class App:
             return True
         if lv == "list" and k == pygame.K_5:  # 写新邮件
             self.mail_compose_open(reply=False)
+            return True
+        if lv == "list" and k == pygame.K_6 and self.mail_has_more \
+                and not self.mail_folder.startswith("@"):
+            em = (self.mail_cur or {}).get("email", "")
+            self.mail_page += 1
+            self.osd = ("加载更早邮件…", time.monotonic() + 3)
+            self.net.job("mail_list:%s:p%d" % (em, self.mail_page),
+                         self._mail_list_fn(self.mail_page), 180)
             return True
         if lv == "detail" and k == pygame.K_4:
             self.mail_mark("read")
@@ -4499,24 +4532,38 @@ class App:
         em = (self.mail_cur or {}).get("email", "")
         self.tool_head(surf, "邮件 · " + clip_text(em, 11, 150),
                        "%d 夹" % len(self.mail_folders))
-        if not self.mail_folders:
+        nfol = len(self.mail_folders)
+        cols = 3                              # 三列网格 (丝印←→↑↓/真方向)
+        rows_n = (nfol + cols - 1) // cols
+        vis = 4                               # 每屏 4 行
+        if not nfol:
             textc(surf, "连接中…", 12, dim, W // 2, 70)
-        start = max(0, min(self.mail_sel - 2, len(self.mail_folders) - 4))
-        for i, f in enumerate(self.mail_folders[start:start + 4], start):
-            y = 18 + (i - start) * 31
-            r = pygame.Rect(6, y, W - 12, 27)
-            sel = i == self.mail_sel
-            pygame.draw.rect(surf, self.card(0), r, border_radius=5)
-            pygame.draw.rect(surf, acc if sel else self.th("border"), r,
-                             2 if sel else 1, border_radius=5)
-            text(surf, clip_text(f["name"], 13, W - 110), 13,
-                 hi if sel else soft, (14, y + 5))
-            if f.get("unread", 0) > 0:
-                text(surf, "未读 %d" % f["unread"], 11, acc, (W - 76, y + 6))
-            if f.get("total") is not None:
-                text(surf, "共 %s" % f["total"], 10, dim,
-                     (W - 14, y + 7), right=True)
-        self.tool_foot(surf, ["Enter 打开", "Esc 返回"])
+        start_row = max(0, min(self.mail_sel // cols - (vis - 1),
+                               rows_n - vis))
+        cw = (W - 12) // cols
+        for r in range(vis):
+            rowi = start_row + r
+            base = rowi * cols
+            if base >= nfol:
+                break
+            for c in range(cols):
+                idx = base + c
+                if idx >= nfol:
+                    break
+                f = self.mail_folders[idx]
+                x = 6 + c * cw
+                y = 18 + r * 30
+                cell = pygame.Rect(x + 1, y, cw - 2, 26)
+                sel = idx == self.mail_sel
+                pygame.draw.rect(surf, self.card(0), cell, border_radius=4)
+                pygame.draw.rect(surf, acc if sel else self.th("border"),
+                                 cell, 2 if sel else 1, border_radius=4)
+                text(surf, clip_text(f["name"], 11, cw - 12), 11,
+                     hi if sel else soft, (x + 6, y + 4))
+                if f.get("unread", 0) > 0:
+                    text(surf, str(f["unread"]), 10, acc,
+                         (x + cw - 6, y + 6), right=True)
+        self.tool_foot(surf, ["←→↑↓ 选夹", "Enter 打开", "Esc 返回"])
 
     def draw_mail_list(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
@@ -4533,8 +4580,12 @@ class App:
                                      self.mail_total))
         msgs = self._mail_view_msgs()
         if not msgs:
-            msg = self.mail_err or ("无未读/旗标邮件" if self.mail_got
-                                    else ("获取中…" if self.net.mode != "offline"
+            if (self.mail_folder or "").startswith("@"):
+                empty = "无未读/旗标邮件"
+            else:
+                empty = "无邮件"
+            msg = self.mail_err or (empty if self.mail_got
+                                    else ("搜索中…" if self.net.mode != "offline"
                                           else "离线 · 联网后同步"))
             textc(surf, msg, 12, dim, W // 2, 70)
         start = max(0, min(self.mail_sel - 1, len(msgs) - 3))
@@ -4562,7 +4613,12 @@ class App:
                 pv = "[%s] %s" % (m["fldn"], pv)   # 聚合视图标注来源夹
             text(surf, clip_text(pv, 10, W - 28), 10,
                  dim, (14, y + 31))
-        self.tool_foot(surf, ["4 刷新", "5 写邮件", "Enter 读", "Esc 返回"])
+        foot = ["4 刷新", "5 写邮件"]
+        if not (self.mail_folder or "").startswith("@") \
+                and self.mail_has_more:
+            foot.append("6 更多")
+        foot += ["Enter 读", "Esc 返回"]
+        self.tool_foot(surf, foot)
 
     def draw_mail_detail(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),

@@ -618,9 +618,10 @@ def fetch_all(acct, which="uf", limit=30):
         _release(M)
 
 
-def fetch_msgs(acct, raw_q, limit=30):
-    """未读+旗标邮件列表 (最新在前, 服务端搜索, 不拉全量):
-    FLAGS + 前 16KB 原文, PEEK 不置已读."""
+def fetch_msgs(acct, raw_q, limit=10, page=0):
+    """文件夹最近邮件列表 (不论未读/旗标, 最新在前, 分页加载):
+    page=0 最近 limit 封, page=N 更早一页; FLAGS + 前 16KB 原文,
+    PEEK 不置已读; has_more=还有更早邮件 (查看更多用)."""
     M, err = _connect(acct)
     if err:
         return {"ok": False, "err": err}
@@ -628,10 +629,14 @@ def fetch_msgs(acct, raw_q, limit=30):
         st, _ = M.select(raw_q, readonly=True)
         if st != "OK":
             return {"ok": False, "err": "文件夹打开失败"}
-        ids = _search_uf(M)
-        recent = ids[-limit:]
+        st, data = M.uid("SEARCH", "ALL")
+        ids = data[0].split() if st == "OK" and data and data[0] else []
+        end = len(ids) - page * limit                 # 尾端往前取页
+        recent = ids[max(0, end - limit):end]
+        has_more = len(ids) > (page + 1) * limit
         if not recent:
-            return {"ok": True, "msgs": [], "total": 0}
+            return {"ok": True, "msgs": [], "total": len(ids),
+                    "page": page, "has_more": len(ids) > page * limit}
         st, fetched = M.uid("FETCH", b",".join(recent).decode("ascii"),
                             "(FLAGS BODY.PEEK[]<0.16384>)")
         if st != "OK":

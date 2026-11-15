@@ -1426,11 +1426,37 @@ def test_mail_keys():
         {"raw": "\"&XfJT0ZAB-\"", "name": "已发送", "unread": 0, "total": 4}]})
     assert [f["name"] for f in app.mail_folders] == \
         ["全部未读", "全部红旗", "INBOX", "已发送"]
+    app.mail_sel = 2                              # INBOX (第三列)
+    app.key(pygame.K_RIGHT)                   # 三列网格: → 同行 +1
+    assert app.mail_sel == 3
+    app.key(pygame.K_LEFT)
+    assert app.mail_sel == 2
+    app.key(pygame.K_UP)                      # ↑ 跨行 -3 (钳 0)
+    assert app.mail_sel == 0
+    app.key(pygame.K_DOWN)                    # ↓ 跨行 +3
+    assert app.mail_sel == 3
     app.mail_sel = 2                              # INBOX (虚拟夹 2 个在前)
     app.key(pygame.K_RETURN)
     assert app.mail_lv == "list" and app.mail_folder == "INBOX"
     assert sum(1 for t in app.net.got
                if t[0] == "job" and t[1].startswith("mail_list")) >= 1
+    app.on_net("data", "mail_list:user@163.com",
+               {"ok": True, "total": 25, "page": 0, "has_more": True,
+                "msgs": [{"uid": "b%d" % i, "subject": "m%d" % i,
+                          "from": "x", "date": "d", "preview": "",
+                          "seen": True, "flagged": False}
+                         for i in range(10)]})
+    assert len(app.mail_msgs) == 10 and app.mail_has_more
+    assert app._mail_view_msgs() == app.mail_msgs  # 单夹全量 (已读也显示)
+    app.key(pygame.K_6)                       # 加载更多 (更早 10 封)
+    assert ("job", "mail_list:user@163.com:p1") in app.net.got
+    app.on_net("data", "mail_list:user@163.com:p1",
+               {"ok": True, "total": 25, "page": 1, "has_more": False,
+                "msgs": [{"uid": "a%d" % i, "subject": "o%d" % i,
+                          "from": "x", "date": "d", "preview": "",
+                          "seen": True, "flagged": False}
+                         for i in range(10)]})
+    assert len(app.mail_msgs) == 20 and not app.mail_has_more
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "folders"
     app.key(pygame.K_ESCAPE)
@@ -1855,9 +1881,8 @@ def test_mail_live():
         len(r["folders"]), inbox.get("total"), inbox.get("unread")))
     r = mailmod.fetch_msgs(acct, inbox["raw"], 5)
     assert r["ok"], r
-    for m in r["msgs"]:
-        # 服务端 OR UNSEEN FLAGGED 口径: 每条必须未读或有旗
-        assert (not m["seen"]) or m["flagged"], m
+    for m in r["msgs"]:                   # 单夹口径 = 最近全量 (含已读)
+        pass
         print("  %s [%s%s] %s | %s" % (m["date"], "未读" if not m["seen"] else "",
                                        "旗" if m["flagged"] else "",
                                        m["from"][:22], m["subject"][:34]))
