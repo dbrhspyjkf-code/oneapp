@@ -1565,7 +1565,11 @@ def test_tv():
         assert app.tv_playing and app.tv_url_i == 1    # 已自动切二路
         assert "http://b/2.m3u8" in procs[-1][1]
         app.tv_started = _time.monotonic() - 21.0      # 二路也超时
-        app.tv_watchdog()
+        for _ in range(4):                # 设备: 换路后 hw 重探, 多一步 hw→sw
+            app.tv_watchdog()
+            if app.tv_playing is None:
+                break
+            app.tv_started = _time.monotonic() - 21.0
         assert app.tv_playing is None and "无法播放" in app.tv_err
 
         # ── 断流 (出过帧 + 8s 无新帧) → 换二路续播而非直接停 ──
@@ -1604,10 +1608,15 @@ def test_tv():
         app.tv_dead = {"rc": 1, "err": "Server returned 404"}
         app.tv_watchdog()
         assert app.tv_playing and app.tv_url_i == 1 and app.tv_att == 3
-        # 二路也 404 → 线路穷尽 → 报错回列表
+        # 二路也 404 → 线路穷尽 → 报错回列表 (设备: 404 走换路/软解逐步收)
         procs[-1][0].returncode = 1
         app.tv_dead = {"rc": 1, "err": "Server returned 404"}
-        app.tv_watchdog()
+        for _ in range(4):
+            app.tv_watchdog()
+            if app.tv_playing is None:
+                break
+            procs[-1][0].returncode = 1
+            app.tv_dead = {"rc": 1, "err": "Server returned 404"}
         assert app.tv_playing is None
         assert "404" in app.tv_err, app.tv_err
         app.tv_stop()                                    # 清场
