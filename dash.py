@@ -3978,6 +3978,12 @@ class App:
                 cur = self.cfg["cards"].get(ck, ck != "usage")
                 self.cfg["cards"][ck] = not cur
                 self.cfg_save()
+                if self.cfg["cards"][ck]:
+                    on = sum(1 for v in self.cfg["cards"].values()
+                             if v)
+                    if on > 3:
+                        self.osd = ("主页最多显示 3 卡",
+                                    time.monotonic() + 2.5)
             elif rid.startswith("theme:"):
                 self.theme_idx = int(rid.split(":", 1)[1]) % len(THEMES)
                 json.dump({"idx": self.theme_idx}, open(THEME_FILE, "w"))
