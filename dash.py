@@ -4062,7 +4062,7 @@ class App:
                      (pill.centerx, y), right=True)
             elif rid.startswith("theme:"):
                 ti = int(rid.split(":", 1)[1])
-                dot = hex2rgb(THEMES[ti]["accent"])
+                dot = hex2rgb(THEMES[ti]["hero"])   # 预览色 = 主题底色观感
                 pygame.draw.circle(surf, dot, (W - 40, y + 6), 5)
                 if self.theme_idx == ti:
                     text(surf, "✓", 12, hi, (W - 16, y), right=True)
