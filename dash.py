@@ -5665,7 +5665,7 @@ class App:
                 vw = cw2 - 16
                 vy = top0 + 13 + (chh - 13 - BODY) // 2
                 segs = _split_width_segs(txt, BODY, vw)
-                si = int(now // 2) % len(segs)   # 2s 一段轮播
+                si = int(now // 3) % len(segs)   # 3s 一段轮播
                 text(surf, segs[si], BODY, soft, (cx + 8, vy))
             else:
                 text(surf, "获取中" if self.net.mode == "online" else "--",
