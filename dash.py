@@ -9,7 +9,7 @@ pygame 直写 /dev/fb_lcd + 裸 evdev 键盘 (与 sudokuzero 同款基建);
   电台 内置站台直连流 · 音乐 QQ/网易云 直连 (musrc.py) + 本地曲库
   歌词 LRCLIB + 网易兜底 (musrc.lrc_fetch)
 
-键位:  1-5 切页   Z/C/F/X(丝印←→↑↓) 翻页   t 换主题(仅主页)
+键位:  1-5 切页   fn+Z/C/F/X(←→↑↓) 翻页   t 换主题(仅主页)
        Fn+S/Fn+D 音量±  Fn+A 静音        主页长按 Esc 1s 退出
 """
 
@@ -660,7 +660,7 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
                 ("solidot", "Solidot"), ("ifanr", "爱范儿"),
                 ("leiphone", "雷峰网"), ("wscn", "华尔街见闻")]
 
-# ── 工具页: app 卡片入口 (卡片=名字+快捷键, 5×2 网格, Z/C/F/X(←→↑↓) 移动
+# ── 工具页: app 卡片入口 (卡片=名字+快捷键, 5×2 网格, fn+Z/C/F/X(←→↑↓) 移动
 #    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
 TOOL_APPS = [("fx", "汇率"), ("unit", "单位换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
@@ -3439,7 +3439,7 @@ class App:
             textc(surf, "线路 %d/%d" % (self.tv_url_i + 1, len(ch[2])),
                   10, self.th("dim"), W // 2, 76)
         textc(surf, ch[0], 12, self.th("soft"), W // 2, 94)
-        textc(surf, "F/X 换台 · Z/C 换线路 · Esc 返回", 9,
+        textc(surf, "fn+F/X 换台 · fn+Z/C 换线路 · Esc 返回", 9,
               self.th("dim"), W // 2, 136)
 
     def _tv_log(self, line):
@@ -6409,7 +6409,8 @@ def find_keyboard():
     return None
 
 
-# 丝印方向键 F=↑ X=↓ Z=← C=→ (无需 Fn); 其余字母按标准 evdev 码
+# 方向键 = fn 层 (fn+F/X/Z/C → 内核发 103/108/105/106, 官方 fn 表同款);
+# 裸 F/Z/X/C 是字母 (输入态打拼音/英文必需)
 EVDEV_MAP = {
     1: pygame.K_ESCAPE,
     2: pygame.K_1, 3: pygame.K_2, 4: pygame.K_3, 5: pygame.K_4, 6: pygame.K_5,
@@ -6420,7 +6421,9 @@ EVDEV_MAP = {
     43: pygame.K_BACKSLASH, 51: pygame.K_COMMA, 52: pygame.K_PERIOD,
     14: pygame.K_BACKSPACE, 15: pygame.K_TAB, 28: pygame.K_RETURN,
     96: pygame.K_KP_ENTER, 111: pygame.K_DELETE, 57: pygame.K_SPACE,
-    33: pygame.K_UP, 44: pygame.K_LEFT, 45: pygame.K_DOWN, 46: pygame.K_RIGHT,
+    33: pygame.K_f, 44: pygame.K_z, 45: pygame.K_x, 46: pygame.K_c,
+    102: pygame.K_HOME, 104: pygame.K_PAGEUP,              # fn+K/L
+    107: pygame.K_END, 109: pygame.K_PAGEDOWN, 110: pygame.K_INSERT,
     103: pygame.K_UP, 108: pygame.K_DOWN, 105: pygame.K_LEFT, 106: pygame.K_RIGHT,
     16: pygame.K_q, 17: pygame.K_w, 18: pygame.K_e, 19: pygame.K_r, 20: pygame.K_t,
     21: pygame.K_y, 22: pygame.K_u, 23: pygame.K_i, 24: pygame.K_o, 25: pygame.K_p,

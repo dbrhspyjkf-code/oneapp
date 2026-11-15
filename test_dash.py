@@ -1590,7 +1590,16 @@ def test_driver_sym():
     # 无修饰: 原样
     assert dash.keychar(3, "2", mods_none) == "2"
     assert dash.keychar(27, "]", mods_none) == "]"
-    print("driver sym OK (official sym table/@/.:letters-punct/shiftcaps)")
+    # 驱动码表: 裸 F/Z/X/C 是字母 (输入态打字), 方向键在 fn 层码
+    assert dash.EVDEV_MAP[33] == pygame.K_f and dash.EVDEV_CHARS[33] == "f"
+    assert dash.EVDEV_MAP[44] == pygame.K_z and dash.EVDEV_CHARS[44] == "z"
+    assert dash.EVDEV_MAP[45] == pygame.K_x and dash.EVDEV_CHARS[45] == "x"
+    assert dash.EVDEV_MAP[46] == pygame.K_c and dash.EVDEV_CHARS[46] == "c"
+    assert dash.EVDEV_MAP[103] == pygame.K_UP      # fn+F
+    assert dash.EVDEV_MAP[108] == pygame.K_DOWN    # fn+X
+    assert dash.EVDEV_MAP[105] == pygame.K_LEFT    # fn+Z
+    assert dash.EVDEV_MAP[106] == pygame.K_RIGHT   # fn+C
+    print("driver sym OK (official sym table/@/.:letters-punct/shiftcaps/fzxc)")
 
 
 def test_mail_compose():
