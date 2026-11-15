@@ -460,9 +460,8 @@ def test_tools():
     assert app.page == 5                          # 8 → 工具页
     app.tool_open("music")
     assert app.tool == "music" and app.mu_view == "play"   # 主页即播放页
-    app.esc_hold_at = _time.monotonic() - 1.1     # 回拨: 视为已长按满 1s
-    app.esc_hold_poll()
-    assert app.esc_hold_at is None and app.tool is None    # 长按满 → 退音乐
+    app.key(pygame.K_ESCAPE)                      # Esc 直接退出 (无 1s 长按)
+    assert app.tool is None
     # 汇率: 字段循环 / 金额键入 / UP 增加 DOWN 减少
     app.tool_open("fx")
     app.fx_amt = "1"

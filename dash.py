@@ -3630,7 +3630,8 @@ class App:
                         self.mu_input = False      # 音乐搜索输入态
                         self.mu_q = ""
                 elif self.tool == "music" and self.mu_view == "play":
-                    self.esc_hold_at = time.monotonic()  # 长按满 1s 才退出
+                    self.tool_close()          # Esc 直接退出音乐 (2026-11-15
+                    return True                #   用户定版: 去掉 1s 长按限制)
                 elif self.tool == "music" and self.mu_view == "qr":
                     if self.mu_qr and self.mu_qr.state != "idle":
                         self.mu_qr.stop()          # 扫码线程掐掉
