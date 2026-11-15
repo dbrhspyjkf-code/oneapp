@@ -5506,8 +5506,8 @@ class App:
         ck = self.cfg.get("cards", {})
         vis = [(lab, key) for lab, key in
                (("每日一句", "hitokoto"), ("新闻", "news"),
-                ("自选股", "fin"), ("USAGE", "usage"))
-               if ck.get(key, key != "usage")]      # USAGE 默认关
+                ("USAGE", "usage"), ("自选股", "fin"))
+               if ck.get(key, key != "usage")][:3]  # 右列最多 3 卡 (用户定版)
         nc = max(1, len(vis))
         gap = M
         chh = (137 - M * (nc - 1)) // nc           # 动态均分右列高
@@ -5550,27 +5550,14 @@ class App:
             news = self._news_items()
             now = time.monotonic()
             if news:
-                vw = cw2 - 16
+                if now - self._news_at > 10:           # 10s 轮换头条 (无跑马灯)
+                    self._news_at = now
+                    self.news_i = (self.news_i + 1) % len(news)
                 headline = news[self.news_i]["t"]
-                tw = textw(headline, BODY)
-                if tw <= vw:
-                    if now - self._news_at > 10:
-                        self._news_at = now
-                        self.news_i = (self.news_i + 1) % len(news)
-                else:
-                    SPEED = 28.0                       # px/s
-                    span = tw + vw + 24                # 右进左出全程
-                    if now - self._news_at > span / SPEED + 1.2:
-                        self._news_at = now
-                        self.news_i = (self.news_i + 1) % len(news)
-                        headline = news[self.news_i]["t"]
-                        tw = textw(headline, BODY)
-                    vy2 = top1 + 13 + (chh - 13 - BODY) // 2
-                    off = (now - self._news_at) * SPEED
-                    x = cx + 8 + vw - off              # 右缘进入, 向左滚出
-                    surf.set_clip((cx + 8, top1, vw, chh))
-                    text(surf, headline, BODY, soft, (x, vy2))
-                    surf.set_clip(None)
+                vw = cw2 - 16
+                vy2 = top1 + 13 + (chh - 13 - BODY) // 2
+                text(surf, clip_text(headline, BODY, vw), BODY, soft,
+                     (cx + 8, vy2))
             else:
                 text(surf, "获取中" if self.net.mode != "offline" else "离线",
                      BODY, dim, (cx + 8, top1 + 16))

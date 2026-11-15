@@ -331,10 +331,12 @@ def glm_usage(key):
                           "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=8) as r:
             j = json.loads(r.read().decode("utf-8", "replace"))
-        if not j.get("success"):
+        if not (j.get("success") or j.get("code") == 200):
             return {"ok": False, "err": str(j.get("msg", ""))[:40]}
+        data = j.get("data") or {}
+        items = data.get("quota_limits") or data.get("limits") or []
         p5 = pw = None
-        for it in (j.get("data") or {}).get("quota_limits") or []:
+        for it in items:
             u, pc = it.get("unit"), it.get("percentage")
             if u == 3 and pc is not None:
                 p5 = pc                     # unit3 = 5h token 配额
@@ -354,7 +356,7 @@ def ds_balance(key):
         with urllib.request.urlopen(req, timeout=8) as r:
             j = json.loads(r.read().decode("utf-8", "replace"))
         cny = ""
-        for b in j.get("balances") or []:
+        for b in j.get("balances") or j.get("balance_infos") or []:
             if b.get("currency") == "CNY":
                 cny = b.get("total_balance", "")
         return {"ok": True, "cny": cny}
