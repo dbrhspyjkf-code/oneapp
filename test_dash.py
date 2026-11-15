@@ -228,17 +228,27 @@ def test_render():
     assert app.key(0, "Z") and app.buf == "aZ"
     assert app.key(pygame.K_BACKSPACE) and app.buf == "a"
     assert app.key(pygame.K_ESCAPE) and not app.in_input
-    # 电台页: 内置台表 + 语言分类 + VU tick 数学
+    # 电台页: 内置台表 (四组) + 分组列表 + VU tick 数学
     import radio_stations
     app.page = 2
     app.draw(canvas)
-    assert len(radio_stations.STATIONS) == 20
-    assert dash.App._st_lang({"name": "深圳交通广播"}) == "zh"
-    assert dash.App._st_lang({"name": "BBC World Service"}) == "en"
-    assert len(app.stations()) == 11              # zh 台
-    app.radio_lang = "en"
-    assert len(app.stations()) == 9               # en 台
-    app.radio_lang = "zh"
+    assert len(radio_stations.STATIONS) == 204
+    assert app.radio_tabs() == ["★"] + radio_stations.GROUPS
+    app.radio_grp = 1                             # 国家
+    assert all(s["grp"] == "国家" for s in app.radio_list())
+    app.radio_grp = 4                             # 国际
+    assert all(s["grp"] == "国际" for s in app.radio_list())
+    app.radio_grp = 0                             # ★ (空)
+    assert app.radio_list() == []
+    app.wx_loc = {"city": "深圳", "prov": "广东省"}  # 本地置顶: 同城>同省
+    app.radio_grp = 3                             # 地方
+    lst = app.radio_list()
+    assert lst[0]["city"] == "深圳" and lst[1]["city"] == "深圳"
+    app.radio_grp = 2                             # 省级
+    lst = app.radio_list()
+    assert all(s.get("prov") == "广东" for s in lst[:5])   # 广东 5 台置顶区
+    assert radio_stations.local_rank(lst[0], "广东", "深圳") == 1
+    app.wx_loc = None
     app.lvl.lvl = (100.0, 0.0, 0.0)               # 纯 bass → 左侧条高右侧低
     for i in range(30):
         app.vu_tick(_time.monotonic() + i * 0.13, *app.lvl.lvl)
@@ -794,7 +804,7 @@ def test_radio_out():
         real_raop = dash.App._radio_play_raop
         dash.App._radio_play_raop = fake_raop
         try:
-            st = app3.stations()[0]
+            st = app3.radio_list(1)[0]
             app3.playing_key = st["key"]
             app3.key(pygame.K_o)              # 本机→A (停旧 + 续播同台)
             assert app3.radio_out == 1 and played[-1] == (st["key"], "ida")
@@ -816,6 +826,7 @@ def test_radio_out():
         app3b.page = 2
         app3b.raop = devs
         app3b.radio_out = 1
+        app3b.radio_grp = 1                      # 国家组 (Enter 走当前组台表)
         played2 = []
 
         def fake_raop2(self, st, dev):
@@ -825,7 +836,7 @@ def test_radio_out():
 
         dash.App._radio_play_raop = fake_raop2
         try:
-            sts = app3b.stations()
+            sts = app3b.radio_list(1)
             app3b.rsel = 0
             app3b.key(pygame.K_RETURN)          # 停播起播 A
             assert app3b.playing_key == sts[0]["key"] and len(played2) == 1
@@ -993,6 +1004,65 @@ def test_radio_out():
         assert prod.poll() is not None and cons.poll() is not None, \
             "radio_stop 未杀掉忽略 SIGTERM 的进程 (futex 僵尸复现)"
         print("radio out OK (filter/restore/cycle/fallback/keys/vol/kill)")
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def test_radio_groups():
+    """电台分组/收藏: ★组增删持久化 + 切组光标记忆 + 5 键在电台页不被跳页截走."""
+    import shutil as _sh
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.RADIO_FAV_CACHE = os.path.join(tmp, "radio_fav.json")
+    dash.RADIO_OUT_FILE = os.path.join(tmp, "radio_out.json")
+    dash.RAOP_CACHE = os.path.join(tmp, "raop.json")
+    try:
+        import radio_stations
+        assert dash.App.radio_tabs() == ["★", "国家", "省级", "地方", "国际"]
+        assert radio_stations.norm_prov("广东省") == "广东"
+        assert radio_stations.norm_prov("Guangdong") == "广东"
+        assert radio_stations.norm_prov("内蒙古自治区") == "内蒙古"
+        assert radio_stations.norm_prov("Overijssel") is None
+        assert radio_stations.norm_city("深圳市") == "深圳"
+        st = radio_stations.STATIONS[0]
+        assert radio_stations.local_rank(
+            {"prov": "广东", "city": "深圳"}, "广东", "深圳") == 0
+        assert radio_stations.local_rank({"prov": "湖南"}, "广东", None) == 2
+
+        app = dash.App(FakeNet())
+        app.page = 2
+        app.radio_grp = 1                            # 国家
+        nat = app.radio_list()
+        assert nat and all(x["grp"] == "国家" for x in nat)
+        app.rsel = 2                                 # 光标记忆: 切走再切回
+        app.radio_grp_cycle(1)
+        app.radio_grp_cycle(-1)
+        assert app.radio_grp == 1 and app.rsel == 2, "切组应恢复各组光标"
+
+        app.radio_grp = 1
+        app.rsel = 0
+        app.key(pygame.K_5)                          # 5 收藏 (不落跳页分支)
+        assert app.page == 2
+        assert app.radio_fav == [nat[0]["key"]]
+        import os as _os
+        assert _os.path.exists(dash.RADIO_FAV_CACHE)
+        app.radio_grp = 0                            # ★ 组出现该台
+        assert [x["key"] for x in app.radio_list()] == [nat[0]["key"]]
+        app.key(pygame.K_5)                          # 再按取消
+        assert app.radio_fav == [] and app.radio_list() == []
+        # 持久化回读 (新实例恢复收藏)
+        app.radio_grp = 1
+        app.rsel = 0
+        app.key(pygame.K_5)
+        app2 = dash.App(FakeNet())
+        assert app2.radio_fav == [nat[0]["key"]], "收藏应随 radio_fav.json 恢复"
+        app.draw(canvas)                             # 全组绘制冒烟 (含空★组)
+        app.radio_grp = 3
+        app.draw(canvas)
+        print("radio groups OK (tabs/fav/persist/cursor/local)")
     finally:
         _sh.rmtree(tmp, ignore_errors=True)
 
@@ -1739,6 +1809,7 @@ if __name__ == "__main__":
     test_music()
     test_mu_airplay()
     test_radio_out()
+    test_radio_groups()
     test_tv()
     test_voice()
     test_ime()

@@ -120,6 +120,7 @@ WX_LOC_FILE = os.path.join(STATE_DIR, "wx_loc.json")   # IP 归属地快照
 # Dash 已装); 缺库/无设备时 O 键回落本机。局域网自动发现 (mDNS 扫描)。
 RAOP_CACHE = os.path.join(STATE_DIR, "raop_devs.json")
 RADIO_OUT_FILE = os.path.join(STATE_DIR, "radio_out.json")
+RADIO_FAV_CACHE = os.path.join(STATE_DIR, "radio_fav.json")   # 电台收藏 (key 表)
 RAOP_VOL_FILE = os.path.join(STATE_DIR, "raop_vol.json")   # AirPlay 会话音量记忆
 _RAOP_SKIP = re.compile(r"电视|tv|macbook|ipad|iphone", re.I)
 
@@ -1258,7 +1259,9 @@ class App:
         self.scroll = 0
         self.player = None                    # ffplay 子进程 (电台)
         # 电台页状态
-        self.radio_lang = "zh"                # zh | en (名字首字符拉丁 → en)
+        self.radio_grp = 0                    # 分组索引 (0=收藏, 1+=GROUPS)
+        self.radio_sels = {}                  # 各组光标记忆 (切组恢复)
+        self.radio_fav = self.radio_fav_load()
         self.rsel = 0
         self.rscroll = 0
         self.playing_key = None               # 播放中电台 key
@@ -1733,17 +1736,75 @@ class App:
 
     # ── 电台 ──
     @staticmethod
-    def _st_lang(s):
-        n = (s.get("name") or " ")[0]
-        return "en" if (n.isascii() and n.isalpha()) else "zh"
-
-    STATIONS_CACHE = os.path.join(STATE_DIR, "stations_cache.json")
-
-    def stations(self):
-        """台表: 内置 (radio_stations.STATIONS), 按语言过滤."""
+    def radio_tabs():
+        """分组页签: 收藏在最前 (打开即看), 后接四组."""
         import radio_stations
-        return [s for s in radio_stations.STATIONS
-                if self._st_lang(s) == self.radio_lang]
+        return ["★"] + radio_stations.GROUPS
+
+    @staticmethod
+    def radio_fav_load():
+        """收藏 key 表 (radio_fav.json); 坏数据当空."""
+        v = netmod.load_json_file(RADIO_FAV_CACHE, []) or []
+        return [k for k in v if isinstance(k, str)]
+
+    def radio_list(self, grp=None):
+        """分组台表 (grp=None → 当前组). 0=收藏 (key→台, 缺剔);
+        省级/地方组按 IP 归属地本地置顶 (同城>同省>其他, 稳定排序)."""
+        import radio_stations
+        g = self.radio_grp if grp is None else grp
+        if g == 0:
+            by = {s["key"]: s for s in radio_stations.STATIONS}
+            return [by[k] for k in self.radio_fav if k in by]
+        lst = [s for s in radio_stations.STATIONS
+               if s["grp"] == radio_stations.GROUPS[g - 1]]
+        prov, city = self.radio_local()
+        if prov or city:
+            lst = sorted(lst, key=lambda s: radio_stations.local_rank(
+                s, prov, city))
+        return lst
+
+    def radio_local(self):
+        """IP 归属地 → (prov, city) 匹配锚点; 未定位/境外返回 (None, None)."""
+        import radio_stations
+        w = self.wx_loc or {}
+        prov = radio_stations.norm_prov(w.get("prov"))
+        city = radio_stations.norm_city(w.get("city"))
+        return (prov, city)
+
+    def radio_grp_cycle(self, d):
+        """←→ 切分组 (光标按组记忆; 空组归 0)."""
+        self.radio_sels[self.radio_grp] = self.rsel
+        self.radio_grp = (self.radio_grp + d) % len(self.radio_tabs())
+        lst = self.radio_list()
+        self.rsel = min(self.radio_sels.get(self.radio_grp, 0),
+                        max(0, len(lst) - 1))
+        self.rscroll = max(0, min(self.rsel - 5, max(0, len(lst) - 7)))
+
+    def radio_fav_toggle(self):
+        """5 键收藏/取消 (播放中=当前台, 列表=选中台); 落 radio_fav.json."""
+        import radio_stations
+        cur = next((s for s in radio_stations.STATIONS
+                    if s["key"] == self.playing_key), None)
+        lst = self.radio_list()
+        st = cur or (lst[self.rsel] if 0 <= self.rsel < len(lst) else None)
+        if not st:
+            return
+        k = st["key"]
+        if k in self.radio_fav:
+            self.radio_fav.remove(k)
+            self.osd = ("已取消收藏", time.monotonic() + 1.2)
+        else:
+            self.radio_fav.append(k)
+            self.osd = ("已收藏 · %s" % st["name"], time.monotonic() + 1.5)
+        netmod.save_json_file(RADIO_FAV_CACHE, self.radio_fav)
+        n = len(self.radio_list())            # 收藏组可能变短, 光标钳回
+        if self.radio_grp == 0 and n:
+            self.rsel = min(self.rsel, n - 1)
+
+    def radio_st_by_key(self, key):
+        import radio_stations
+        return next((s for s in radio_stations.STATIONS
+                     if s["key"] == key), None)
 
     def radio_out_name(self):
         """输出名: 本机 / AirPlay·<设备名>."""
@@ -1775,7 +1836,7 @@ class App:
         self.osd = ("输出: %s" % self.radio_out_name(),
                     time.monotonic() + 1.5)
         if prev:
-            st = next((s for s in self.stations() if s["key"] == prev), None)
+            st = self.radio_st_by_key(prev)
             if st:
                 self.radio_play(st)
 
@@ -2020,7 +2081,7 @@ class App:
         self.vu_pk = [3.0] * 12
 
     def radio_toggle(self):
-        sts = self.stations()
+        sts = self.radio_list()
         if not (0 <= self.rsel < len(sts)):
             return
         if self.playing_key == sts[self.rsel]["key"]:
@@ -3553,6 +3614,7 @@ class App:
         # 工具网格页: 数字 1-9/0 全部留给 app 直开
         # 电台页无数字占用 (列表无序号, 换台走 ↑↓+Enter, 输出走 O)
         page_keys = {1: (4, 5, 7, 8),
+                     2: (5,),                      # 电台 5=收藏 (防全局跳页截走)
                      3: (4, 5, 6, 8), 4: tuple(range(1, 8)),
                      5: tuple(range(0, 10))}
         digit = k - pygame.K_0                # pygame 常量值 → 数字序号
@@ -3567,7 +3629,10 @@ class App:
             elif self.page == 1:
                 self.move_sel(-2 if k == pygame.K_UP else -1)
             elif self.page == 2:
-                self.move_rsel(-1)
+                if k == pygame.K_LEFT:
+                    self.radio_grp_cycle(-1)   # ← 切分组 (↑ 仍移光标)
+                else:
+                    self.move_rsel(-1)
             elif self.page == 3 and not self.fdetail and not self.fin_input \
                         and not self.fin_sync:
                 self._move_fsel(-3 if k == pygame.K_UP else -1)
@@ -3587,7 +3652,10 @@ class App:
             elif self.page == 1:
                 self.move_sel(2 if k == pygame.K_DOWN else 1)
             elif self.page == 2:
-                self.move_rsel(1)
+                if k == pygame.K_RIGHT:
+                    self.radio_grp_cycle(1)    # → 切分组 (↓ 仍移光标)
+                else:
+                    self.move_rsel(1)
             elif self.page == 3 and not self.fdetail and not self.fin_input \
                         and not self.fin_sync:
                 self._move_fsel(3 if k == pygame.K_DOWN else 1)
@@ -3639,10 +3707,8 @@ class App:
         elif self.page == 2:
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.radio_toggle()              # Enter = 播放/暂停
-            elif k == pygame.K_e:
-                self.radio_lang = "en" if self.radio_lang == "zh" else "zh"
-                self.rsel = 0
-                self.rscroll = 0
+            elif k == pygame.K_5:
+                self.radio_fav_toggle()          # 5 = 收藏/取消
             elif k == pygame.K_o:
                 self.radio_out_cycle()           # O = 输出 本机→AirPlay 循环
         elif self.page == 5:
@@ -4469,7 +4535,7 @@ class App:
             self.esc_hold_at = None
 
     def move_rsel(self, d):
-        n = len(self.stations())
+        n = len(self.radio_list())
         if not n:
             return
         self.rsel = (self.rsel + d) % n          # 循环: 顶部↑到底部, 反之亦然
@@ -4617,21 +4683,39 @@ class App:
                               self.th("soft"), self.th("dim"))
         border, track = self.th("border"), self.th("track")
         BODY = 13                                # 与想法页同字号
-        sts = self.stations()
+        sts = self.radio_list()
         playing = bool(self.playing_key)
         LX, LW = 2, 158                          # 列表区 (左, 半屏)
         RX, RW = 164, 152                        # VU 区 (右, 半屏)
+        tabs = self.radio_tabs()
 
-        # 头部
+        # 头部: 电台 · N 台 + 归属地徽标 (IP 匹配激活时右对齐)
+        import radio_stations as _rs
         text(surf, "电台", 14, hi, (6, 2))
-        tab = "EN" if self.radio_lang == "en" else "中文"
-        text(surf, "· %s %d 台 · E 切换" % (tab, len(sts)), 11, dim,
+        text(surf, "· %d 台" % len(_rs.STATIONS), 11, dim,
              (6 + textw("电台", 14) + 6, 4))
-        text(surf, "Enter 播/停 · E 中/英 · O 输出", 13, soft, (6, 151))
+        prov, city = self.radio_local()
+        if prov or city:
+            loc = "·".join(x for x in (prov, city) if x)
+            text(surf, clip_text("本:%s" % loc, 10, LW - textw("电台", 14) - 56),
+                 10, acc, (LX + LW - 6, 5), right=True)
 
-        # 电台列表 (左, 无序号 — 换台走 ↑↓+Enter)
-        rows = 8
-        y0, rh = 20, 15
+        # 分组 tabs (收藏在最前, 电视页同款框选; ★ 组标签即星标本身)
+        gx = 6
+        for i, g in enumerate(tabs):
+            sel = i == self.radio_grp
+            lab = g
+            if sel:
+                r = pygame.Rect(gx - 3, 24, textw(lab, 11) + 6, 15)
+                pygame.draw.rect(surf, self.card(0), r, border_radius=3)
+                pygame.draw.rect(surf, acc, r, 1, border_radius=3)
+            text(surf, lab, 11, hi if sel else soft, (gx, 26))
+            gx += textw(lab, 11) + 9
+
+        # 电台列表 (左, 无序号 — 换台走 ↑↓+Enter, ←→ 切组)
+        prov, city = self.radio_local()          # 本地徽标判据 (循环外一次)
+        rows = 7
+        y0, rh = 42, 15
         for i in range(rows):
             idx = self.rscroll + i
             if idx >= len(sts):
@@ -4639,32 +4723,41 @@ class App:
             st = sts[idx]
             y = y0 + i * rh
             on = st["key"] == self.playing_key
-            sel = idx == self.rsel
+            fav = st["key"] in self.radio_fav
+            local = _rs.local_rank(st, prov, city) < 2
             if idx == self.rsel:
                 pygame.draw.rect(surf, track, (LX, y, LW, rh - 1), border_radius=3)
                 pygame.draw.rect(surf, acc, (LX, y, 2, rh - 1))
             if on:
                 pygame.draw.polygon(surf, acc, [(LX + 8, y + 4), (LX + 8, y + 12),
                                                 (LX + 15, y + 8)])
+            elif fav:
+                text(surf, "★", 11, acc, (LX + 8, y + 1))
             name_col = hi if (on or idx == self.rsel) else soft
-            tx = LX + (20 if on else 8)
-            text(surf, clip_text(st.get("name", ""), BODY, LW - 48 - tx),
+            tx = LX + (20 if on else (18 if fav else 8))
+            # 右列动态预留: 本徽标窄 (26), FM 频率宽 (46)
+            rsv = 26 if local else (46 if st.get("freq") else 12)
+            text(surf, clip_text(st.get("name", ""), BODY, LW - rsv - tx),
                  BODY, name_col, (tx, y + 1))
-            fq = st.get("freq") or 0
-            if fq > 0:
-                text(surf, "FM%.1f" % (fq / 10.0), 10, dim,
-                     (LX + LW - 4, y + 3), right=True)
+            if local:
+                text(surf, "本", 10, acc, (LX + LW - 4, y + 3), right=True)
+            else:
+                fq = st.get("freq") or 0
+                if fq > 0:
+                    text(surf, "FM%.1f" % (fq / 10.0), 10, dim,
+                         (LX + LW - 4, y + 3), right=True)
 
-        if not sts:
-            textc(surf, "无电台", BODY, dim, LX + LW // 2, 70)
+        if not sts:                             # 空收藏组提示
+            textc(surf, "还没有收藏", BODY, dim, LX + LW // 2, 70)
+            textc(surf, "列表里按 5 收藏喜欢的电台", 10, dim, LX + LW // 2, 92)
+        text(surf, "←→ 组 · Enter 播/停 · 5 ★ · O 输出", 13, soft, (6, 151))
 
         # 右侧 VU 面板 (常驻): 播放中跳动, 未播放静止低位
         if True:
             if playing:
                 lvb, lvm, lvt = self.lvl.lvl
                 self.vu_tick(time.monotonic(), lvb, lvm, lvt)
-            cur = next((s["name"] for s in sts if s["key"] == self.playing_key),
-                       None)
+            cur = (self.radio_st_by_key(self.playing_key) or {}).get("name")
             r = pygame.Rect(RX, 16, RW, 130)
             pygame.draw.rect(surf, self.card(0), r, border_radius=5)
             pygame.draw.rect(surf, border, r, 1, border_radius=5)

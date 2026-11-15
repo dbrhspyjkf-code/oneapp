@@ -111,18 +111,19 @@ def hitokoto_fetch():
 
 # ── IP 归属地 (天气定位; 1800s TTL) ────────────────────────────────────────
 def wx_locate():
-    """出口 IP → {"lat","lon","city","src"}; 全源失败返回 None (UI 回落深圳).
-    ① ip-api.com (免费 http, 中文城市+经纬度一步到位; 2026-11-14 家宽实测通)
-    ② api.ip.sb/geoip (备用; 英文城市)
-    热点/CGNAT 下归属地=运营商出口, 省市级精度, 对天气够用."""
+    """出口 IP → {"lat","lon","city","prov","src"}; 全源失败返回 None (UI 回落深圳).
+    ① ip-api.com (免费 http, 中文省市+经纬度一步到位; 2026-11-14 家宽实测通)
+    ② api.ip.sb/geoip (备用; 英文省市, prov 走别名表归一)
+    热点/CGNAT 下归属地=运营商出口, 省市级精度, 对天气/电台本地组够用."""
     try:
         j = _get_json_direct(
-            "http://ip-api.com/json/?lang=zh-CN&fields=status,city,lat,lon",
+            "http://ip-api.com/json/?lang=zh-CN&fields=status,city,regionName,lat,lon",
             timeout=4)
         if str(j.get("status")).lower() == "success" \
                 and j.get("lat") is not None:
             out = {"lat": float(j["lat"]), "lon": float(j["lon"]),
                    "city": (j.get("city") or "").strip() or "定位",
+                   "prov": (j.get("regionName") or "").strip(),
                    "src": "ip-api"}
             _snap_write("wx_loc.json", out)
             return out
@@ -133,6 +134,7 @@ def wx_locate():
         if j.get("latitude") is not None:
             out = {"lat": float(j["latitude"]), "lon": float(j["longitude"]),
                    "city": (j.get("city") or "").strip() or "定位",
+                   "prov": (j.get("region") or "").strip(),
                    "src": "ip.sb"}
             _snap_write("wx_loc.json", out)
             return out
