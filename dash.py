@@ -1621,6 +1621,9 @@ class App:
                     self.cfg["cloud_user"] = b.get("user") or ""
                     self.cfg_save()
                     self.reg = None            # 成功: 关表单 + ping 验证
+                    if b.get("now"):           # 新号: csync 取服务器钟
+                        self.ideas["csync"] = b["now"]
+                        netmod.save_json_file(IDEAS_FILE, self.ideas)
                     self.cloud_ping_trigger()
                     self.osd = ("注册成功 已连接 %s" % b.get("user"),
                                 time.monotonic() + 2.5)
@@ -1639,6 +1642,9 @@ class App:
                     self.cfg["cloud_user"] = b.get("user") or ""
                     self.cfg_save()
                     self.login = None          # 成功: 关表单 + ping 复核
+                    if b.get("now"):           # 换号: csync 重置 (本地
+                        self.ideas["csync"] = b["now"]   #   不向新号回放)
+                        netmod.save_json_file(IDEAS_FILE, self.ideas)
                     self.cloud_ping_trigger()
                     self.osd = ("已登录 %s" % b.get("user"),
                                 time.monotonic() + 2.5)
@@ -4315,8 +4321,10 @@ class App:
             return [("theme:%d" % i, t["name"])
                     for i, t in enumerate(THEMES)]
         return [("key:glm", "GLM KEY"), ("key:ds", "DS KEY"),
-                ("key:cloud", "想法云地址"), ("login", "登录"),
-                ("reg", "注册新账号"),
+                ("key:cloud", "想法云地址"),
+                ("login", "更换账户" if self.cfg.get("cloud_tok")
+                 else "登录"),
+                ("reg", "注册新账号"), ("logout", "退出登录"),
                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
                 ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡")]
 
@@ -4393,8 +4401,19 @@ class App:
                             time.monotonic() + 2)
             elif rid == "reg":                 # 注册表单 (用户名+邀请码)
                 self.reg = {"name": "", "invite": "", "field": 0}
-            elif rid == "login":               # 登录表单 (已有 TOKEN)
+            elif rid == "login":               # 登录/更换账户 表单
                 self.login = {"tok": ""}
+            elif rid == "logout":              # 退出登录 (本地数据不动)
+                u = self.cfg.get("cloud_user") or ""
+                if self.cfg.get("cloud_tok"):
+                    self.cfg["cloud_tok"] = ""
+                    self.cfg["cloud_user"] = ""
+                    self.cfg_save()
+                    self.osd = ("已退出 %s · 想法仅本地" % u
+                                if u else "已退出",
+                                time.monotonic() + 2.5)
+                else:
+                    self.osd = ("未登录", time.monotonic() + 1.5)
         return True
 
     def _login_key(self, k, ch):
@@ -4434,8 +4453,17 @@ class App:
         except ValueError:
             j = {}
         if st == 200 and j.get("ok"):
+            now = None                      # 换号 → csync 重置到新号当前
+            st2, b2 = netmod.http_raw(url + "/v1/tombstones?since=0",
+                                      timeout=8,
+                                      headers={"Authorization": "Bearer " + tok})
+            if st2 == 200:
+                try:
+                    now = json.loads(b2.decode("utf-8", "replace")).get("now")
+                except ValueError:
+                    now = None
             return {"ok": 1, "user": j.get("user") or "?",
-                    "tok": tok, "url": url}
+                    "tok": tok, "url": url, "now": now}
         return {"ok": 0, "st": st,
                 "err": "TOKEN 无效" if st == 401 else
                        ("HTTP %s" % st if st else "网络异常")}
@@ -4485,8 +4513,19 @@ class App:
             j = json.loads(rbody.decode("utf-8", "replace"))
         except ValueError:
             j = {}
+        now = None                          # 新号 → csync 起点取服务器钟
+        if st == 200:
+            st2, b2 = netmod.http_raw(url + "/v1/tombstones?since=0",
+                                      timeout=8,
+                                      headers={"Authorization": "Bearer " + j.get("token") or ""})
+            if st2 == 200:
+                try:
+                    now = json.loads(b2.decode("utf-8", "replace")).get("now")
+                except ValueError:
+                    now = None
         return {"ok": 1 if st == 200 else 0, "st": st, "err": j.get("err"),
-                "token": j.get("token"), "user": j.get("user"), "url": url}
+                "token": j.get("token"), "user": j.get("user"), "url": url,
+                "now": now}
 
     def _set_mask(self, v):
         return ("..." + v[-6:]) if len(v) > 10 else v
@@ -4604,12 +4643,15 @@ class App:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
                      self.th("danger"), (box.right - 12, box.y + 69),
                      right=True)
-        # ── 登录表单 (覆盖): 已有用户名+TOKEN 的用户 ──
+        # ── 登录表单 (覆盖): 已有用户名+TOKEN 的用户 / 换账户 ──
         if self.login is not None:
             box = pygame.Rect(24, 52, W - 48, 76)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
-            text(surf, "登录想法云", 13, hi, (box.x + 12, box.y + 8))
+            cur = self.cfg.get("cloud_user") or ""
+            title = ("更换账户 (当前 @%s)" % cur) \
+                if self.cfg.get("cloud_tok") else "登录想法云"
+            text(surf, title, 13, hi, (box.x + 12, box.y + 8))
             text(surf, "TOKEN", 12, dim, (box.x + 12, box.y + 30))
             shown = clip_text(self.login["tok"][-24:] + "_", 12, 170)
             text(surf, shown, 12, hi, (box.x + 66, box.y + 30))

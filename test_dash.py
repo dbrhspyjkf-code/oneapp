@@ -1363,11 +1363,11 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=8; 云地址/云TOKEN/注册 三行插入后位移) → 开启被拒
+    # sw:usage 行 (sel=9; 云地址/登录/注册/退出 四行插入后位移) → 开启被拒
     # (前三已开, 上限 3) + OSD 提醒
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
-    assert app._set_rows()[8][0] == "sw:usage"
-    app.set_sel = 8
+    assert app._set_rows()[9][0] == "sw:usage"
+    app.set_sel = 9
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
     assert app.osd and "先关" in app.osd[0], app.osd
@@ -1637,7 +1637,36 @@ def test_login():
     netmod.http_raw = orig_raw
     app.key(pygame.K_ESCAPE)
     assert app.login is None and app.tool == "set"
-    print("login OK (form/fxzc/ping verify/persist/fail-retain/esc)")
+    # 换账户: 已登录 → login 行标签变"更换账户"; 换号成功 csync 重置
+    assert ("login", "更换账户") in app._set_rows()
+    app.ideas = {"texts": [], "voices": [], "csync": 1}
+    orig_raw = netmod.http_raw
+    def raw_switch(url, **k):
+        if "/v1/tombstones" in url:
+            return 200, json.dumps({"ids": [], "now": 777.0}).encode()
+        return 200, json.dumps({"ok": 1, "user": "other"}).encode()
+    netmod.http_raw = raw_switch
+    app.login = {"tok": "n" * 24}
+    app.key(pygame.K_RETURN)
+    d = app.net.last_job("cloudlogin")()
+    assert d["ok"] == 1 and d["now"] == 777.0
+    app.on_net("data", "cloudlogin", d)
+    assert app.cfg["cloud_user"] == "other"
+    assert app.ideas["csync"] == 777.0    # 换号 → csync 重置到新号钟
+    assert json.load(open(dash.IDEAS_FILE))["csync"] == 777.0
+    netmod.http_raw = orig_raw
+    # 退出登录: logout 行 → cfg 清空 + OSD; 未登录再按 → 提示; 标签复原
+    assert ("login", "登录") not in app._set_rows()
+    idx = [r[0] for r in app._set_rows()].index("logout")
+    app.set_sel = idx
+    app.key(pygame.K_RETURN)
+    assert app.cfg.get("cloud_tok") == "" and app.cfg.get("cloud_user") == ""
+    assert app.osd and "已退出" in app.osd[0]
+    assert ("login", "登录") in app._set_rows()
+    app.key(pygame.K_RETURN)               # 未登录再按 logout
+    assert app.osd and "未登录" in app.osd[0]
+    print("login OK (form/fxzc/ping verify/persist/fail-retain/esc/"
+          "switch+csync reset/logout)")
 
 
 def test_mail_keys():
