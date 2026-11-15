@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mail — 邮件 app 直连源 (IMAP 授权码收件) — 纯逻辑, 无 pygame 依赖.
+"""mail — 邮件 app 直连源 (IMAP 授权码收件 + SMTP 发信) — 纯逻辑, 无 pygame 依赖.
 
 设计要点:
-- 纯标准库 imaplib/email, 零第三方依赖 (商店版约束).
+- 纯标准库 imaplib/smtplib/email, 零第三方依赖 (商店版约束).
 - 多账号: PROVIDERS 域名注册表预留 (163/126/yeah/qq/outlook/gmail),
   新邮箱 = 加一条 dict 即可, UI 层零改动; 账号 (含授权码明文) 存
   STATE_DIR/mail.json, net.save_json_file 0600 原子落盘.
@@ -12,6 +12,9 @@
   worker 吞异常丢详情, UI 只能报错误气泡).
 - 163 坑: 登录后补发 IMAP ID 命令 (163 对无 ID 客户端偶发 Unsafe
   Login 拒连, 加了无害); 列表/正文一律 BODY.PEEK 不误标已读.
+- 发信: SMTP_SSL 465 直发 (授权码同 IMAP), 成功后尽力 APPEND 已发送
+  (163/126 类 SMTP 发出不自动存 Sent; 文件夹名 LIST 解码后按
+  已发送/Sent 匹配, 失败静默不影响发送结果).
 - 解析函数移植自家庭版 server/email-status-server.py (真机验证多年):
   RFC2047 头解码 / HTML 剥离 / 引言签名裁剪 / IMAP UTF-7.
 """
@@ -22,8 +25,10 @@ import email.utils
 import imaplib
 import os
 import re
+import smtplib
 from email.header import decode_header
-from email.utils import parsedate_to_datetime
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid, parsedate_to_datetime
 
 import net as netmod
 
@@ -49,7 +54,7 @@ PROVIDERS = {
     "gmail.com":    {"imap": "imap.gmail.com",    "port": 993,
                      "smtp": "smtp.gmail.com",    "sport": 465},
 }
-SMTP_PORT = 465                                     # smtp 预留 (v1 只收件)
+SMTP_PORT = 465                                     # smtp 默认口 (outlook 587)
 
 
 def provider_for(addr):
@@ -330,8 +335,9 @@ _TIMEOUT = 12
 
 def _friendly_err(e):
     s = str(e)
-    if "AUTHENTICATIONFAILED" in s or "LOGIN failed" in s:
-        return "登录被拒 (授权码错或未开 IMAP)"
+    if isinstance(e, smtplib.SMTPAuthenticationError) \
+            or "AUTHENTICATIONFAILED" in s or "LOGIN failed" in s:
+        return "登录被拒 (授权码错或未开 IMAP/SMTP)"
     if "Unsafe Login" in s:
         return "服务端拒连 (Unsafe Login)"
     if "timeout" in s.lower() or "timed out" in s.lower():
@@ -438,9 +444,9 @@ def list_folders(acct):
             pass
 
 
-def fetch_msgs(acct, raw_q, view="all", limit=20):
-    """文件夹邮件列表 (最新在前): FLAGS + 前 16KB 原文, PEEK 不置已读.
-    view: all | unread."""
+def fetch_msgs(acct, raw_q, limit=30):
+    """未读+旗标邮件列表 (最新在前, 服务端 OR 搜索, 不拉全量):
+    FLAGS + 前 16KB 原文, PEEK 不置已读."""
     M, err = _connect(acct)
     if err:
         return {"ok": False, "err": err}
@@ -448,7 +454,7 @@ def fetch_msgs(acct, raw_q, view="all", limit=20):
         st, _ = M.select(raw_q, readonly=True)
         if st != "OK":
             return {"ok": False, "err": "文件夹打开失败"}
-        st, data = M.uid("SEARCH", "UNSEEN" if view == "unread" else "ALL")
+        st, data = M.uid("SEARCH", "OR", "UNSEEN", "FLAGGED")
         ids = data[0].split() if st == "OK" and data and data[0] else []
         recent = ids[-limit:]
         if not recent:
@@ -491,7 +497,8 @@ def fetch_msgs(acct, raw_q, view="all", limit=20):
 
 
 def fetch_body(acct, raw_q, uid):
-    """详情正文: 前 128KB 原文 → 纯文本 (换行结构保留)."""
+    """详情正文: 前 128KB 原文 → 纯文本 (换行结构保留).
+    附带回信元数据 (msg_id/refs/from_addr/date, 回复预填 + In-Reply-To 用)."""
     M, err = _connect(acct)
     if err:
         return {"ok": False, "err": err}
@@ -504,9 +511,18 @@ def fetch_body(acct, raw_q, uid):
                 or not isinstance(data[0], tuple) or not data[0][1]:
             return {"ok": False, "err": "取正文失败"}
         msg = email_mod.message_from_bytes(data[0][1])
+        try:
+            _, from_addr = email.utils.parseaddr(
+                msg.get("Reply-To") or msg.get("From") or "")
+        except Exception:
+            from_addr = ""
         return {"ok": True, "uid": uid,
                 "subject": decode_subject(msg["Subject"]),
-                "text": extract_body(msg)}
+                "text": extract_body(msg),
+                "msg_id": (msg.get("Message-ID") or "").strip(),
+                "refs": (msg.get("References") or "").strip(),
+                "from_addr": from_addr,
+                "date": fmt_date(msg.get("Date"))}
     except Exception as e:
         return {"ok": False, "err": _friendly_err(e)}
     finally:
@@ -545,6 +561,93 @@ def mail_action(acct, raw_q, uid, action):
             M.logout()
         except Exception:
             pass
+
+
+_SENT_NAMES = ("sent messages", "sent items", "sent mail", "sent")
+
+
+def _append_sent(addr, auth, msg):
+    """发信后尽力把原件 APPEND 到服务器已发送夹.
+    163/126 类 SMTP 会自动存 Sent (QQ 不存) — 先按 Message-ID 查重,
+    服务器已有则跳过, 两类服务商都不产生重复. LIST 解码后按
+    已发送/Sent 匹配文件夹; 任何失败静默 (不影响发送结果)."""
+    try:
+        p = provider_for(addr)
+        if not p["imap"]:
+            return
+        M = imaplib.IMAP4_SSL(p["imap"], p.get("port", 993), timeout=_TIMEOUT)
+        try:
+            M.login(addr, auth)
+            try:                               # 163 ID 命令 (同 _connect 口径)
+                M.xatom("ID", '("name" "ONEAPP" "version" "1.0.0")')
+            except Exception:
+                pass
+            st, lst = M.list()
+            box = ""
+            if st == "OK":
+                for item in lst or []:
+                    if not item:
+                        continue
+                    m = _LIST_RE.match(
+                        item.decode("utf-8", "replace").strip())
+                    if not m:
+                        continue
+                    raw = m.group("name").strip()
+                    disp = _decode_imap_utf7(raw.strip('"')).lower()
+                    if "已发送" in disp or disp in _SENT_NAMES:
+                        box = raw
+                        break
+            if box:
+                mid = (msg.get("Message-ID") or "").strip()
+                have = False
+                if mid:                        # SMTP 自动存档的服务商已有原件
+                    st, data = M.uid("SEARCH", "HEADER", "Message-ID",
+                                     '"%s"' % mid)
+                    have = st == "OK" and data and data[0] \
+                        and bool(data[0].split())
+                if not have:
+                    M.append(box, "\\Seen", None, msg.as_bytes())
+        finally:
+            try:
+                M.logout()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def send_mail(acct, to, subject, body, in_reply_to="", references=""):
+    """SMTP_SSL 直发 (授权码同 IMAP). 回信带 In-Reply-To/References 头.
+    成功后尽力存服务器已发送副本 (查重防双份). 返回 {"ok","err"} 不抛异常."""
+    addr, auth = acct.get("email", ""), acct.get("auth", "")
+    if not addr or not auth:
+        return {"ok": False, "err": "账号未配置"}
+    to = (to or "").strip()
+    if "@" not in to:
+        return {"ok": False, "err": "收件人格式不对"}
+    p = provider_for(addr)
+    if not p["smtp"]:
+        return {"ok": False, "err": "无法识别邮箱域名"}
+    msg = EmailMessage()
+    msg["From"] = addr
+    msg["To"] = to
+    msg["Subject"] = (subject or "").strip() or "(无主题)"
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=addr.rsplit("@", 1)[-1])
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = ((references + " " + in_reply_to).strip()
+                             [:900])           # 头过长部分服务器会拒
+    msg.set_content((body or "").strip() or " ")
+    try:
+        with smtplib.SMTP_SSL(p["smtp"], p.get("sport", SMTP_PORT),
+                              timeout=15) as S:
+            S.login(addr, auth)
+            S.send_message(msg)
+    except Exception as e:
+        return {"ok": False, "err": _friendly_err(e)}
+    _append_sent(addr, auth, msg)
+    return {"ok": True, "err": ""}
 
 
 def inbox_unread(acct):

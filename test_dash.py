@@ -1365,24 +1365,41 @@ def test_mail_keys():
          "date": "11-13 08:00", "preview": "", "seen": True,
          "flagged": True}]})
     assert app.mail_total == 2 and len(app.mail_msgs) == 2
+    assert app.mail_got                     # 列表已落地 (区分空/加载中)
+    # 未读+旗标口径: 已读且无旗标的行本地即时消失 (uid 10 已读但有旗 → 保留)
+    view = app._mail_view_msgs()
+    assert [m["uid"] for m in view] == ["11", "10"], view
+    app.mail_msgs[1]["flagged"] = False
+    assert [m["uid"] for m in app._mail_view_msgs()] == ["11"]
+    app.mail_msgs[1]["flagged"] = True
     app.key(pygame.K_RETURN)                      # 开详情 → mail_body:11
     assert app.mail_lv == "detail" and app.mail_body_uid == "11"
     assert ("job", "mail_body:11") in app.net.got
     app.on_net("data", "mail_body:11",
-               {"ok": True, "uid": "11", "text": "第一行\n第二行"})
+               {"ok": True, "uid": "11", "text": "第一行\n第二行",
+                "subject": "你好", "msg_id": "<m11@163.com>",
+                "refs": "", "from_addr": "a@b.com", "date": "11-14 09:00"})
     assert app.mail_body == "第一行\n第二行"
-    # 详情 4/5: 标已读 / 红旗 (tag 带 uid) + Esc 回列表
+    assert app.mail_c_meta.get("msg_id") == "<m11@163.com>"
+    # 详情 4/5/6: 标已读 / 红旗 / 回复 (tag 带 uid) + Esc 回列表
     app.key(pygame.K_4)
     assert ("job", "mail_act:11:mark_read") in app.net.got
     app.key(pygame.K_5)
     assert ("job", "mail_act:11:flag") in app.net.got
+    app.key(pygame.K_6)                           # 回复 → compose 预填
+    assert app.mail_lv == "compose" and app.mail_c_reply
+    assert app.mail_c["to"] == "a@b.com" and app.mail_c["subject"] == "Re: 你好"
+    assert app.mail_c_quote.startswith("在 11-14 09:00，a@b.com 写道：\n> 第一行")
+    app.key(pygame.K_ESCAPE)                      # Esc 回详情 (入口层)
+    assert app.mail_lv == "detail"
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "list"
-    # 列表 5: 全部↔未读视图切换
+    # 列表 5: 写新邮件 (空白) → Esc 回列表
     app.key(pygame.K_5)
-    assert app.mail_view == "unread"
-    app.key(pygame.K_5)
-    assert app.mail_view == "all"
+    assert app.mail_lv == "compose" and not app.mail_c_reply \
+        and app.mail_c == {"to": "", "subject": "", "body": ""}
+    app.key(pygame.K_ESCAPE)
+    assert app.mail_lv == "list"
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "folders"
     app.key(pygame.K_ESCAPE)
@@ -1416,10 +1433,120 @@ def test_mail_keys():
     app.mail_sel = 0
     app.draw(canvas)
     app.mail_lv = "detail"
+    app.mail_body_uid = "1"                   # 详情按 uid 定位 (与列表行对齐)
     app.mail_body = "正文" * 200
     app.mail_body_scroll = 3
     app.draw(canvas)
     print("mail keys OK (grid/login/folders/list/detail/del/esc/render)")
+
+
+def test_mail_compose():
+    """写信/回复全流程: 英文直输三字段 → Enter 发送 → 成功清草稿 / 失败保留;
+    回复预填 + In-Reply-To; IME 模式切换; 六层渲染冒烟."""
+    import mail as mailmod
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    mailmod.MAIL_FILE = os.path.join(tmp, "mail.json")
+    app = dash.App(FakeNet())
+    app.tool_open("mail")
+    app.mail_cur = {"email": "me@163.com", "auth": "k"}
+    app.mail_folder = "INBOX"
+    app.mail_lv = "list"
+    # 列表 5 → 写新邮件; '/' 切英文直输
+    app.key(pygame.K_5)
+    assert app.mail_lv == "compose" and app.mail_cf == 0
+    app.key(pygame.K_SLASH)
+    assert app.ime_mode is False
+    for c in "friend@qq.com":
+        app.key(0, c)
+    assert app.mail_c["to"] == "friend@qq.com"
+    app.key(pygame.K_RETURN)                      # → 主题
+    assert app.mail_cf == 1
+    for c in "Hi there":
+        app.key(0, c)
+    assert app.mail_c["subject"] == "Hi there"
+    app.key(pygame.K_RETURN)                      # → 正文
+    assert app.mail_cf == 2
+    for c in "Long time no see, ok?":
+        app.key(0, c)
+    app.key(pygame.K_RETURN)                      # 正文 Enter = 发送
+    assert ("job", "mail_send") in app.net.got
+    assert app.mail_c_busy
+    app.on_net("data", "mail_send", {"ok": True})
+    assert not app.mail_c_busy \
+        and app.mail_c == {"to": "", "subject": "", "body": ""}
+    assert app.mail_lv == "list"
+    # 校验: 无 @ 收件人 → 不发包
+    app.key(pygame.K_5)
+    app.key(pygame.K_RETURN)                      # to 空 Enter → 主题
+    app.key(pygame.K_LEFT)                        # ←→ 切回收件人
+    app.key(0, "n")
+    app.key(pygame.K_RETURN)                      # to → 主题
+    app.key(pygame.K_RETURN)                      # 主题 → 正文
+    app.key(pygame.K_RETURN)                      # 正文 → 发送尝试 (to=n 无 @)
+    assert app.net.got.count(("job", "mail_send")) == 1   # 没有第二次
+    assert app.mail_cf == 0                       # 焦点拉回收件人
+    # 发送失败: 草稿保留, 留在写信层
+    app.mail_c["to"] = "friend@qq.com"
+    app.mail_cf = 2
+    app.key(pygame.K_RETURN)
+    assert app.net.got.count(("job", "mail_send")) == 2
+    app.on_net("data", "mail_send", {"ok": False, "err": "登录被拒"})
+    assert app.mail_lv == "compose" \
+        and app.mail_c["to"] == "friend@qq.com"
+    # Esc 退拼音串 → 再 Esc 回列表 (草稿丢弃)
+    app.ime_mode = True
+    app.ime_buf = "ni"
+    app.key(pygame.K_ESCAPE)
+    assert app.mail_lv == "compose" and not app.ime_buf
+    app.key(pygame.K_ESCAPE)
+    assert app.mail_lv == "list"
+    # 回复: 详情 6 → 预填 + 发送带 In-Reply-To; 完成回详情
+    app.mail_lv = "detail"
+    app.mail_body_uid = "7"
+    app.mail_c_meta = {"uid": "7", "subject": "Re: 问一下", "text": "问题内容",
+                       "msg_id": "<m7@qq.com>", "refs": "<m6@163.com>",
+                       "from_addr": "boss@qq.com", "date": "11-15 10:00"}
+    app.key(pygame.K_6)
+    assert app.mail_lv == "compose" and app.mail_c_reply
+    assert app.mail_c["to"] == "boss@qq.com"
+    assert app.mail_c["subject"] == "Re: 问一下"   # 重复 Re: 不叠加
+    assert app.mail_c_quote.startswith("在 11-15 10:00，boss@qq.com 写道：")
+    app.key(pygame.K_RETURN)                      # to → subject
+    app.key(pygame.K_RETURN)                      # subject → body
+    app.key(pygame.K_SLASH)                       # 切英文直输 (IME 会吃字母)
+    app.key(0, "O")
+    app.key(0, "K")
+    app.key(pygame.K_RETURN)                      # 发送
+    assert app.net.got.count(("job", "mail_send")) == 3
+    app.on_net("data", "mail_send", {"ok": True})
+    assert app.mail_lv == "detail" and not app.mail_c_reply  # 回跳详情
+    # 发送闭包: 引用块拼正文 + 回信头 (直接调闭包验证形状)
+    app.mail_lv = "compose"
+    app.mail_c = {"to": "a@b.com", "subject": "s", "body": "我的回复"}
+    app.mail_c_quote = "在 x，y 写道：\n> 原文"
+    app.mail_c_reply = True
+    app.mail_c_meta = {"msg_id": "<m@x>", "refs": "<r@x>"}
+    fn = app._mail_send_fn()
+    r = fn()                                      # mail.send_mail 校验层拦 (假账号)
+    assert not r["ok"]                            # 不会真发 (账号假)
+    print("mail compose OK (new/reply/ime/send/fail/esc/render)")
+
+    # 渲染冒烟: compose 空态 / 三字段有值+引用 / IME 候选条让位底栏
+    app.mail_c_reply = True
+    app.draw(canvas)                              # 空正文 + 引用
+    app.mail_c = {"to": "a@b.com", "subject": "标题在截断边缘" * 3,
+                  "body": "第一行\n第二行"}
+    app.mail_cf = 2
+    app.draw(canvas)
+    app.ime_buf = "ni"
+    app.ime_cands = ["你", "泥"]
+    app.draw(canvas)
+    app.ime_clear()
+    print("mail compose render OK")
 
 
 def test_mail_live():
@@ -1449,9 +1576,11 @@ def test_mail_live():
     inbox = next(f for f in r["folders"] if f["name"].upper() == "INBOX")
     print("  folders %d, INBOX total=%s unread=%s" % (
         len(r["folders"]), inbox.get("total"), inbox.get("unread")))
-    r = mailmod.fetch_msgs(acct, inbox["raw"], "all", 3)
+    r = mailmod.fetch_msgs(acct, inbox["raw"], 5)
     assert r["ok"], r
-    for m in r["msgs"][:3]:
+    for m in r["msgs"]:
+        # 服务端 OR UNSEEN FLAGGED 口径: 每条必须未读或有旗
+        assert (not m["seen"]) or m["flagged"], m
         print("  %s [%s%s] %s | %s" % (m["date"], "未读" if not m["seen"] else "",
                                        "旗" if m["flagged"] else "",
                                        m["from"][:22], m["subject"][:34]))
@@ -1459,9 +1588,60 @@ def test_mail_live():
         uid = r["msgs"][0]["uid"]
         b = mailmod.fetch_body(acct, inbox["raw"], uid)
         assert b["ok"], b
-        print("  body %d chars: %s" % (len(b["text"]),
-                                       b["text"][:60].replace("\n", " / ")))
-    print("mail live OK (163 imap direct)")
+        assert "msg_id" in b and "from_addr" in b   # 回复元数据齐
+        print("  body %d chars, msg_id=%s: %s" % (
+            len(b["text"]), b.get("msg_id", "")[:24],
+            b["text"][:60].replace("\n", " / ")))
+    # SMTP 自发自收 (须 MAIL_LIVE_SEND=1 显式开启, 避免常规跑测发信).
+    # 轮询用 UID 增量 + 客户端解码主题 — 163 服务端 HEADER 搜索对
+    # RFC2047 编码主题不可靠 (邮件在但搜不到, 2026-11-15 实测).
+    if os.environ.get("MAIL_LIVE_SEND"):
+        import email
+        subj = "ONEAPP 发送链路测试 %d" % int(_time.time())
+        M, err = mailmod._connect(acct)
+        assert not err, err
+        M.select("INBOX", readonly=True)
+        st, d = M.uid("SEARCH", None, "ALL")
+        base = max(int(x) for x in d[0].split()) \
+            if st == "OK" and d and d[0] and d[0].split() else 0
+        try:
+            M.logout()
+        except Exception:
+            pass
+        r = mailmod.send_mail(acct, addr, subj, "链路自测邮件, 可忽略。")
+        assert r["ok"], r
+        print("  smtp sent to self: %s (base uid>%d)" % (subj, base))
+        got = None
+        for _ in range(12):                    # 投递轮询 ≤120s (自发延迟波动大)
+            _time.sleep(10)
+            M, err = mailmod._connect(acct)
+            if err:
+                continue
+            try:
+                M.select("INBOX", readonly=True)
+                st, d = M.uid("SEARCH", None, "ALL")
+                if st != "OK" or not d or not d[0]:
+                    continue
+                for uid in reversed([x for x in d[0].split()
+                                     if int(x) > base]):
+                    st2, dd = M.uid("FETCH", uid,
+                                    "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+                    if st2 != "OK" or not dd or not isinstance(dd[0], tuple):
+                        continue
+                    msg = email.message_from_bytes(dd[0][1])
+                    if mailmod.decode_subject(msg["Subject"]) == subj:
+                        got = uid.decode("ascii")
+                        break
+                if got:
+                    break
+            finally:
+                try:
+                    M.logout()
+                except Exception:
+                    pass
+        assert got, "自发自收未达 (120s)"
+        print("  loopback OK uid=%s (到达态不管已读否 — 未读+旗标列表口径正确)" % got)
+    print("mail live OK (163 imap+smtp direct)")
 
 
 def test_net_live():
@@ -1817,6 +1997,7 @@ if __name__ == "__main__":
     test_mail_utf7()
     test_mail_accounts()
     test_mail_keys()
+    test_mail_compose()
     if os.environ.get("RUN_NET"):
         test_net_live()
         test_mail_live()
