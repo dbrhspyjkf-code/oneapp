@@ -1459,7 +1459,8 @@ class App:
         return hex2rgb(THEMES[self.theme_idx][key])
 
     def card(self, i):
-        return hex2rgb(THEMES[self.theme_idx]["cards"][i])
+        cards = THEMES[self.theme_idx]["cards"]
+        return hex2rgb(cards[i % len(cards)])   # 第 4 卡 (USAGE) 循环取色
 
     def _load_home_cache(self):
         """主页卡数据磁盘缓存 → self.data (天气/新闻/新股); 每日一句内置."""
