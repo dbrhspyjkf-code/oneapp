@@ -3533,11 +3533,24 @@ class App:
             self.osd = ("音频缺失", time.monotonic() + 1.5)
             return
         try:
-            self.player = subprocess.Popen(
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                 "-vn", f],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                env=_AUDIO_ENV, **_FFPLAY_KW)
+            # wav → paplay (毫秒级启动; ffplay 冷启动 ~5s 于 CM0, 语音短
+            # 进度条走完声音才出的根因); 非 wav (webm 等云端语音) 仍 ffplay;
+            # paplay 缺席回退 ffplay (慢但能响)
+            if f.lower().endswith(".wav"):
+                cmd = ["paplay", f]
+            else:
+                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                       "-vn", f]
+            try:
+                self.player = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=_AUDIO_ENV, **_FFPLAY_KW)
+            except FileNotFoundError:
+                self.player = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                     "-vn", f],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=_AUDIO_ENV, **_FFPLAY_KW)
         except Exception:
             self.osd = ("播放失败", time.monotonic() + 1.2)
             return
