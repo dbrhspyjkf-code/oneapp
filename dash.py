@@ -664,9 +664,11 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
 #    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
 TOOL_APPS = [("fx", "汇率"), ("unit", "单位换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
-             ("music", "音乐"), ("mail", "邮件"), ("tv", "电视")]
+             ("music", "音乐"), ("mail", "邮件"), ("tv", "电视"),
+             ("set", "设置")]   # 设置: API KEY + 主页卡片显隐 (无数字键)
 TOOL_GRID = 5                            # 每行卡片数
 MAIL_BODY_ROWS = 5                       # 邮件详情每屏正文行数 (13px, 用户定版原生字号)
+SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")   # 设置: API KEY + 主页卡片显隐
 
 # 音乐 app: 本地曲库 (mp3/flac/wav 直读) + QQ/网易云直连 provider (musrc.py,
 # 扫码绑定后走同一播放页), 输出仅本机 (商店版无 AirPlay/音箱遥控)。
@@ -1409,6 +1411,17 @@ class App:
         self.mail_err = ""                     # 列表获取失败文案 (空态显示)
         self._mail_body_cache = (None, [])     # (key, lines) 详情折行缓存
         self._mail_c_cache = (None, [])        # (key, lines) 写信正文折行缓存
+        # 设置 (工具·设置卡): API KEY + 主页卡片显隐 (settings.json 0600)
+        self.cfg = netmod.load_json_file(SETTINGS_FILE, {}) or {}
+        if not isinstance(self.cfg, dict):
+            self.cfg = {}
+        self.cfg.setdefault("glm_key", "")
+        self.cfg.setdefault("ds_key", "")
+        self.cfg.setdefault("cards", {})
+        self.set_sel = 0
+        self.set_edit = None
+        self.set_buf = ""
+        self._usage_at = 0.0
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
         # + 音频同进程 — 播放方案移植官方 cardputer-zero-iptv 的 panel.py)
         self.tv_grp = 0                        # 分组索引 (0=收藏, 1+=GROUPS)
@@ -1524,6 +1537,8 @@ class App:
 
     # ── 每秒请求 (worker 按 TTL 去重) ──
     def poll(self):
+        if self.page == 0 and not self.tool:
+            self.poll_usage()
         """按页取数: 只拉当前页所需, 页面切换即时响应不排队."""
         self.mu_tick()                        # 音乐连播: 任意页/离线都要走 (本地曲库)
         if self.net.mode == "online":
@@ -1570,6 +1585,26 @@ class App:
                         and time.monotonic() - self.play_at > 50:
                     self.radio_stop()          # RAOP 预读+连接 50s 没到 = 挂死
                     self.osd = ("AirPlay 未连上", time.monotonic() + 2.0)
+
+    def poll_usage(self):
+        """主页 USAGE 卡: 每 300s 拉一次 GLM/DeepSeek (有 KEY 才拉)."""
+        nowm = time.monotonic()
+        if nowm - self._usage_at <= 300:
+            return
+        self._usage_at = nowm
+        if self.cfg.get("glm_key"):
+            self.net.job("usage:glm", self._usage_fn("glm"), 300)
+        if self.cfg.get("ds_key"):
+            self.net.job("usage:ds", self._usage_fn("ds"), 300)
+
+    def _usage_fn(self, which):
+        key = self.cfg.get("glm_key" if which == "glm" else "ds_key", "")
+
+        def f():
+            if which == "glm":
+                return fetchers.glm_usage(key)
+            return fetchers.ds_balance(key)
+        return f
 
     def poll_tool(self):
         """工具子应用按需取数 (poll 每秒调; TTL 层去重)."""
@@ -3465,7 +3500,8 @@ class App:
         return (self.in_input or self.fin_input or self.fin_sync
                 or self.mu_input
                 or (self.tool == "mail"
-                    and self.mail_lv in ("login", "compose")))
+                    and self.mail_lv in ("login", "compose"))
+                or (self.tool == "set" and self.set_edit is not None))
 
     def key(self, k, ch=""):
         # 丝印方向 (非输入态): F/X/Z/C = ↑↓←→ (fn+ 同效, 输入态保持字母)
@@ -3843,7 +3879,83 @@ class App:
         except Exception:
             pass
 
+    # ── 工具·设置: API KEY (ASCII 掩码编辑) + 主页卡片勾选 (settings.json 0600) ──
+    SET_ROWS = ("glm", "ds", "c:hitokoto", "c:news", "c:fin", "c:usage")
+
+    def cfg_save(self):
+        netmod.save_json_file(SETTINGS_FILE, self.cfg)
+        self._usage_at = 0.0                   # KEY 变更 → 下轮 poll 重取 usage
+
+    def set_key(self, k, ch):
+        if self.set_edit is not None:          # KEY 编辑态: ASCII 直输
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE):
+                key = ("glm_key", "ds_key")[self.set_edit]
+                self.cfg[key] = self.set_buf.strip()
+                self.cfg_save()
+                self.set_edit = None
+                self.osd = ("已保存", time.monotonic() + 1.5)
+                return True
+            if k == pygame.K_BACKSPACE:
+                self.set_buf = self.set_buf[:-1]
+            elif ch and 0x20 <= ord(ch) < 0x7F:
+                self.set_buf = (self.set_buf + ch)[:64]
+            return True
+        if k in (pygame.K_UP, pygame.K_DOWN):
+            d = 1 if k == pygame.K_DOWN else -1
+            self.set_sel = max(0, min(len(self.SET_ROWS) - 1,
+                                      self.set_sel + d))
+            return True
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            r = self.SET_ROWS[self.set_sel]
+            if r in ("glm", "ds"):
+                self.set_edit = 0 if r == "glm" else 1
+                self.set_buf = self.cfg.get(
+                    "glm_key" if r == "glm" else "ds_key", "")
+            else:                              # 卡片勾选 toggle
+                ck = r.split(":", 1)[1]
+                cur = self.cfg["cards"].get(ck, ck != "usage")
+                self.cfg["cards"][ck] = not cur
+                self.cfg_save()
+            return True
+        return True
+
+    def draw_set(self, surf):
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        self.tool_head(surf, "设置", "%d 项" % len(self.SET_ROWS))
+        rows = [("GLM KEY", self.cfg.get("glm_key", ""), False),
+                ("DS KEY", self.cfg.get("ds_key", ""), False),
+                ("卡·每日一句", self.cfg["cards"].get("hitokoto", True), True),
+                ("卡·新闻", self.cfg["cards"].get("news", True), True),
+                ("卡·自选股", self.cfg["cards"].get("fin", True), True),
+                ("卡·USAGE", self.cfg["cards"].get("usage", False), True)]
+        y = 16
+        for i, (lab, val, is_ck) in enumerate(rows):
+            sel = i == self.set_sel
+            rr = pygame.Rect(6, y, W - 12, 20)
+            pygame.draw.rect(surf, self.card(0), rr, border_radius=4)
+            pygame.draw.rect(surf, acc if sel else self.th("border"), rr,
+                             2 if sel else 1, border_radius=4)
+            editing = sel and self.set_edit is not None
+            if is_ck:
+                mark = "[√]" if val else "[ ]"
+                text(surf, mark, 13, acc if val else dim, (12, y + 3))
+                text(surf, lab, 13, hi if sel else soft, (52, y + 3))
+            else:
+                text(surf, lab, 13, acc if sel else soft, (12, y + 3))
+                show = self.set_buf if editing else val
+                if show:
+                    show = ("..." + show[-6:]) if len(show) > 10 else show
+                cur = "_" if editing and int(time.monotonic() * 2) % 2 == 0 else ""
+                text(surf, clip_text(show + cur, 13, W - 110), 13,
+                     hi if show else dim, (W - 14, y + 3), right=True)
+            y += 21
+        hint = "输入 API KEY, Enter 保存" if self.set_edit is not None \
+            else "Enter 编辑/勾选 · 保存到本机"
+        textc(surf, hint, 10, dim, W // 2, 146)
+
     def tool_open(self, tid):
+
         self.tool = tid
         self.cv_armed = False
         self.osd = None
@@ -3907,6 +4019,8 @@ class App:
             return self.mail_key(k, ch)
         if t == "tv":
             return self.tv_key(k)
+        if t == "set":
+            return self.set_key(k, ch)
         return True
 
     # ── 邮件 (工具第 7 卡; IMAP 授权码直连, 协议层 mail.py, net.job 后台跑) ──
@@ -5385,114 +5499,153 @@ class App:
                     (ix + iw // 2 + 3, iy + ih // 2 + 1),
                     (ix + iw // 2, iy + ih // 2 + 1)])
 
-        # ── 右列两卡: 每日一句 / 新闻 ──
+        # ── 右列卡片: 按设置显隐 (每日一句/新闻/自选股/USAGE) 动态堆叠 ──
         cx = M + LW + M                            # 124
         cw2 = W - cx - M                           # 192
-        chh, gap = 43, M
-        tops = (M, M + chh + gap, M + 2 * (chh + gap))
+        ck = self.cfg.get("cards", {})
+        vis = [(lab, key) for lab, key in
+               (("每日一句", "hitokoto"), ("新闻", "news"),
+                ("自选股", "fin"), ("USAGE", "usage"))
+               if ck.get(key, key != "usage")]      # USAGE 默认关
+        nc = max(1, len(vis))
+        gap = M
+        chh = (137 - M * (nc - 1)) // nc           # 动态均分右列高
+        tops = {lab: M + i * (chh + gap)
+                for i, (lab, key) in enumerate(vis)}
         now = time.monotonic()
-        for i, (lab, top) in enumerate(zip(("每日一句", "新闻", "自选股"),
-                                           tops)):
-            rr = pygame.Rect(cx, top, cw2, chh)
+        for i, (lab, key) in enumerate(vis):
+            rr = pygame.Rect(cx, tops[lab], cw2, chh)
             pygame.draw.rect(surf, self.card(i + 1), rr, border_radius=6)
             pygame.draw.rect(surf, border, rr, 1, border_radius=6)
             text(surf, lab, 13, dim, (rr.x + 8, rr.y + 2))   # 与农历同字号
         # 每日一句: 单行跑马灯 (溢出卡宽即滚动, 同新闻卡)
-        top0 = tops[0]
-        hk = self.data.get("hitokoto") or {}
-        if hk.get("text"):
-            txt = hk["text"]
-            if hk.get("from"):
-                txt += " — " + hk["from"]
-            vw = cw2 - 16
-            tw = textw(txt, BODY)
-            vy = top0 + 13 + (chh - 13 - BODY) // 2
-            if tw <= vw:
-                text(surf, txt, BODY, soft, (cx + 8, vy))
+        top0 = tops.get("每日一句")
+        if tops.get("每日一句") is not None:
+            hk = self.data.get("hitokoto") or {}
+            if hk.get("text"):
+                txt = hk["text"]
+                if hk.get("from"):
+                    txt += " — " + hk["from"]
+                vw = cw2 - 16
+                tw = textw(txt, BODY)
+                vy = top0 + 13 + (chh - 13 - BODY) // 2
+                if tw <= vw:
+                    text(surf, txt, BODY, soft, (cx + 8, vy))
+                else:
+                    SPEED = 28.0
+                    span = tw + vw + 24
+                    if now - self._hk_at > span / SPEED + 1.0:
+                        self._hk_at = now
+                    off = (now - self._hk_at) * SPEED
+                    surf.set_clip((cx + 8, top0, vw, chh))
+                    text(surf, txt, BODY, soft, (cx + 8 + vw - off, vy))
+                    surf.set_clip(None)
             else:
-                SPEED = 28.0
-                span = tw + vw + 24
-                if now - self._hk_at > span / SPEED + 1.0:
-                    self._hk_at = now
-                off = (now - self._hk_at) * SPEED
-                surf.set_clip((cx + 8, top0, vw, chh))
-                text(surf, txt, BODY, soft, (cx + 8 + vw - off, vy))
-                surf.set_clip(None)
-        else:
-            text(surf, "获取中" if self.net.mode == "online" else "--",
-                 BODY, dim, (cx + 8, top0 + 13 + (chh - 13 - BODY) // 2))
-        # 新闻: 单行 BODY px 垂直居中, 超宽横向跑马灯, 滚完一条再换
-        top1 = tops[1]
-        news = self._news_items()
-        now = time.monotonic()
-        if news:
-            vw = cw2 - 16
-            headline = news[self.news_i]["t"]
-            tw = textw(headline, BODY)
-            if tw <= vw:
-                if now - self._news_at > 10:
-                    self._news_at = now
-                    self.news_i = (self.news_i + 1) % len(news)
+                text(surf, "获取中" if self.net.mode == "online" else "--",
+                     BODY, dim, (cx + 8, top0 + 13 + (chh - 13 - BODY) // 2))
+            # 新闻: 单行 BODY px 垂直居中, 超宽横向跑马灯, 滚完一条再换
+        top1 = tops.get("新闻")
+        if tops.get("新闻") is not None:
+            news = self._news_items()
+            now = time.monotonic()
+            if news:
+                vw = cw2 - 16
+                headline = news[self.news_i]["t"]
+                tw = textw(headline, BODY)
+                if tw <= vw:
+                    if now - self._news_at > 10:
+                        self._news_at = now
+                        self.news_i = (self.news_i + 1) % len(news)
+                else:
+                    SPEED = 28.0                       # px/s
+                    span = tw + vw + 24                # 右进左出全程
+                    if now - self._news_at > span / SPEED + 1.2:
+                        self._news_at = now
+                        self.news_i = (self.news_i + 1) % len(news)
+                        headline = news[self.news_i]["t"]
+                        tw = textw(headline, BODY)
+                    vy2 = top1 + 13 + (chh - 13 - BODY) // 2
+                    off = (now - self._news_at) * SPEED
+                    x = cx + 8 + vw - off              # 右缘进入, 向左滚出
+                    surf.set_clip((cx + 8, top1, vw, chh))
+                    text(surf, headline, BODY, soft, (x, vy2))
+                    surf.set_clip(None)
             else:
-                SPEED = 28.0                       # px/s
-                span = tw + vw + 24                # 右进左出全程
-                if now - self._news_at > span / SPEED + 1.2:
-                    self._news_at = now
-                    self.news_i = (self.news_i + 1) % len(news)
-                    headline = news[self.news_i]["t"]
-                    tw = textw(headline, BODY)
-                vy2 = top1 + 13 + (chh - 13 - BODY) // 2
-                off = (now - self._news_at) * SPEED
-                x = cx + 8 + vw - off              # 右缘进入, 向左滚出
-                surf.set_clip((cx + 8, top1, vw, chh))
-                text(surf, headline, BODY, soft, (x, vy2))
-                surf.set_clip(None)
-        else:
-            text(surf, "获取中" if self.net.mode != "offline" else "离线",
-                 BODY, dim, (cx + 8, top1 + 16))
-        # 自选股行情卡 (新闻下方): 单行跑马灯
-        top2 = tops[2]
-        its = self.fin_items()
-        segs = []                              # 分段着色: 涨红跌绿
-        for it in its:
-            if not it.get("price"):
-                continue
-            segs.append(("%s %.2f %+.2f%%" % (
-                (it.get("name") or it["code"])[:6],
-                it.get("price") or 0, it.get("pchg") or 0),
-                self._chg_col(it.get("pchg") or 0)))
-        if segs:
-            vw = cw2 - 16
-            SEP = " · "
-            sep_w = textw(SEP, BODY)
-            widths = [textw(t, BODY) for t, _ in segs]
-            tw = sum(widths) + sep_w * (len(segs) - 1)
-            vy = top2 + 13 + (chh - 13 - BODY) // 2
-            if tw <= vw:                       # 不溢出: 静态分行内逐段画
-                x = cx + 8
-                for (t, c), w in zip(segs, widths):
-                    text(surf, t, BODY, c, (x, vy))
-                    x += w + sep_w
-            else:                              # 跑马灯: 逐段平移, 分隔符 dim
-                SPEED = 28.0
-                span = tw + vw + 24
-                if now - self._wk_at > span / SPEED + 1.0:
-                    self._wk_at = now
-                off = (now - self._wk_at) * SPEED
-                surf.set_clip((cx + 8, top2, vw, chh))
-                x = cx + 8 + vw - off
-                for i, ((t, c), w) in enumerate(zip(segs, widths)):
-                    if x + w > cx + 8 and x < cx + 8 + vw:
+                text(surf, "获取中" if self.net.mode != "offline" else "离线",
+                     BODY, dim, (cx + 8, top1 + 16))
+            # 自选股行情卡 (新闻下方): 单行跑马灯
+        top2 = tops.get("自选股")
+        if tops.get("自选股") is not None:
+            its = self.fin_items()
+            segs = []                              # 分段着色: 涨红跌绿
+            for it in its:
+                if not it.get("price"):
+                    continue
+                segs.append(("%s %.2f %+.2f%%" % (
+                    (it.get("name") or it["code"])[:6],
+                    it.get("price") or 0, it.get("pchg") or 0),
+                    self._chg_col(it.get("pchg") or 0)))
+            if segs:
+                vw = cw2 - 16
+                SEP = " · "
+                sep_w = textw(SEP, BODY)
+                widths = [textw(t, BODY) for t, _ in segs]
+                tw = sum(widths) + sep_w * (len(segs) - 1)
+                vy = top2 + 13 + (chh - 13 - BODY) // 2
+                if tw <= vw:                       # 不溢出: 静态分行内逐段画
+                    x = cx + 8
+                    for (t, c), w in zip(segs, widths):
                         text(surf, t, BODY, c, (x, vy))
-                    if i < len(segs) - 1:
-                        text(surf, SEP, BODY, dim, (x + w, vy))
-                    x += w + sep_w
-                surf.set_clip(None)
-        else:
-            text(surf, "获取中" if self.net.mode == "online" else "--",
-                 BODY, dim, (cx + 8, top2 + 13 + (chh - 13 - BODY) // 2))
-
+                        x += w + sep_w
+                else:                              # 跑马灯: 逐段平移, 分隔符 dim
+                    SPEED = 28.0
+                    span = tw + vw + 24
+                    if now - self._wk_at > span / SPEED + 1.0:
+                        self._wk_at = now
+                    off = (now - self._wk_at) * SPEED
+                    surf.set_clip((cx + 8, top2, vw, chh))
+                    x = cx + 8 + vw - off
+                    for i, ((t, c), w) in enumerate(zip(segs, widths)):
+                        if x + w > cx + 8 and x < cx + 8 + vw:
+                            text(surf, t, BODY, c, (x, vy))
+                        if i < len(segs) - 1:
+                            text(surf, SEP, BODY, dim, (x + w, vy))
+                        x += w + sep_w
+                    surf.set_clip(None)
+            else:
+                text(surf, "获取中" if self.net.mode == "online" else "--",
+                     BODY, dim, (cx + 8, top2 + 13 + (chh - 13 - BODY) // 2))
+    
     # ── 行情页: 自选/指数/商品 三子页 ──
+        # USAGE 卡: GLM / DeepSeek 轮播 (4s 切换, 无跑马灯)
+        topu = tops.get("USAGE")
+        if topu is not None:
+            g = self.data.get("usage_glm") or {}
+            d = self.data.get("usage_ds") or {}
+            has_g = bool(self.cfg.get("glm_key"))
+            has_d = bool(self.cfg.get("ds_key"))
+            opts = []
+            if has_g:
+                opts.append(("GLM", g))
+            if has_d:
+                opts.append(("DS", d))
+            vy3 = topu + 13 + (chh - 13 - BODY) // 2
+            if not opts:
+                text(surf, "设置里填 API KEY", BODY, dim, (cx + 8, vy3))
+            else:
+                ulab, udat = opts[int(now // 4) % len(opts)]
+                if not udat.get("ok"):
+                    utxt = "获取中…" if not udat.get("err") \
+                        else "失败 " + udat.get("err", "")[:14]
+                elif ulab == "GLM":
+                    p5, pw = udat.get("p5"), udat.get("pw")
+                    utxt = "GLM 5h %s%% 周 %s%%" % (
+                        p5 if p5 is not None else "?",
+                        pw if pw is not None else "?")
+                else:
+                    utxt = "DS 余额 ¥%s" % (udat.get("cny") or "?")
+                text(surf, utxt, BODY, soft, (cx + 8, vy3))
+
     FIN_TABS = ["自选股", "指数", "商品"]
 
     @staticmethod
@@ -5909,7 +6062,8 @@ class App:
         {"fx": self.draw_fx, "unit": self.draw_unit,
          "cal": self.draw_cal_app, "ssq": self.draw_ssq,
          "timer": self.draw_timer, "music": self.draw_mu,
-         "mail": self.draw_mail, "tv": self.draw_tv}[self.tool](surf)
+         "mail": self.draw_mail, "tv": self.draw_tv,
+         "set": self.draw_set}[self.tool](surf)
 
     def draw_tools(self, surf):
         acc, hi, soft = self.th("accent"), self.th("hi"), self.th("soft")

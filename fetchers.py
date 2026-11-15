@@ -319,3 +319,44 @@ def ipo_fetch():
         if snap:
             return snap
         return {"ok": True, "items": [], "count": 0}
+
+
+def glm_usage(key):
+    """GLM Coding Plan 用量配额 (Bearer key). → {ok, p5, pw} 5h/周用量百分比.
+    端点同官方 glm-plan-usage 插件: GET /api/monitor/usage/quota/limit."""
+    url = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Authorization": "Bearer " + key,
+                          "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+        if not j.get("success"):
+            return {"ok": False, "err": str(j.get("msg", ""))[:40]}
+        p5 = pw = None
+        for it in (j.get("data") or {}).get("quota_limits") or []:
+            u, pc = it.get("unit"), it.get("percentage")
+            if u == 3 and pc is not None:
+                p5 = pc                     # unit3 = 5h token 配额
+            if u == 6 and pc is not None:
+                pw = pc                     # unit6 = 周 token 配额
+        return {"ok": True, "p5": p5, "pw": pw}
+    except Exception as e:
+        return {"ok": False, "err": str(e)[:60]}
+
+
+def ds_balance(key):
+    """DeepSeek 余额 (官方 user/balance, Bearer key). → {ok, cny}."""
+    url = "https://api.deepseek.com/user/balance"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Authorization": "Bearer " + key})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+        cny = ""
+        for b in j.get("balances") or []:
+            if b.get("currency") == "CNY":
+                cny = b.get("total_balance", "")
+        return {"ok": True, "cny": cny}
+    except Exception as e:
+        return {"ok": False, "err": str(e)[:60]}
