@@ -26,6 +26,7 @@ import imaplib
 import os
 import re
 import smtplib
+import time
 from email.header import decode_header
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parsedate_to_datetime
@@ -346,14 +347,48 @@ def _friendly_err(e):
     return ("登录失败 " + m.group(1)) if m else s[:60]
 
 
+_SESS = {"M": None, "email": "", "at": 0.0}   # IMAP 会话复用 (单 worker 线程)
+_SESS_TTL = 240                               # 秒; NOOP 兜底校验服务端掐线
+
+
+def _drop_sess():
+    if _SESS["M"] is not None:
+        try:
+            _SESS["M"].logout()
+        except Exception:
+            pass
+    _SESS.update(M=None, email="", at=0.0)
+
+
+def _release(M):
+    """操作收尾 (原 finally logout): 命中缓存的会话不登出, 留给下个操作复用."""
+    if _SESS["M"] is not M:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
 def _connect(acct):
-    """acct={"email","auth"} → (IMAP4_SSL | None, err|None). 登录后补 ID."""
+    """acct={"email","auth"} → (IMAP4_SSL | None, err|None). 登录后补 ID.
+    会话复用: 同账号 TTL 内 NOOP 通过即免登录 — 163 频繁登录会被限流拖慢
+    (短连接风暴: 列表每分钟重拉 = 每分钟全新登录, 用一阵子后越来越卡)."""
     addr, auth = acct.get("email", ""), acct.get("auth", "")
     if not addr or not auth:
         return None, "账号未配置"
     p = provider_for(addr)
     if not p["imap"]:
         return None, "无法识别邮箱域名"
+    s = _SESS
+    if s["M"] is not None and s["email"] == addr \
+            and time.monotonic() - s["at"] < _SESS_TTL:
+        try:
+            if s["M"].noop()[0] == "OK":
+                s["at"] = time.monotonic()
+                return s["M"], None
+        except Exception:
+            pass
+        _drop_sess()                          # 会话已被服务端掐 → 重连
     try:
         M = imaplib.IMAP4_SSL(p["imap"], p.get("port", 993), timeout=_TIMEOUT)
     except Exception as e:
@@ -371,6 +406,8 @@ def _connect(acct):
         M.xatom("ID", '("name" "ONEAPP" "version" "1.0.0")')
     except Exception:
         pass
+    _drop_sess()                              # 换账号/旧会话让位
+    s["M"], s["email"], s["at"] = M, addr, time.monotonic()
     return M, None
 
 
@@ -389,10 +426,7 @@ def test_login(acct):
     except Exception as e:
         return {"ok": False, "err": _friendly_err(e)}
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _release(M)
 
 
 def list_folders(acct):
@@ -438,10 +472,7 @@ def list_folders(acct):
     except Exception as e:
         return {"ok": False, "err": _friendly_err(e)}
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _release(M)
 
 
 def fetch_msgs(acct, raw_q, limit=30):
@@ -490,10 +521,7 @@ def fetch_msgs(acct, raw_q, limit=30):
     except Exception as e:
         return {"ok": False, "err": _friendly_err(e)}
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _release(M)
 
 
 def fetch_body(acct, raw_q, uid):
@@ -526,10 +554,7 @@ def fetch_body(acct, raw_q, uid):
     except Exception as e:
         return {"ok": False, "err": _friendly_err(e)}
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _release(M)
 
 
 _ACTIONS = {                                          # action → STORE 操作
@@ -557,10 +582,7 @@ def mail_action(acct, raw_q, uid, action):
     except Exception as e:
         return {"ok": False, "err": _friendly_err(e)}
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _release(M)
 
 
 _SENT_NAMES = ("sent messages", "sent items", "sent mail", "sent")
@@ -572,16 +594,10 @@ def _append_sent(addr, auth, msg):
     服务器已有则跳过, 两类服务商都不产生重复. LIST 解码后按
     已发送/Sent 匹配文件夹; 任何失败静默 (不影响发送结果)."""
     try:
-        p = provider_for(addr)
-        if not p["imap"]:
+        M, err = _connect({"email": addr, "auth": auth})
+        if err or M is None:
             return
-        M = imaplib.IMAP4_SSL(p["imap"], p.get("port", 993), timeout=_TIMEOUT)
         try:
-            M.login(addr, auth)
-            try:                               # 163 ID 命令 (同 _connect 口径)
-                M.xatom("ID", '("name" "ONEAPP" "version" "1.0.0")')
-            except Exception:
-                pass
             st, lst = M.list()
             box = ""
             if st == "OK":
@@ -608,10 +624,7 @@ def _append_sent(addr, auth, msg):
                 if not have:
                     M.append(box, "\\Seen", None, msg.as_bytes())
         finally:
-            try:
-                M.logout()
-            except Exception:
-                pass
+            _release(M)
     except Exception:
         pass
 
@@ -666,7 +679,4 @@ def inbox_unread(acct):
         return {"ok": False, "err": _friendly_err(e),
                 "email": acct.get("email", "")}
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _release(M)

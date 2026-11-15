@@ -3903,14 +3903,19 @@ class App:
         return True
 
     def mail_open(self, acct):
-        """账号层 Enter: 进入该账号文件夹层 (短连接拉文件夹)."""
+        """账号层 Enter: 直进 INBOX 列表 (免文件夹层中转, 打开即见邮件;
+        会话复用下 ~0.5s). 其他文件夹: 列表 Esc → 文件夹层按需取."""
         self.mail_cur = dict(acct)
-        self.mail_lv = "folders"
-        self.mail_folders = []
+        self.mail_folder = "INBOX"
+        self.mail_msgs = []
+        self.mail_total = 0
+        self.mail_got = False
+        self.mail_lv = "list"
         self.mail_sel = self.mail_scroll = 0
         self.osd = ("连接中…", time.monotonic() + 3)
-        self.net.invalidate("mail_folders")
-        self.net.job("mail_folders", self._mail_folders_fn(), 60)
+        self.net.invalidate("mail_list")
+        self.net.job("mail_list", self._mail_list_fn(), 180)
+        self.net.job("mail_folders", self._mail_folders_fn(), 600)
 
     def mail_del(self, email):
         """dialog 确认后删账号 → 落 mail.json."""
@@ -3980,9 +3985,9 @@ class App:
         if lv == "acct" and self.mail.get("accounts"):
             self.net.job("mail_unread", self._mail_unread_fn(), 60)
         elif lv == "folders" and self.mail_cur:
-            self.net.job("mail_folders", self._mail_folders_fn(), 60)
+            self.net.job("mail_folders", self._mail_folders_fn(), 600)
         elif lv == "list" and self.mail_cur and self.mail_folder:
-            self.net.job("mail_list", self._mail_list_fn(), 60)
+            self.net.job("mail_list", self._mail_list_fn(), 180)
 
     def on_mail_net(self, tag, b):
         if tag == "mail_login":
@@ -4108,7 +4113,7 @@ class App:
                     self.mail_sel = self.mail_scroll = 0
                     self.mail_lv = "list"
                     self.net.invalidate("mail_list")
-                    self.net.job("mail_list", self._mail_list_fn(), 60)
+                    self.net.job("mail_list", self._mail_list_fn(), 180)
             elif lv == "list":
                 msgs = self._mail_view_msgs()
                 if msgs:
@@ -4128,7 +4133,7 @@ class App:
         if lv == "list" and k == pygame.K_4:  # 强制刷新
             self.mail_got = False
             self.net.invalidate("mail_list")
-            self.net.job("mail_list", self._mail_list_fn(), 60)
+            self.net.job("mail_list", self._mail_list_fn(), 180)
             self.osd = ("刷新中…", time.monotonic() + 1.5)
             return True
         if lv == "list" and k == pygame.K_5:  # 写新邮件
@@ -6395,6 +6400,10 @@ EVDEV_MAP = {
     1: pygame.K_ESCAPE,
     2: pygame.K_1, 3: pygame.K_2, 4: pygame.K_3, 5: pygame.K_4, 6: pygame.K_5,
     7: pygame.K_6, 8: pygame.K_7, 9: pygame.K_8, 10: pygame.K_9, 11: pygame.K_0,
+    12: pygame.K_MINUS, 13: pygame.K_EQUALS,
+    26: pygame.K_LEFTBRACKET, 27: pygame.K_RIGHTBRACKET,
+    39: pygame.K_SEMICOLON, 40: pygame.K_QUOTE, 41: pygame.K_BACKQUOTE,
+    43: pygame.K_BACKSLASH, 51: pygame.K_COMMA, 52: pygame.K_PERIOD,
     14: pygame.K_BACKSPACE, 15: pygame.K_TAB, 28: pygame.K_RETURN,
     96: pygame.K_KP_ENTER, 111: pygame.K_DELETE, 57: pygame.K_SPACE,
     33: pygame.K_UP, 44: pygame.K_LEFT, 45: pygame.K_DOWN, 46: pygame.K_RIGHT,
@@ -6419,6 +6428,53 @@ EVDEV_CHARS = {
     49: "n", 50: "m",
 }
 
+# ── ZERO 三修饰键 + sym 第二层解码 (2026-11-15 真机抓键 + 设备树 tca8418@34
+#    三层键码表实解: sym 键=383, fn 键=389, shift/Aa=42; 内核在 sym 层换用
+#    keymap1 码表且与丝印上档错位 — 故按物理格反查丝印符号, 不信内核码) ──
+_SYM_CELL = {                            # keymap1 码 → 物理格 (row, col)
+    1: (4, 0), 15: (4, 9), 26: (4, 4), 27: (0, 0), 39: (0, 1), 40: (0, 2),
+    41: (0, 3), 43: (0, 4), 51: (0, 5), 52: (0, 6), 53: (0, 7), 94: (0, 8),
+    14: (0, 9), 383: (4, 3), 389: (4, 2), 42: (4, 1),
+    55: (1, 0), 69: (1, 1), 70: (1, 2), 71: (1, 3), 72: (1, 4), 73: (1, 5),
+    74: (1, 6), 75: (1, 7), 76: (1, 8), 77: (1, 9),
+    79: (2, 0), 80: (2, 1), 81: (2, 2), 82: (2, 4), 83: (2, 5), 85: (2, 6),
+    86: (2, 7), 89: (2, 8), 28: (2, 9),
+    29: (3, 0), 56: (3, 1), 90: (3, 5), 91: (3, 6), 92: (3, 7), 93: (3, 8),
+    57: (3, 9),
+}
+_SYM_CHARS = {                           # 丝印上档: 数字行 !@#$%^&*()
+    (4, 4): "!", (0, 0): "@", (0, 1): "#", (0, 2): "$", (0, 3): "%",
+    (0, 4): "^", (0, 5): "&", (0, 6): "*", (0, 7): "(", (0, 8): ")",
+}
+_CELL_CH = {                             # 物理格 → 基层字符 (5×10 矩阵)
+    (4, 4): "1", (0, 0): "2", (0, 1): "3", (0, 2): "4", (0, 3): "5",
+    (0, 4): "6", (0, 5): "7", (0, 6): "8", (0, 7): "9", (0, 8): "0",
+    (1, 0): "q", (1, 1): "w", (1, 2): "e", (1, 3): "r", (1, 4): "t",
+    (1, 5): "y", (1, 6): "u", (1, 7): "i", (1, 8): "o", (1, 9): "p",
+    (2, 0): "a", (2, 1): "s", (2, 2): "d", (2, 3): "f", (2, 4): "g",
+    (2, 5): "h", (2, 6): "j", (2, 7): "k", (2, 8): "l",
+    (3, 2): "z", (3, 3): "x", (3, 4): "c", (3, 5): "v", (3, 6): "b",
+    (3, 7): "n", (3, 8): "m", (3, 9): " ",
+}
+_MOD_SYMS = (383, 389, 42)               # sym / fn / shift 键码 (不投事件)
+
+
+def keychar(code, uni, mods):
+    """修饰键态下的字符解码 (纯函数, 可测).
+    sym 按住: 物理格 → 丝印上档符号 (2=@ 等), 字母→大写, 其他→基层字符.
+    shift 按住: 字母→大写 (内核 shift 不换码表). fn 不产字符."""
+    if mods.get(383):
+        c = _SYM_CHARS.get(_SYM_CELL.get(code))
+        if c:
+            return c
+        if code not in (14, 28, 57):     # 退格/回车/空格 保持原语义
+            base = _CELL_CH.get(_SYM_CELL.get(code, ()), "")
+            if base.isalpha():
+                return base.upper()
+    if (mods.get(383) or mods.get(42)) and uni.isalpha():
+        return uni.upper()
+    return uni
+
 
 class EvKeyboard:
     app = None                                 # 主循环注入, 音量键用
@@ -6426,6 +6482,7 @@ class EvKeyboard:
     def __init__(self):
         self.path = find_keyboard()
         self.fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK) if self.path else None
+        self.mods = {383: False, 389: False, 42: False}   # sym/fn/shift 按住态
 
     def poll(self):
         if self.fd is None:
@@ -6445,17 +6502,24 @@ class EvKeyboard:
                 if code in (113, 114, 115):     # Fn+A 静音 / Fn+S+ / Fn+D-
                     if EvKeyboard.app:
                         EvKeyboard.app.adjust_volume(code)
-                elif code in EVDEV_MAP:
-                    kt = pygame.KEYDOWN if val == 1 else pygame.KEYUP
-                    pygame.event.post(pygame.event.Event(
-                        kt, key=EVDEV_MAP[code], mod=0,
-                        unicode=EVDEV_CHARS.get(code, "") if val == 1 else ""))
+                elif code in self.mods:         # sym/fn/shift: 只更新态不投事件
+                    self.mods[code] = val == 1
                 else:
-                    try:
-                        with open("/tmp/dash_unmapped_keys.log", "a") as f:
-                            f.write("code=%d\n" % code)
-                    except Exception:
-                        pass
+                    kt = pygame.KEYDOWN if val == 1 else pygame.KEYUP
+                    key = EVDEV_MAP.get(code, pygame.K_UNKNOWN)
+                    uni = EVDEV_CHARS.get(code, "") if val == 1 else ""
+                    if val == 1:
+                        uni = keychar(code, uni, self.mods)
+                    if uni or key != pygame.K_UNKNOWN:
+                        pygame.event.post(pygame.event.Event(
+                            kt, key=key, mod=0, unicode=uni))
+                    elif val == 1:                # 只记按下 (松开不记, 减半噪音)
+                        try:
+                            with open("/tmp/dash_unmapped_keys.log",
+                                      "a") as f:
+                                f.write("code=%d\n" % code)
+                        except Exception:
+                            pass
 
     def close(self):
         if self.fd is not None:

@@ -1341,21 +1341,14 @@ def test_mail_keys():
     assert app.mail_auth_buf == "authcode1"
     app.key(pygame.K_RETURN)
     assert ("job", "mail_login") in app.net.got
-    # 登录成功 → 落盘 0600 + 进文件夹层
+    # 登录成功 → 落盘 0600 + 直进 INBOX 列表 (免文件夹层中转, 提速)
     app.on_net("data", "mail_login", {"ok": True, "unread": 3,
                                       "email": "user@163.com",
                                       "auth": "authcode1"})
-    assert app.mail_lv == "folders" \
+    assert app.mail_lv == "list" and app.mail_folder == "INBOX" \
         and app.mail_cur.get("email") == "user@163.com"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(mailmod.MAIL_FILE).st_mode) == 0o600
-    assert ("job", "mail_folders") in app.net.got
-    app.on_net("data", "mail_folders", {"ok": True, "folders": [
-        {"raw": "INBOX", "name": "INBOX", "unread": 3, "total": 12},
-        {"raw": "\"&XfJT0ZAB-\"", "name": "已发送", "unread": 0, "total": 4}]})
-    assert [f["name"] for f in app.mail_folders] == ["INBOX", "已发送"]
-    app.key(pygame.K_RETURN)                      # INBOX → 列表层
-    assert app.mail_lv == "list" and app.mail_folder == "INBOX"
     assert ("job", "mail_list") in app.net.got
     app.on_net("data", "mail_list", {"ok": True, "total": 2, "msgs": [
         {"uid": "11", "subject": "你好", "from": "a@b.com",
@@ -1402,6 +1395,16 @@ def test_mail_keys():
     assert app.mail_lv == "list"
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "folders"
+    # 文件夹层 (列表 Esc 按需进入): 数据落地 → Enter INBOX 换夹回列表
+    app.on_net("data", "mail_folders", {"ok": True, "folders": [
+        {"raw": "INBOX", "name": "INBOX", "unread": 3, "total": 12},
+        {"raw": "\"&XfJT0ZAB-\"", "name": "已发送", "unread": 0, "total": 4}]})
+    assert [f["name"] for f in app.mail_folders] == ["INBOX", "已发送"]
+    app.key(pygame.K_RETURN)
+    assert app.mail_lv == "list" and app.mail_folder == "INBOX"
+    assert app.net.got.count(("job", "mail_list")) >= 2   # 换夹重新拉取
+    app.key(pygame.K_ESCAPE)
+    assert app.mail_lv == "folders"
     app.key(pygame.K_ESCAPE)
     assert app.mail_lv == "acct" and app.mail_cur is None
     # 账号层 d 删除 → dialog 确认 → 落盘
@@ -1437,7 +1440,111 @@ def test_mail_keys():
     app.mail_body = "正文" * 200
     app.mail_body_scroll = 3
     app.draw(canvas)
-    print("mail keys OK (grid/login/folders/list/detail/del/esc/render)")
+    app.mail_lv = "compose"                   # 写信层冒烟 (有引用)
+    app.mail_c = {"to": "x@163.com", "subject": "Re: s", "body": "好的"}
+    app.mail_c_quote = "在 x，y 写道：\n> 原文"
+    app.mail_c_reply = True
+    app.mail_cf = 2
+    app.draw(canvas)
+    app.ime_buf = "ni"
+    app.ime_cands = ["你"]
+    app.draw(canvas)
+    app.ime_clear()
+    print("mail keys OK (grid/login/list/folders/list/detail/compose/del/esc/render)")
+
+
+def test_mail_sess():
+    """mail.py IMAP 会话复用: 同账号 TTL 内免重登录, 收尾不登出缓存会话;
+    过期/换账号重连; 163 登录限流对策."""
+    import mail as mailmod
+    orig_cls = mailmod.imaplib.IMAP4_SSL
+
+    class FakeIMAP:
+        n = 0
+
+        def __init__(self, host, port, timeout=None):
+            FakeIMAP.n += 1
+            self.id = FakeIMAP.n
+            self.logins = self.noops = self.logouts = 0
+
+        def login(self, u, p):
+            self.logins += 1
+            return ("OK", ["b"])
+
+        def noop(self):
+            self.noops += 1
+            return ("OK", ["b"])
+
+        def logout(self):
+            self.logouts += 1
+            return ("OK", ["b"])
+
+        def xatom(self, *a):
+            return ("OK", [])
+
+        def select(self, box, ro=False):
+            return ("OK", [b"2"])
+
+        def uid(self, cmd, *args):
+            if "SEARCH" in args:
+                return ("OK", [b""])
+            return ("OK", [b""])
+
+    try:
+        mailmod.imaplib.IMAP4_SSL = FakeIMAP
+        mailmod._SESS.update(M=None, email="", at=0.0)
+        acct = {"email": "t@163.com", "auth": "k"}
+        M1, e = mailmod._connect(acct)
+        assert e is None and M1.id == 1
+        M2, e = mailmod._connect(acct)            # TTL 内复用, 免登录
+        assert e is None and M2 is M1 and M1.logins == 1 and M1.noops == 1
+        mailmod.fetch_msgs(acct, "INBOX", 5)      # 操作收尾不登出缓存会话
+        assert M1.logouts == 0
+        mailmod._SESS["at"] -= 999                # 过期 → NOOP 前就重连
+        M3, e = mailmod._connect(acct)
+        assert e is None and M3 is not M1 and M1.logouts == 1
+        acct2 = {"email": "u@qq.com", "auth": "k"}
+        M4, e = mailmod._connect(acct2)           # 换账号 → 旧会话让位
+        assert e is None and M4 is not M3 and M3.logouts == 1
+        assert M4.logins == 1
+    finally:
+        mailmod.imaplib.IMAP4_SSL = orig_cls
+        mailmod._SESS.update(M=None, email="", at=0.0)
+    print("mail sess OK (reuse/expiry/switch/release)")
+
+
+def test_driver_sym():
+    """ZERO 键盘修饰层解码 (纯函数): sym+2=@ (内核 sym 层码 27 错位免疫),
+    数字行全上档符号, sym/shift+字母大写, 回车/退格/空格原语义."""
+    import dash
+    mods_sym = {383: True, 389: False, 42: False}
+    mods_none = {383: False, 389: False, 42: False}
+    mods_shift = {383: False, 389: False, 42: True}
+    # sym 层内核码 (27=sym+2) → 丝印上档; 不受 DT keymap1 与丝印错位影响
+    assert dash.keychar(27, "]", mods_sym) == "@"
+    assert dash.keychar(39, ";", mods_sym) == "#"
+    assert dash.keychar(40, "'", mods_sym) == "$"
+    assert dash.keychar(41, "`", mods_sym) == "%"
+    assert dash.keychar(43, "\\", mods_sym) == "^"
+    assert dash.keychar(51, ",", mods_sym) == "&"
+    assert dash.keychar(52, ".", mods_sym) == "*"
+    assert dash.keychar(53, "/", mods_sym) == "("
+    assert dash.keychar(94, "", mods_sym) == ")"
+    assert dash.keychar(26, "[", mods_sym) == "!"     # sym+1 (格 (4,4))
+    # sym + 字母 (字母在 sym 层发 KP 段码, uni 为空 → 按物理格反查)
+    assert dash.keychar(55, "", mods_sym) == "Q"
+    assert dash.keychar(79, "", mods_sym) == "A"
+    # 保留键: 退格/回车/空格 不被 sym 改写
+    assert dash.keychar(14, "", mods_sym) == ""
+    assert dash.keychar(28, "", mods_sym) == ""
+    assert dash.keychar(57, " ", mods_sym) == " "
+    # shift 不换码表: 字母大写, 数字原样
+    assert dash.keychar(30, "a", mods_shift) == "A"
+    assert dash.keychar(3, "2", mods_shift) == "2"
+    # 无修饰: 原样
+    assert dash.keychar(3, "2", mods_none) == "2"
+    assert dash.keychar(27, "]", mods_none) == "]"
+    print("driver sym OK (sym@/shiftcaps/keepkeys)")
 
 
 def test_mail_compose():
@@ -1997,6 +2104,8 @@ if __name__ == "__main__":
     test_mail_utf7()
     test_mail_accounts()
     test_mail_keys()
+    test_mail_sess()
+    test_driver_sym()
     test_mail_compose()
     if os.environ.get("RUN_NET"):
         test_net_live()
