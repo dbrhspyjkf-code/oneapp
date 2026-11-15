@@ -1567,11 +1567,20 @@ class App:
                                 time.monotonic() + 1.2)
             elif a == "cloudvoice" and isinstance(b, dict) \
                     and b.get("data"):
-                p = "/tmp/oneapp_cloud_%s.wav" % b["id"]
+                lid = b.get("local_id")           # 懒下载: 落 voices/ 并回填条目
+                p = (os.path.join(VOICES_DIR, "%s.wav" % b["id"]) if lid
+                     else "/tmp/oneapp_cloud_%s.wav" % b["id"])
                 try:
+                    os.makedirs(VOICES_DIR, exist_ok=True)
                     with open(p, "wb") as f:
                         f.write(b["data"])
-                    self.play_voice({"id": "cloud-" + b["id"], "file": p,
+                    if lid:
+                        for it in self.ideas.get("voices", []):
+                            if it.get("id") == lid:
+                                it["file"] = p
+                        netmod.save_json_file(IDEAS_FILE, self.ideas)
+                    self.play_voice({"id": lid or ("cloud-" + b["id"]),
+                                     "cid": b["id"], "file": p,
                                      "dur": b.get("dur") or 0})
                 except OSError:
                     self.osd = ("播放失败", time.monotonic() + 1.2)
@@ -1813,12 +1822,18 @@ class App:
 
     # ── 想法列表 (文字+语音按时间倒序合并) ──
     def idea_items(self):
+        """本地缓存列表 — 只显示当前登录账户的条目 (owner 归属过滤);
+        未登录显示全部本地 (离线只读)."""
+        user = self.cfg.get("cloud_user") or ""
         items = [{"kind": "text", "id": it.get("id"),
                   "cid": it.get("cid"),
                   "text": it.get("text", ""),
                   "createdAt": it.get("createdAt", 0)}
-                 for it in self.ideas.get("texts", [])]
+                 for it in self.ideas.get("texts", [])
+                 if not user or it.get("owner", user) == user]
         for it in self.ideas.get("voices", []):
+            if user and it.get("owner", user) != user:
+                continue
             items.append({"kind": "voice", "id": it.get("id"),
                           "cid": it.get("cid"),
                           "file": it.get("file", ""),
@@ -3099,6 +3114,7 @@ class App:
             "id": "%d-%s" % (int(time.time() * 1000),
                              "".join(random.choice("0123456789abcdef") for _ in range(6))),
             "cid": _cloud_id(),               # 云端 id (纯 hex, 幂等上传键)
+            "owner": self.cfg.get("cloud_user") or "",   # 账户归属 (换号隔离)
             "text": txt, "createdAt": int(time.time() * 1000),
         })
         netmod.save_json_file(IDEAS_FILE, self.ideas)
@@ -3139,12 +3155,17 @@ class App:
                 (self.cfg.get("cloud_tok") or "").strip())
 
     def ensure_cids(self):
-        """存量想法补 cid (首次上云前一次性补齐, UI 线程内落盘)."""
+        """存量想法补 cid/owner (首次上云前补齐, UI 线程内落盘).
+        owner = 当前登录账户 — 换账户后列表只显示本账户条目."""
+        user = self.cfg.get("cloud_user") or ""
         ch = False
         for key in ("texts", "voices"):
             for it in self.ideas.get(key, []):
                 if not it.get("cid"):
                     it["cid"] = _cloud_id()
+                    ch = True
+                if user and not it.get("owner") and not it.get("up"):
+                    it["owner"] = user   # 只补从未上传的; up=1 保持原归属
                     ch = True
         if ch:
             netmod.save_json_file(IDEAS_FILE, self.ideas)
@@ -3209,6 +3230,16 @@ class App:
             d["csync"] = j.get("now")
         elif st:                                   # 对账失败: 继续删/传 (不早退)
             d["err"] = "对账失败 HTTP %s" % st
+        st, body = netmod.http_raw(                # 云端全量 → 本地镜像对齐
+            url + "/v1/notes?limit=300", headers=H)
+        if st == 200:
+            try:
+                j2 = json.loads(body.decode("utf-8", "replace"))
+                d["cloud_list"] = j2.get("notes") or []
+            except ValueError:
+                d["cloud_list"] = []
+        elif not d["err"]:
+            d["err"] = "列表 HTTP %s" % st
         for cid in self.ideas.get("cdel", []):     # 本地删 → 云端联动删
             st, _ = netmod.http_raw(url + "/v1/notes/" + cid,
                                     method="DELETE", headers=H)
@@ -3285,7 +3316,51 @@ class App:
             dels += len(done)
         if d.get("csync"):
             self.ideas["csync"] = d["csync"]
-        netmod.save_json_file(IDEAS_FILE, self.ideas)
+        user = self.cfg.get("cloud_user") or ""
+        cl = d.get("cloud_list") or []
+        if cl:
+            local = {}
+            for key in ("texts", "voices"):
+                for it in self.ideas.get(key, []):
+                    if it.get("cid"):
+                        local[it["cid"]] = (key, it)
+            for cn in cl:
+                cid = cn["id"]
+                created = int((cn.get("ts") or 0) * 1000)
+                if cid in local:
+                    key, it = local[cid]
+                    it.setdefault("owner", user)
+                    if it.get("up"):
+                        it["text"] = cn.get("text") or it.get("text", "")
+                        if cn.get("ts"):
+                            it["createdAt"] = created
+                else:                          # 云端有本地无 (他端/换号前) → 镜像入
+                    base = {"id": cid, "cid": cid, "owner": user, "up": 1,
+                            "text": cn.get("text") or "",
+                            "createdAt": created}
+                    if cn["kind"] == "voice":
+                        base.update({"dur": round(cn.get("dur") or 0),
+                                     "file": ""})   # 文件懒下载 (播放时)
+                        self.ideas.setdefault("voices", []).append(base)
+                    else:
+                        self.ideas.setdefault("texts", []).append(base)
+            # 本地 up=1 但云端没有的 → 已被他端删 (tombstone 兜底, 这里硬对齐)
+            cloud_ids = {n["id"] for n in cl}
+            for key in ("voices", "texts"):
+                keep = []
+                for it in self.ideas.get(key, []):
+                    if it.get("owner") == user and it.get("up") \
+                            and it.get("cid") not in cloud_ids:
+                        if key == "voices" and it.get("file"):
+                            try:
+                                os.remove(it["file"])
+                            except OSError:
+                                pass
+                        continue
+                    keep.append(it)
+                self.ideas[key] = keep
+            self.sel = 0
+        netmod.save_json_file(IDEAS_FILE, self.ideas)   # 无条件落盘 (up/删除/merge)
         if ups or dels:
             self.osd = ("云同步 +%d -%d" % (len(ups), dels),
                         time.monotonic() + 1.5)
@@ -3315,15 +3390,22 @@ class App:
 
     def _cloud_voice_fn(self):
         url, tok = self._cloud_cfg()
-        it = self.cloud_notes[self.csel] \
-            if 0 <= self.csel < len(self.cloud_notes) else None
-        if not (url and tok) or not it or it.get("kind") != "voice":
+        if not (url and tok):
             return {"skip": 1}
-        st, body = netmod.http_raw(url + "/v1/voice/" + it["id"],
+        req = getattr(self, "_play_req", None)   # 懒下载 (本地视图缺文件)
+        if req:
+            cid, dur, lid = req
+        else:                                    # 云端视图选中项
+            it = self.cloud_notes[self.csel] \
+                if 0 <= self.csel < len(self.cloud_notes) else None
+            if not it or it.get("kind") != "voice":
+                return {"skip": 1}
+            cid, dur, lid = it["id"], it.get("dur") or 0, None
+        st, body = netmod.http_raw(url + "/v1/voice/" + cid,
                                    headers={"Authorization": "Bearer " + tok})
         if st != 200:
             return None
-        return {"id": it["id"], "dur": it.get("dur") or 0, "data": body}
+        return {"id": cid, "dur": dur, "local_id": lid, "data": body}
 
     def cloud_del_sel(self):
         self.net.invalidate(("job", "clouddel"))
@@ -3417,7 +3499,9 @@ class App:
             dst = os.path.join(VOICES_DIR, vid + ".wav")
             shutil.move(self.rec_path, dst)
             self.ideas.setdefault("voices", []).append(
-                {"id": vid, "cid": _cloud_id(), "file": dst, "dur": real,
+                {"id": vid, "cid": _cloud_id(),
+                 "owner": self.cfg.get("cloud_user") or "",
+                 "file": dst, "dur": real,
                  "createdAt": int(time.time() * 1000)})
             netmod.save_json_file(IDEAS_FILE, self.ideas)
             self.cloud_sync_trigger()
@@ -3437,6 +3521,14 @@ class App:
             self.mu_stop()
         self.stop_player()
         f = item.get("file") or ""
+        if (not f or not os.path.exists(f)) and item.get("cid") \
+                and self._cloud_cfg()[0]:
+            self._play_req = (item["cid"], item.get("dur") or 0,
+                              item.get("id"))
+            self.net.invalidate(("job", "cloudvoice"))
+            self.net.job("cloudvoice", self._cloud_voice_fn, ttl=10)
+            self.osd = ("云端拉取中…", time.monotonic() + 5)
+            return
         if not f or not os.path.exists(f):
             self.osd = ("音频缺失", time.monotonic() + 1.5)
             return

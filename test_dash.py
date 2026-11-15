@@ -1523,8 +1523,31 @@ def test_cloud():
     netmod.http_raw = orig_raw
     app.key(pygame.K_ESCAPE)
     assert app.iview == "local"
+    # 云端全量 merge: 云端有本地无 → 镜像入 (owner=当前账户); 已传条目内容对齐
+    app.cfg["cloud_user"] = "zero"
+    def raw_merge(url, **k):
+        if "/v1/tombstones" in url:
+            return 200, json.dumps({"ids": [], "now": 6.0}).encode()
+        if url.endswith("/v1/notes") or "/v1/notes?" in url:
+            return 200, json.dumps({"notes": [
+                {"id": "e" * 12, "kind": "text", "text": "他端新增",
+                 "ts": 900.0, "category": "work"},
+                {"id": "d" * 12, "kind": "text", "text": "紧随其后",
+                 "ts": 800.0}]}).encode()
+        return 200, b"{}"
+    netmod.http_raw = raw_merge
+    app._cloud_trig = 0.0
+    app.cloud_sync_trigger()
+    d = app.net.last_job("cloudsync")()
+    assert len(d["cloud_list"]) == 2
+    app.on_net("data", "cloudsync", d)
+    texts = {t["cid"]: t for t in app.ideas["texts"]}
+    assert texts["e" * 12]["text"] == "他端新增"
+    assert texts["e" * 12]["owner"] == "zero" and texts["e" * 12]["up"] == 1
+    assert texts["d" * 12]["text"] == "紧随其后"   # 已传条目内容向云端对齐
+    netmod.http_raw = orig_raw
     print("cloud OK (settings/ping/upload idempotent/cdel/tombstone/"
-          "cloud view keys)")
+          "cloud view keys/merge)")
 
 
 def test_reg():
