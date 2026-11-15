@@ -1363,11 +1363,11 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=9; 云地址/登录/注册/退出 四行插入后位移) → 开启被拒
+    # sw:usage 行 (sel=11; 云/账户四行+管理员两行插入后位移) → 开启被拒
     # (前三已开, 上限 3) + OSD 提醒
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
-    assert app._set_rows()[9][0] == "sw:usage"
-    app.set_sel = 9
+    assert app._set_rows()[11][0] == "sw:usage"
+    app.set_sel = 11
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
     assert app.osd and "先关" in app.osd[0], app.osd
@@ -1665,8 +1665,35 @@ def test_login():
     assert ("login", "登录") in app._set_rows()
     app.key(pygame.K_RETURN)               # 未登录再按 logout
     assert app.osd and "未登录" in app.osd[0]
+    # 生成注册码 (管理员): 未配 admin → 提示; 配了 → job → 结果覆盖层
+    idx = [r[0] for r in app._set_rows()].index("minv")
+    app.set_sel = idx
+    app.key(pygame.K_RETURN)
+    assert app.osd and "管理员TOKEN" in app.osd[0]
+    app.cfg["cloud_admin"] = "at" * 8
+    app.key(pygame.K_RETURN)
+    assert app.net.last_job("cloudinvite") is not None
+    orig_raw = netmod.http_raw
+    netmod.http_raw = lambda url, **k: (200, json.dumps(
+        {"ok": 1, "code": "abcd1234", "uses": 1}).encode())
+    d = app.net.last_job("cloudinvite")()
+    assert d["ok"] == 1 and d["code"] == "abcd1234"
+    app.on_net("data", "cloudinvite", d)
+    assert app.inv_show == ("abcd1234", 1)
+    app.draw(canvas)                       # 结果层渲染冒烟
+    app.key(pygame.K_RETURN)               # 任意键关
+    assert app.inv_show is None
+    # admin token 错 → 401 OSD
+    netmod.http_raw = lambda url, **k: (401, json.dumps(
+        {"err": "admin token required"}).encode())
+    app.key(pygame.K_RETURN)
+    d = app.net.last_job("cloudinvite")()
+    assert d["ok"] == 0 and "admin" in d["err"]
+    app.on_net("data", "cloudinvite", d)
+    assert app.osd and "生成失败" in app.osd[0]
+    netmod.http_raw = orig_raw
     print("login OK (form/fxzc/ping verify/persist/fail-retain/esc/"
-          "switch+csync reset/logout)")
+          "switch+csync reset/logout/admin-invite)")
 
 
 def test_mail_keys():

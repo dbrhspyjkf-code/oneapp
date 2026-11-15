@@ -1466,6 +1466,7 @@ class App:
         self.reg_busy = False                  # 注册提交中 (防重复)
         self.login = None                      # 登录表单态 {tok}
         self.login_busy = False                # 登录验证中 (防重复)
+        self.inv_show = None                   # 注册码结果态 (code, uses)
         self.set_buf = ""
         self._usage_at = 0.0
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
@@ -1632,6 +1633,14 @@ class App:
                                            if b.get("st") else "网络异常")
                     self.osd = ("注册失败 %s" % err,
                                 time.monotonic() + 2.5)
+            elif a == "cloudinvite" and isinstance(b, dict):
+                if b.get("ok"):
+                    self.inv_show = (b["code"], b.get("uses") or 1)
+                else:
+                    err = b.get("err") or ("HTTP %s" % b.get("st")
+                                           if b.get("st") else "网络异常")
+                    self.osd = ("生成失败 %s" % err,
+                                time.monotonic() + 2.5)
             elif a == "cloudlogin" and isinstance(b, dict):
                 self.login_busy = False
                 if b.get("ok"):
@@ -1674,6 +1683,8 @@ class App:
             elif a == "cloudlogin":
                 self.login_busy = False
                 self.osd = ("登录失败 网络异常", time.monotonic() + 2.5)
+            elif a == "cloudinvite":
+                self.osd = ("生成失败 网络异常", time.monotonic() + 2.5)
         elif kind == "text":
             self.data[a] = b
             if b and a in ("quotes", "idx"):
@@ -3930,6 +3941,10 @@ class App:
                 self.dialog = None
             return True
 
+        if self.inv_show is not None:          # 注册码结果态: 任意键关
+            self.inv_show = None
+            return True
+
         if self.page == 3 and self.fin_sync:
             # 东财 API-KEY 输入 (默认英文; Enter=保存并同步)
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
@@ -4325,6 +4340,7 @@ class App:
                 ("login", "更换账户" if self.cfg.get("cloud_tok")
                  else "登录"),
                 ("reg", "注册新账号"), ("logout", "退出登录"),
+                ("key:admin", "管理员 TOKEN"), ("minv", "生成注册码"),
                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
                 ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡")]
 
@@ -4333,9 +4349,13 @@ class App:
         self._usage_at = 0.0                   # KEY 变更 → 下轮 poll 重取 usage
 
     SET_CFGKEYS = {"glm": "glm_key", "ds": "ds_key",
-                   "cloud": "cloud_url", "tok": "cloud_tok"}
+                   "cloud": "cloud_url", "tok": "cloud_tok",
+                   "admin": "cloud_admin"}
 
     def set_key(self, k, ch):
+        if self.inv_show is not None:          # 注册码结果态: 任意键关
+            self.inv_show = None
+            return True
         if self.login is not None:             # 登录表单态: TOKEN 单字段
             return self._login_key(k, ch)
         if self.reg is not None:               # 注册表单态: 两字段 ASCII
@@ -4414,7 +4434,36 @@ class App:
                                 time.monotonic() + 2.5)
                 else:
                     self.osd = ("未登录", time.monotonic() + 1.5)
+            elif rid == "minv":                # 生成注册码 (管理员)
+                if not self.cfg.get("cloud_admin"):
+                    self.osd = ("先在 管理员TOKEN 填入 admin token",
+                                time.monotonic() + 2.5)
+                else:
+                    self.net.invalidate(("job", "cloudinvite"))
+                    self.net.job("cloudinvite", self._cloud_invite_fn,
+                                 ttl=10)
+                    self.osd = ("生成中…", time.monotonic() + 5)
         return True
+
+    def _cloud_invite_fn(self):
+        """worker: POST /v1/invite (管理员) → {ok,code,uses}."""
+        at = (self.cfg.get("cloud_admin") or "").strip()
+        url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
+        st, body = netmod.http_raw(url + "/v1/invite", method="POST",
+                                   body=json.dumps({"uses": 1}).encode(),
+                                   timeout=8,
+                                   headers={"Content-Type":
+                                            "application/json",
+                                            "Authorization": "Bearer " + at})
+        try:
+            j = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            j = {}
+        if st == 200 and j.get("code"):
+            return {"ok": 1, "code": j["code"], "uses": j.get("uses") or 1}
+        return {"ok": 0, "st": st,
+                "err": "admin token 无效" if st == 401 else
+                       ("HTTP %s" % st if st else "网络异常")}
 
     def _login_key(self, k, ch):
         """登录表单键流: 已有用户名+TOKEN 的用户 — 填 TOKEN → ping 验证."""
@@ -4577,7 +4626,8 @@ class App:
                 else:
                     v = self.cfg.get(
                         {"key:glm": "glm_key", "key:ds": "ds_key",
-                         "key:tok": "cloud_tok"}.get(rid, "glm_key"), "")
+                         "key:tok": "cloud_tok",
+                         "key:admin": "cloud_admin"}.get(rid, "glm_key"), "")
                 text(surf, clip_text((self._set_mask(v) if rid != "key:cloud"
                                       else v) or "未设置", 12, 110),
                      12, hi if v else dim, (W - 14, y), right=True)
@@ -4664,6 +4714,20 @@ class App:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
                      self.th("danger"), (box.right - 12, box.y + 53),
                      right=True)
+        # ── 注册码结果 (覆盖): 任意键关闭 ──
+        if self.inv_show is not None:
+            code, uses = self.inv_show
+            box = pygame.Rect(24, 50, W - 48, 84)
+            pygame.draw.rect(surf, self.card(0), box, border_radius=6)
+            pygame.draw.rect(surf, acc, box, 2, border_radius=6)
+            text(surf, "新注册码 (%d 次)" % uses, 12, dim,
+                 (box.x + 12, box.y + 10))
+            code_c = W // 2
+            textc(surf, code, 22, acc, code_c, box.y + 30)
+            text(surf, "转给对方 · 设置·注册新账号 使用", 10, dim,
+                 (box.x + 12, box.y + 60))
+            text(surf, "任意键关闭", 10, dim,
+                 (box.right - 12, box.y + 61), right=True)
 
     def tool_open(self, tid):
         self.tool = tid
