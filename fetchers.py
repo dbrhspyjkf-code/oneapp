@@ -209,6 +209,44 @@ def em_watchlist_fetch(apikey):
     return {"ok": False, "err": "no results"}
 
 
+_EM_MANAGE_URL = _EM_SEL_URL.replace("/get", "/manage")
+
+
+def em_manage_parse(j):
+    """妙想 manage 响应 → {"ok": bool, "msg"?/"err"?} (纯函数便于离线测试).
+    实测同步返回: status/code=0, data 是确认文案 ("…已为您将1个标的(贵州茅台)添加自选…")."""
+    try:
+        if str(j.get("code")) not in ("0", "200") \
+                and j.get("status") not in (0, "0", "success", 200):
+            return {"ok": False,
+                    "err": str(j.get("message") or j.get("status"))[:30]}
+    except Exception:
+        return {"ok": False, "err": "bad resp"}
+    return {"ok": True, "msg": str(j.get("data") or "")[:48]}
+
+
+def em_watch_manage(apikey, code, add=True):
+    """单只自选股增/删推送东财通行证账户 (自然语言 manage 接口, apikey
+    放 header; 裸 6 位代码实测可解析, 北交所云端自动归一 430xxx→920xxx).
+    同步 ~1.6s 返回 → em_manage_parse 结果."""
+    if not apikey:
+        return {"ok": False, "err": "未配置 API-KEY"}
+    bare = str(code or "")[-6:]
+    q = ("把%s添加到我的自选股列表" if add
+         else "把%s从我的自选股列表删除") % bare
+    try:
+        req = urllib.request.Request(
+            _EM_MANAGE_URL,
+            data=json.dumps({"query": q}).encode("utf-8"), method="POST",
+            headers={"apikey": apikey, "Content-Type": "application/json",
+                     "User-Agent": _UA})
+        with _OPENER_DIRECT.open(req, timeout=20) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+        return em_manage_parse(j)
+    except Exception as e:
+        return {"ok": False, "err": repr(e)[:40]}
+
+
 # ── 双色球 (中彩官网; 参考 hermes _ssq.py 同源移植) ─────────────────────────
 _SSQ_URL = ("https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/"
             "findDrawNotice?name=ssq&issueCount=100")

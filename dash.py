@@ -1544,14 +1544,36 @@ class App:
                     pass
             if a == "emwatch" and isinstance(b, dict):
                 if b.get("ok"):
+                    got = {it.get("code") for it in b.get("items") or []}
+                    local_only = [it.get("code") for it in
+                                  self.watch.get("items", [])
+                                  if it.get("code") not in got]
                     self.watch = {"items": b.get("items") or []}
                     netmod.save_json_file(WATCH_FILE, self.watch)
                     self.fsel = self.fscroll = 0
-                    self.osd = ("已同步 %d 只 (替换)" % len(self.watch["items"]),
-                                time.monotonic() + 2)
+                    if local_only:             # 推送失败/离线时加的, 提醒
+                        self.osd = ("已同步 %d 只 · %s 等 %d 只未上云"
+                                    % (len(self.watch["items"]),
+                                       local_only[0], len(local_only)),
+                                    time.monotonic() + 4)
+                    else:
+                        self.osd = ("已同步 %d 只 (替换)"
+                                    % len(self.watch["items"]),
+                                    time.monotonic() + 2)
                 else:
                     self.osd = ("同步失败 %s" % (b.get("err") or "")[:24],
                                 time.monotonic() + 2.5)
+            if a.startswith("empush:") and isinstance(b, dict):
+                op, ecode = a[7:].split(":", 1)
+                if b.get("ok"):
+                    self.osd = ("云端已%s %s"
+                                % ("加" if op == "add" else "删", ecode),
+                                time.monotonic() + 1.5)
+                else:
+                    self.osd = ("云端%s失败 %s (%s)"
+                                % ("加" if op == "add" else "删", ecode,
+                                   (b.get("err") or "")[:12]),
+                                time.monotonic() + 3)
             if a == "wxloc" and isinstance(b, dict) and b.get("lat") is not None:
                 old = self.wx_loc or {}
                 if b.get("city") != old.get("city") \
@@ -1856,8 +1878,21 @@ class App:
         return [qt_code(it["code"]) for it in self.watch.get("items", [])
                 if it.get("code")][:16]
 
+    def _em_key(self):
+        return str(netmod.load_json_file(EM_KEY_FILE, {}).get("key") or "")
+
+    def _em_push(self, code, add):
+        """开同步 (已存 API-KEY) 才推: 单只增/删镜像到东财云端账户,
+        结果 on_net "empush:…" 落 OSD. 每操作唯一 tag (job 同 tag 会撞缓存)."""
+        key = self._em_key()
+        if not key:
+            return
+        tag = "empush:%s:%s" % ("add" if add else "del", code)
+        self.net.job(tag, lambda k=key, c=code, a=add:
+                     fetchers.em_watch_manage(k, c, a), 0)
+
     def fin_add_commit(self):
-        """输入框 Enter: 规范化代码 → 去重 → 落 watch.json."""
+        """输入框 Enter: 规范化代码 → 去重 → 落 watch.json (开同步推云端)."""
         code = norm_stock_code(self.buf)
         self.buf = ""
         if not code:
@@ -1869,6 +1904,7 @@ class App:
         self.watch.setdefault("items", []).append({"code": code, "name": ""})
         netmod.save_json_file(WATCH_FILE, self.watch)
         self.osd = ("已添加 " + code, time.monotonic() + 1.5)
+        self._em_push(code, True)          # 开同步 → 云端账户同步加
 
     def fin_sync_commit(self):
         """KEY 输入框 Enter: 保存 → 异步同步东财自选股 (结果 on_net 落表)."""
@@ -1887,7 +1923,7 @@ class App:
                      0)
 
     def watch_del(self, code):
-        """删除自选股 (dialog 确认后调, 按 code) → 落 watch.json."""
+        """删除自选股 (dialog 确认后调, 按 code) → 落 watch.json (开同步推云端)."""
         items = self.watch.get("items", [])
         n0 = len(items)
         self.watch["items"] = [x for x in items if x.get("code") != code]
@@ -1896,6 +1932,7 @@ class App:
             self.fsel = max(0, min(self.fsel,
                                    len(self.watch["items"]) - 1))
             self.osd = ("已删除 " + (code or ""), time.monotonic() + 1.2)
+            self._em_push(code, False)     # 开同步 → 云端账户同步删
 
     def fin_items(self):
         """自选股: 本地 watchlist + 实时 quotes 覆盖."""
