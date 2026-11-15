@@ -4267,6 +4267,21 @@ class App:
         if lv == "list" and k == pygame.K_5:  # 写新邮件
             self.mail_compose_open(reply=False)
             return True
+        if lv == "list" and k == pygame.K_6 \
+                and self.mail_folder.startswith("@"):
+            msgs = self._mail_view_msgs()      # 聚合: 直接标已读
+            if msgs:
+                m = msgs[min(self.mail_sel, len(msgs) - 1)]
+                fld = m.get("fld") or self.mail_folder
+                em = (self.mail_cur or {}).get("email", "")
+                m["seen"] = True
+                self.mail_unread_n[em] = max(
+                    0, self.mail_unread_n.get(em, 0) - 1)
+                self.net.job(
+                    "mail_act:%s:%s:mark_read" % (fld, m["uid"]),
+                    self._mail_act_fn(m["uid"], "mark_read", fld), 0)
+                self.osd = ("已读", time.monotonic() + 1.2)
+            return True
         if lv == "list" and k == pygame.K_6 and self.mail_has_more \
                 and not self.mail_folder.startswith("@"):
             em = (self.mail_cur or {}).get("email", "")
@@ -4513,7 +4528,7 @@ class App:
             if un:
                 text(surf, "未读 %d" % un, 11, acc, (W - 14, y + 7),
                      right=True)
-        self.tool_foot(surf, ["Enter 打开", "d 删除", "Esc 网格"])
+        self.tool_foot(surf, ["Enter 打开", "d 删除", "Esc 退出"])
 
     def draw_mail_login(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
@@ -4640,8 +4655,9 @@ class App:
             text(surf, clip_text(pv, 13, W - 28), 13,
                  dim, (14, y + 30))
         foot = ["4 刷新", "5 写邮件"]
-        if not (self.mail_folder or "").startswith("@") \
-                and self.mail_has_more:
+        if (self.mail_folder or "").startswith("@"):
+            foot.append("6 已读")
+        elif self.mail_has_more:
             foot.append("6 更多")
         foot += ["Enter 读", "Esc 返回"]
         self.tool_foot(surf, foot)

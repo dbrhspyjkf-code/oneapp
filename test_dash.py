@@ -1412,6 +1412,11 @@ def test_mail_keys():
     app.mail_msgs[1]["flagged"] = False
     assert [m["uid"] for m in app._mail_view_msgs()] == ["11"]
     app.mail_msgs[1]["flagged"] = True
+    app.mail_sel = 1
+    app.key(pygame.K_6)                       # 列表直接标已读 (聚合)
+    assert ("job", "mail_act:Bob:10:mark_read") in app.net.got
+    app.mail_msgs[1]["seen"] = True           # 乐观已落 (旗标在, 行保留)
+    app.mail_sel = 0
     app.key(pygame.K_RETURN)                      # 开详情 → mail_body:夹:uid
     assert app.mail_lv == "detail" and app.mail_body_uid == "11"
     assert app.mail_body_fld == "INBOX"
