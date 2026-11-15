@@ -1438,6 +1438,7 @@ def test_tv():
     canvas = pygame.Surface((dash.W, dash.H))
     tmp = tempfile.mkdtemp(prefix="oneapp")
     dash.TV_LAST_CACHE = os.path.join(tmp, "tv_last.json")
+    dash.TV_FAV_CACHE = os.path.join(tmp, "tv_fav.json")
 
     # ── 台表: 95 条实测源, 4 组齐全, 无空名/坏协议/短时效 token;
     #    每频道 urls 列表 (≥30 台多路备胎), aptv host 挂 UA ──
@@ -1519,6 +1520,7 @@ def test_tv():
     dash.App._tv_log = lambda self, line: None   # 测试不污染 /tmp/oneapp_tv.log
     app2 = None
     try:
+        app.tv_grp = 1                         # 默认 0=收藏(空), 钉央视组
         lst = app.tv_list()
         assert len(lst) == 19 and lst[0][0] == "CCTV1"   # 央视组
         app.draw(canvas)                       # 列表页渲染不崩
@@ -1633,35 +1635,69 @@ def test_tv():
             dash.subprocess.Popen = real_popen
         assert app.tv_playing is None
 
-        # ── 键位: 分组循环切换 + 每组光标独立 + 持久化/恢复 ──
-        app.tv_grp = 0                        # 前段换台改过光标, 重置走键位
+        # ── 键位: 5 页签循环 (收藏+四分组) + 每组光标独立 + 持久化/恢复 ──
+        app.tv_grp = 1                        # 前段换台改过光标, 重置走键位
         app.tv_sel = 0
-        app.tv_sels = {0: 0}
+        app.tv_sels = {1: 0}
         app.tv_key(pygame.K_RIGHT)            # 央视→卫视
-        assert app.tv_grp == 1
+        assert app.tv_grp == 2
         app.tv_sel = 5
         app.tv_key(pygame.K_RIGHT)            # → 地方 (卫视光标记 5)
-        assert app.tv_grp == 2 and app.tv_sel == 0
-        app.tv_key(pygame.K_RIGHT)
-        app.tv_key(pygame.K_RIGHT)            # 国际 → 央视 (循环)
+        assert app.tv_grp == 3 and app.tv_sel == 0
+        app.tv_key(pygame.K_RIGHT)            # → 国际
+        app.tv_key(pygame.K_RIGHT)            # 国际 → 收藏 (循环)
         assert app.tv_grp == 0 and app.tv_sel == 0
-        app.tv_key(pygame.K_LEFT)             # 央视 → 国际 (反向循环)
-        assert app.tv_grp == 3
+        app.tv_key(pygame.K_LEFT)             # 收藏 → 国际 (反向循环)
+        assert app.tv_grp == 4
         app.tv_key(pygame.K_LEFT)             # → 地方
         app.tv_key(pygame.K_LEFT)             # → 卫视恢复光标 5
-        assert app.tv_grp == 1 and app.tv_sel == 5
+        assert app.tv_grp == 2 and app.tv_sel == 5
         app.tv_sel = 3
-        app.tv_key(pygame.K_RETURN)           # 起播即存档
+        app.tv_key(pygame.K_RETURN)           # 起播即存档 (grp 存页签名)
         assert netmod.load_json_file(dash.TV_LAST_CACHE, None) \
-            == {"grp": 1, "sel": 3}
+            == {"grp": "卫视", "sel": 3}
         app.tv_stop()
-        app2 = dash.App(FakeNet())            # 新会话恢复
+        app2 = dash.App(FakeNet())            # 新会话恢复 (名寻位)
         app2.tool = "tv"
         app2.tv_restore()
-        assert app2.tv_grp == 1 and app2.tv_sel == 3
+        assert app2.tv_grp == 2 and app2.tv_sel == 3
+        # 旧格式迁移: int grp (无收藏位) 顺移 +1
+        netmod.save_json_file(dash.TV_LAST_CACHE, {"grp": 1, "sel": 2})
+        app2.tv_restore()
+        assert app2.tv_grp == 2 and app2.tv_sel == 2
+        app2.tv_grp = 1
         app2.draw(canvas)                     # 恢复位列表渲染不崩
         app2.key(pygame.K_ESCAPE)             # 列表 Esc → 回工具网格 (外层链)
         assert app2.tool is None
+
+        # ── 收藏: 5 键收/取消 + 收藏组打开即看 + 播放中收藏 ──
+        app.tv_fav = []
+        app.tv_grp, app.tv_sel = 1, 0         # 央视组 CCTV1
+        app.tv_key(pygame.K_5)                # 列表: 收藏选中台
+        assert app.tv_fav == ["CCTV1"]
+        assert netmod.load_json_file(dash.TV_FAV_CACHE, None) == ["CCTV1"]
+        wl = app.tv_list(2)                   # 卫视组首台
+        app.tv_grp, app.tv_sel = 2, 0
+        app.tv_key(pygame.K_5)
+        assert app.tv_fav == ["CCTV1", wl[0][0]]
+        app.tv_key(pygame.K_LEFT)             # 卫视→央视
+        app.tv_key(pygame.K_LEFT)             # 央视→收藏
+        assert app.tv_grp == 0
+        assert [c[0] for c in app.tv_list()] == ["CCTV1", wl[0][0]]
+        app.draw(canvas)                      # 收藏组渲染 (★标+底栏) 不崩
+        app.tv_sel = 1
+        app.tv_key(pygame.K_RETURN)           # 收藏组 Enter 直接看
+        assert app.tv_playing and app.tv_playing[0] == wl[0][0]
+        app.tv_key(pygame.K_5)                # 播放中 5 = 取消收藏当前台
+        assert app.tv_fav == ["CCTV1"]
+        app.tv_stop()
+        app.tv_grp, app.tv_sel = 0, 0
+        app.draw(canvas)                      # 单条收藏组不崩
+        app.tv_key(pygame.K_5)                # 组内取消 → 空收藏
+        assert app.tv_fav == []
+        app.draw(canvas)                      # 空收藏组提示不崩
+        app.tv_key(pygame.K_LEFT)             # 空组仍可 ←→ 离开 → 国际
+        assert app.tv_grp == 4
     finally:
         dash.App._tv_spawn = real_spawn
         dash.App._tv_log = real_log

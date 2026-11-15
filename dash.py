@@ -676,6 +676,7 @@ MUSIC_SRCS = [("local", "本地曲库", ""), ("qq", "QQ 音乐", ""),
 MU_LAST_CACHE = os.path.join(STATE_DIR, "mu_last.json")  # 上次播放会话 (跨重启)
 MU_OUT_CACHE = os.path.join(STATE_DIR, "mu_out.json")   # 音乐输出 (按设备 id)
 TV_LAST_CACHE = os.path.join(STATE_DIR, "tv_last.json")  # 电视上次分组/光标
+TV_FAV_CACHE = os.path.join(STATE_DIR, "tv_fav.json")    # 电视收藏 (频道名表)
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
 CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
 _SENT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1393,7 +1394,10 @@ class App:
         self._mail_body_cache = (None, [])     # (key, lines) 详情折行缓存
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
         # + 音频同进程 — 播放方案移植官方 cardputer-zero-iptv 的 panel.py)
-        self.tv_grp = 0                        # 分组索引 (tv_channels.GROUPS)
+        self.tv_grp = 0                        # 分组索引 (0=收藏, 1+=GROUPS)
+        self.tv_fav = [n for n in
+                       netmod.load_json_file(TV_FAV_CACHE, [])
+                       if isinstance(n, str)]   # 收藏频道名 (插入序)
         self.tv_sel = 0                        # 组内光标
         self.tv_sels = {0: 0}                  # 每组光标 {grp_idx: sel}
         self.tv_scroll = 0                     # 列表窗口起点
@@ -2915,20 +2919,34 @@ class App:
     TV_FIRST_TIMEOUT = 20.0                 # 起播无首帧判死 (白天源拥堵实测 10-17s)
     TV_STALL_TIMEOUT = 8.0                  # 播放中断流判定
 
+    @staticmethod
+    def tv_tabs():
+        """分组页签: 收藏在最前 (打开即看), 后接四大分组."""
+        import tv_channels
+        return ["收藏"] + tv_channels.GROUPS
+
     def tv_list(self, grp=None):
-        """分组频道表 (grp=None → 当前组)."""
+        """分组频道表 (grp=None → 当前组). grp 0=收藏 (名字→频道, 缺名剔),
+        1+ = tv_channels.GROUPS[grp-1]."""
         import tv_channels
         g = self.tv_grp if grp is None else grp
-        return [c for c in tv_channels.CHANNELS if c[1] == tv_channels.GROUPS[g]]
+        if g == 0:
+            by = {c[0]: c for c in tv_channels.CHANNELS}
+            return [by[n] for n in self.tv_fav if n in by]
+        return [c for c in tv_channels.CHANNELS
+                if c[1] == tv_channels.GROUPS[g - 1]]
 
     def tv_restore(self):
-        """进 app 恢复上次分组/光标 (tv_last.json)."""
-        import tv_channels
+        """进 app 恢复上次分组/光标 (tv_last.json; grp 存页签名).
+        旧格式 int grp (无收藏位 0) 顺移 +1."""
+        tabs = self.tv_tabs()
         v = netmod.load_json_file(TV_LAST_CACHE, None)
         if isinstance(v, dict):
-            g = v.get("grp", 0)
-            if isinstance(g, int) and 0 <= g < len(tv_channels.GROUPS):
-                self.tv_grp = g
+            g = v.get("grp")
+            if isinstance(g, str) and g in tabs:
+                self.tv_grp = tabs.index(g)
+            elif isinstance(g, int) and 0 <= g < len(tabs) - 1:
+                self.tv_grp = g + 1             # 旧格式迁移
             s = v.get("sel", 0)
             n = len(self.tv_list())
             if isinstance(s, int) and n:
@@ -2937,7 +2955,28 @@ class App:
 
     def tv_save(self):
         netmod.save_json_file(TV_LAST_CACHE,
-                              {"grp": self.tv_grp, "sel": self.tv_sel})
+                              {"grp": self.tv_tabs()[self.tv_grp],
+                               "sel": self.tv_sel})
+
+    def tv_fav_toggle(self, name=None):
+        """5 键收藏/取消 (播放中=当前台, 列表=选中台); 落 tv_fav.json."""
+        lst = self.tv_list()
+        name = name or (self.tv_playing[0] if self.tv_playing else
+                        lst[self.tv_sel][0] if 0 <= self.tv_sel < len(lst)
+                        else None)
+        if not name:
+            return
+        if name in self.tv_fav:
+            self.tv_fav.remove(name)
+            self.osd = ("已取消收藏", time.monotonic() + 1.2)
+        else:
+            self.tv_fav.append(name)
+            self.osd = ("已收藏 · %s" % name, time.monotonic() + 1.5)
+        netmod.save_json_file(TV_FAV_CACHE, self.tv_fav)
+        n = len(self.tv_list())                # 收藏组可能变短, 光标钳回
+        if self.tv_grp == 0 and n:
+            self.tv_sel = min(self.tv_sel, n - 1)
+            self.tv_sels[0] = self.tv_sel
 
     @staticmethod
     def tv_hwdec_available():
@@ -3196,8 +3235,8 @@ class App:
             self._tv_fail(last)
 
     def tv_key(self, k):
-        """列表: ←→ 切分组 ↑↓ 选台 Enter 播; 播放态: ↑↓ 换台 (Esc 外层)."""
-        import tv_channels
+        """列表: ←→ 切分组 (收藏在最前) ↑↓ 选台 Enter 播 5 收藏;
+        播放态: ↑↓ 换台 5 收藏当前台 (Esc 外层)."""
         lst = self.tv_list()
         if self.tv_playing:
             if k in (pygame.K_UP, pygame.K_DOWN) and lst:
@@ -3206,18 +3245,25 @@ class App:
                 self.tv_sels[self.tv_grp] = self.tv_sel
                 self.tv_play(lst[self.tv_sel])
                 self.tv_save()
-            return True
-        if not lst:
+            elif k == pygame.K_5:
+                self.tv_fav_toggle()
             return True
         if k in (pygame.K_LEFT, pygame.K_RIGHT):
             d = -1 if k == pygame.K_LEFT else 1
             self.tv_sels[self.tv_grp] = self.tv_sel   # 存当前组光标
-            self.tv_grp = (self.tv_grp + d) % len(tv_channels.GROUPS)
+            self.tv_grp = (self.tv_grp + d) % len(self.tv_tabs())
             lst = self.tv_list()
-            self.tv_sel = min(self.tv_sels.get(self.tv_grp, 0), len(lst) - 1)
+            if lst:                              # 空组光标归 0
+                self.tv_sel = min(self.tv_sels.get(self.tv_grp, 0),
+                                  len(lst) - 1)
+            else:
+                self.tv_sel = 0
             self.tv_err = ""
             self.tv_save()
-        elif k in (pygame.K_UP, pygame.K_DOWN):
+            return True
+        if not lst:                              # 空收藏组: 只剩 ↑↓/Esc
+            return True
+        if k in (pygame.K_UP, pygame.K_DOWN):
             d = -1 if k == pygame.K_UP else 1
             self.tv_sel = (self.tv_sel + d) % len(lst)
             self.tv_sels[self.tv_grp] = self.tv_sel
@@ -3225,31 +3271,39 @@ class App:
             self.tv_err = ""
             self.tv_play(lst[self.tv_sel])
             self.tv_save()
+        elif k == pygame.K_5:
+            self.tv_fav_toggle()
         return True
 
     def draw_tv(self, surf):
         if self.tv_playing:
             self._draw_tv_play(surf)
             return
-        import tv_channels
         from urllib.parse import urlparse
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
         lst = self.tv_list()
-        self.tool_head(surf, "电视", "%d 台 · 实测源" % len(lst))
+        self.tool_head(surf, "电视", "★ %d" % len(lst) if self.tv_grp == 0
+                       else "%d 台 · 实测源" % len(lst))
         if self.tv_err:
             text(surf, clip_text(self.tv_err, 9, 200), 9,
                  self.th("danger"), (6, 15))
-        # 分组 tabs
+        # 分组 tabs (收藏在最前)
         gx = 6
-        for i, g in enumerate(tv_channels.GROUPS):
+        for i, g in enumerate(self.tv_tabs()):
             sel = i == self.tv_grp
             if sel:
                 r = pygame.Rect(gx - 3, 26, textw(g, 11) + 6, 15)
                 pygame.draw.rect(surf, self.card(0), r, border_radius=3)
                 pygame.draw.rect(surf, acc, r, 1, border_radius=3)
-            text(surf, g, 11, hi if sel else soft, (gx, 28))
-            gx += textw(g, 11) + 14
+            text(surf, ("★ " + g) if i == 0 else g, 11,
+                 hi if sel else soft, (gx, 28))
+            gx += textw(("★ " + g) if i == 0 else g, 11) + 13
+        if not lst:                             # 空收藏组提示
+            textc(surf, "还没有收藏", 13, dim, W // 2, 72)
+            textc(surf, "列表里按 5 收藏喜欢的频道", 10, dim, W // 2, 94)
+            self.tool_foot(surf, ("←→ 分组", "5 收藏", "Esc 返回"))
+            return
         # 频道列表 4 行 (本地曲库列表同款)
         nrow = 4
         r0 = max(0, min(self.tv_sel - (nrow - 1), max(0, len(lst) - nrow)))
@@ -3265,13 +3319,16 @@ class App:
             pygame.draw.rect(surf, self.card(0), rct, border_radius=4)
             pygame.draw.rect(surf, acc if sel else self.th("border"), rct,
                              2 if sel else 1, border_radius=4)
+            if name in self.tv_fav:             # 收藏星标
+                text(surf, "★", 11, acc, (9, y + 7))
             text(surf, clip_text(name, 12, W - 130), 12,
-                 hi if sel else soft, (12, y + 1))
+                 hi if sel else soft, (24, y + 1))
             text(surf, urlparse(urls[0]).netloc +
                  (" +备胎×%d" % (len(urls) - 1) if len(urls) > 1 else ""),
-                 9, dim, (12, y + 13))
+                 9, dim, (24, y + 13))
             text(surf, "%02d" % (i + 1), 10, acc, (W - 24, y + 7), right=True)
-        self.tool_foot(surf, ("←→ 分组", "↑↓ 选台", "Enter 播", "Esc 返回"))
+        self.tool_foot(surf, ("←→ 组", "↑↓ 选", "5 ★", "Enter 播",
+                              "Esc 返回"))
 
     def _draw_tv_play(self, surf):
         surf.fill((0, 0, 0))
