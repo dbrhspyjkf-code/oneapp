@@ -104,6 +104,22 @@ THEMES = [
     {"name": "岩紫", "hero": "#3A2C55", "accent": "#B08CFF", "press": "#6A4FA0",
      "cards": ["#2B213F", "#251C37", "#1E162C", "#171022"], "border": "#453663",
      "track": "#120D1E", "page": "#000000", **DARK_TXT, **DARK_SEM},
+    # 晨白/车机灰/纯黑: 取色自 car-dash 车机主题 (2026-11-15 对齐导入)
+    {"name": "晨白", "hero": "#F4FAF6", "accent": "#1E9E6A", "press": "#DCEFE4",
+     "cards": ["#FFFFFF", "#F7FAF8", "#F2F6F3", "#EDF2EE"], "border": "#D8E2DA",
+     "track": "#E4ECE6", "page": "#EEF3EF",
+     "hi": "#1A2B22", "soft": "#4A5D52", "dim": "#8AA094",
+     "ok": "#18A05E", "warn": "#D99A12", "danger": "#DC4444"},
+    {"name": "车机灰", "hero": "#ECEEF1", "accent": "#5F7FB8", "press": "#CFD5DE",
+     "cards": ["#F2F4F6", "#EDEFF2", "#E8EAEE", "#E3E5E9"], "border": "#CBD0D8",
+     "track": "#D6D9DF", "page": "#DEE0E4",
+     "hi": "#262B33", "soft": "#555D6B", "dim": "#8A93A3",
+     "ok": "#2FA26E", "warn": "#E8A23D", "danger": "#E05252"},
+    {"name": "纯黑", "hero": "#0C0E11", "accent": "#7FA3D9", "press": "#26292E",
+     "cards": ["#14161A", "#121418", "#0F1114", "#0B0D10"], "border": "#25282E",
+     "track": "#17191E", "page": "#000000",
+     "hi": "#F0F2F4", "soft": "#AEB4BC", "dim": "#6E747D",
+     "ok": "#5B9BD5", "warn": "#E8A23D", "danger": "#E05252"},
 ]
 
 STATE_DIR = os.path.expanduser("~/.local/share/oneapp")
@@ -662,7 +678,7 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
 
 # ── 工具页: app 卡片入口 (卡片=名字+快捷键, 5×2 网格, Z/C/F/X(丝印←→↑↓) 移动
 #    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
-TOOL_APPS = [("fx", "汇率"), ("unit", "单位换算"),
+TOOL_APPS = [("fx", "汇率"), ("unit", "换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
              ("music", "音乐"), ("mail", "邮件"), ("tv", "电视"),
              ("set", "设置")]   # 设置: API KEY + 主页卡片显隐 (无数字键)
@@ -3963,7 +3979,7 @@ class App:
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
         border = self.th("border")
-        self.tool_head(surf, "设置", "←→ 选分类/选项")
+        self.tool_head(surf, "设置", "←→ 选分类/选项 · Enter 确认")
         LX, LW2 = 6, 88                        # 左列分类
         RX = LX + LW2 + 6                      # 右侧详情
         RW2 = W - RX - 6
@@ -4010,7 +4026,6 @@ class App:
             elif rid == "theme":
                 text(surf, "%d/%d" % (self.theme_idx + 1, len(THEMES)),
                      12, soft, (RX + RW2 - 8, y), right=True)
-        textc(surf, "←→ 选分类/选项 · Enter 确认", 10, dim, W // 2, 146)
         # ── KEY 输入弹窗 (覆盖) ──
         if self.set_edit is not None:
             lab = "输入 GLM KEY" if self.set_edit == "glm" else "输入 DS KEY"
@@ -4018,8 +4033,8 @@ class App:
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
             text(surf, lab, 13, hi, (box.x + 12, box.y + 8))
-            text(surf, self.set_buf + "_", 13, soft,
-                 (box.x + 12, box.y + 30))
+            text(surf, clip_text(self.set_buf[-28:] + "_", 13, 210), 13,
+                 soft, (box.x + 12, box.y + 30))   # 尾窗 28 字符防溢出
             text(surf, "Enter 保存 · Esc 取消", 10, dim,
                  (box.x + 12, box.y + 46))
 
