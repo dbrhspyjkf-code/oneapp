@@ -179,14 +179,14 @@ STATIONS = [
     {"key": "pbb13ef", "name": "青海经济广播", "url": "http://satellitepull.cnr.cn/live/wx32qhjjgb/playlist.m3u8", "grp": "省级", "prov": "青海"},
     {"key": "ca28db4", "name": "开州之声", "url": "http://183.64.174.171:10124/tlgb.m3u8", "grp": "地方", "prov": "重庆", "city": "开州"},
     {"key": "p644508", "name": "山西综合广播", "url": "http://satellitepull.cnr.cn/live/wxssxxwgb/playlist.m3u8", "grp": "省级", "prov": "山西"},
-    {"key": "i3e0421", "name": "CityFM城市广播", "url": "http://fm929.cityfm.tw:8080/929.mp3", "grp": "国际"},
-    {"key": "icf4a26", "name": "台湾古典音乐台", "url": "http://59.120.88.155:8000/live.mp3", "grp": "国际"},
-    {"key": "ie3cd93", "name": "BravoFM台北都会音乐台", "url": "https://onair.bravo913.com.tw:9130/live.mp3", "grp": "国际"},
-    {"key": "id7bfca", "name": "台中古典音乐台", "url": "https://onair.family977.com.tw:8977/live.mp3", "grp": "国际"},
-    {"key": "i316c3f", "name": "中广新闻网", "url": "http://n12.rcs.revma.com/78fm9wyy2tzuv", "grp": "国际"},
-    {"key": "i63fd8b", "name": "中广流行网", "url": "http://n14.rcs.revma.com/aw9uqyxy2tzuv", "grp": "国际"},
-    {"key": "iac4c15", "name": "News98新闻台", "url": "http://n12.rcs.revma.com/55tyxsy4qtzuv", "grp": "国际"},
-    {"key": "i2f6c28", "name": "飞碟电台", "url": "http://n08.rcs.revma.com/em90w4aeewzuv", "grp": "国际"},
+    {"key": "i3e0421", "name": "CityFM城市广播", "url": "http://fm929.cityfm.tw:8080/929.mp3", "grp": "省级", "prov": "台湾"},
+    {"key": "icf4a26", "name": "台湾古典音乐台", "url": "http://59.120.88.155:8000/live.mp3", "grp": "省级", "prov": "台湾"},
+    {"key": "ie3cd93", "name": "BravoFM台北都会音乐台", "url": "https://onair.bravo913.com.tw:9130/live.mp3", "grp": "省级", "prov": "台湾"},
+    {"key": "id7bfca", "name": "台中古典音乐台", "url": "https://onair.family977.com.tw:8977/live.mp3", "grp": "省级", "prov": "台湾"},
+    {"key": "i316c3f", "name": "中广新闻网", "url": "http://n12.rcs.revma.com/78fm9wyy2tzuv", "grp": "省级", "prov": "台湾"},
+    {"key": "i63fd8b", "name": "中广流行网", "url": "http://n14.rcs.revma.com/aw9uqyxy2tzuv", "grp": "省级", "prov": "台湾"},
+    {"key": "iac4c15", "name": "News98新闻台", "url": "http://n12.rcs.revma.com/55tyxsy4qtzuv", "grp": "省级", "prov": "台湾"},
+    {"key": "i2f6c28", "name": "飞碟电台", "url": "http://n08.rcs.revma.com/em90w4aeewzuv", "grp": "省级", "prov": "台湾"},
     {"key": "ib335fd", "name": "LOVE 972", "url": "https://14033.live.streamtheworld.com/LOVE972FM_PREM.aac", "grp": "国际"},
     {"key": "i057dbe", "name": "UFM 1003", "url": "https://22283.live.streamtheworld.com/UFM_1003AAC.aac", "grp": "国际"},
     {"key": "p13a317", "name": "HITFM劲曲调频", "url": "http://satellitepull.cnr.cn/live/wxhitfm/playlist.m3u8", "grp": "省级", "prov": "北京"},
@@ -219,7 +219,7 @@ STATIONS = [
 _PROVS = ("北京", "天津", "上海", "重庆", "河北", "山西", "辽宁", "吉林",
           "黑龙江", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南",
           "湖北", "湖南", "广东", "海南", "四川", "贵州", "云南", "陕西",
-          "甘肃", "青海", "内蒙古", "广西", "西藏", "宁夏", "新疆")
+          "甘肃", "青海", "内蒙古", "广西", "西藏", "宁夏", "新疆", "台湾")
 _PROV_SUFFIX = ("特别行政区", "维吾尔自治区", "壮族自治区", "回族自治区",
                 "自治区", "省", "市")
 PROV_ALIAS = {                      # 英文归属地 (api.ip.sb 兜底) → prov
@@ -233,7 +233,7 @@ PROV_ALIAS = {                      # 英文归属地 (api.ip.sb 兜底) → pro
     "guizhou": "贵州", "yunnan": "云南", "shaanxi": "陕西",
     "gansu": "甘肃", "qinghai": "青海", "nei mongol": "内蒙古",
     "inner mongolia": "内蒙古", "guangxi": "广西", "tibet": "西藏",
-    "ningxia": "宁夏", "xinjiang": "新疆",
+    "ningxia": "宁夏", "xinjiang": "新疆", "taiwan": "台湾",
 }
 
 
