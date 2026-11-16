@@ -1489,19 +1489,22 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=12; 提醒/行程卡行插入后再位移) → 开启被拒
-    # (前三已开, 上限 3) + OSD 提醒
-    app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
+    # sw:usage 行 (sel=11; sched 行在 12) → 有效 4 张 (含 sched 缺省 True) 被拒
+    app.cfg["cards"].update(hitokoto=True, news=True, fin=True, usage=False)
     assert app._set_rows()[11][0] == "sw:usage"
     assert app._set_rows()[12][0] == "sw:sched"    # 提醒/行程卡 = 末行
+    assert app._card_on_n() == 4
     app.set_sel = 11
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
     assert app.osd and "先关" in app.osd[0], app.osd
-    # 关掉新闻后 → usage 可开
+    # 关掉自选股+新闻 → 有效 2 张 → usage 可开 (开完 3 张满员)
+    app.cfg["cards"]["fin"] = False
     app.cfg["cards"]["news"] = False
+    assert app._card_on_n() == 2
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is True
+    assert app._card_on_n() == 3
     app.draw(canvas)                          # 设置页渲染冒烟 (KEY 掩码/开关)
     # 主题页签: ←→ 切到 主题 → 选 纯黑 (theme:6) → theme_idx 应用
     app.key(pygame.K_LEFT)                    # ← 左页签 (主题在左? 方向循环)
@@ -1534,6 +1537,23 @@ def test_cloud():
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
     assert [r[0] for r in app._set_rows()].count("key:cloud") == 1
+    # ≤3 归一: 5 张全开 (含 sched 缺省 True) → 只保留前 3, 其余显式 False
+    app.cfg["cards"].update(hitokoto=True, news=True, fin=True, usage=True)
+    app._card_norm()
+    assert app._card_on_n() == 3
+    assert [ck for ck in dash.CARD_KEYS if app._card_on(ck)] ==         list(dash.CARD_KEYS[:3])
+    # 计数含缺省键: sched 缺省 True + 显式 3 张 = 有效 4 → 开第 5 张被拒
+    app.cfg["cards"] = {"hitokoto": True, "news": True, "usage": True,
+                        "fin": False}
+    assert app._card_on_n() == 4
+    rows = app._set_rows()
+    app.tool = "set"
+    app.set_tab = 0
+    app.set_sel = [i for i, r in enumerate(rows) if r[0] == "sw:fin"][0]
+    app.key(pygame.K_RETURN)
+    app.tool = None
+    assert app._card_on("fin") is False        # 被拒, 保持关
+    assert "先关" in (app.osd[0] if app.osd else "")
     # 云配置弹窗保存 → cfg 落盘 + ping 入队
     app.tool = "set"
     app.set_edit = "cloud"

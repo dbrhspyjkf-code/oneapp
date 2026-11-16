@@ -757,6 +757,8 @@ def daily_sentence():
     import datetime
     en, cn = _SENTENCES[datetime.date.today().toordinal() % len(_SENTENCES)]
     return {"ok": True, "text": cn, "from": en}
+# 主页右列卡片键 (与 draw_home vis 元组同序; 设置页开关/≤3 计数共用)
+CARD_KEYS = ("sched", "hitokoto", "news", "usage", "fin")
 # 主页卡缓存标签: 进 app 秒显上次数据, 后台刷新后再覆盖 (用户要求免"获取中")
 HOME_CACHE_TAGS = ("wx", "news", "ipo", "quotes")
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")        # 自选股 (本地)
@@ -1476,6 +1478,7 @@ class App:
         self.cfg.setdefault("glm_key", "")
         self.cfg.setdefault("ds_key", "")
         self.cfg.setdefault("cards", {})
+        self._card_norm()                     # >3 张显式关掉排序靠后的
         self.set_tab = 0                       # 设置页签 (0=卡片 1=主题)
         self.set_sel = 0                       # 页签内行光标
         self.set_edit = None                   # None=常态 glm/ds=KEY 弹窗
@@ -4545,6 +4548,21 @@ class App:
     # ── 工具·设置: TAB 页签 (卡片 = API KEY + 卡片开关; 主题 = 主题选择) ──
     SET_TABS = ("卡片", "主题")
 
+    def _card_on(self, ck):
+        """卡片有效开关态 (缺省: usage 关, 其余开) — 计数/开关/绘制同源."""
+        return self.cfg["cards"].get(ck, ck != "usage")
+
+    def _card_on_n(self):
+        return sum(1 for ck in CARD_KEYS if self._card_on(ck))
+
+    def _card_norm(self):
+        """开机归一: 有效开 >3 张时, 排序靠后的显式关掉 (2026-11-16 用户重申)."""
+        over = [ck for ck in CARD_KEYS if self._card_on(ck)][3:]
+        for ck in over:
+            self.cfg["cards"][ck] = False
+        if over:
+            self.cfg_save()
+
     def _set_rows(self):
         """选中页签的行: 卡片 = KEY + 开关; 主题 = 全部主题."""
         if self.SET_TABS[self.set_tab] == "主题":
@@ -4617,13 +4635,12 @@ class App:
                 self.set_buf = ""
             elif rid.startswith("sw:"):
                 ck = rid.split(":", 1)[1]
-                cur = self.cfg["cards"].get(ck, ck != "usage")
+                cur = self._card_on(ck)
                 if cur:                          # ON → OFF 随意
                     self.cfg["cards"][ck] = False
                     self.cfg_save()
                 else:                            # OFF → ON 须 ≤3 张
-                    on = sum(1 for v in self.cfg["cards"].values()
-                             if v)
+                    on = self._card_on_n()
                     if on >= 3:
                         self.osd = ("最多 3 卡, 请先关一个",
                                     time.monotonic() + 2.5)
@@ -4858,7 +4875,7 @@ class App:
                     text(surf, "填 TOKEN", 10, acc, (W - 96, y), right=True)
             elif rid.startswith("sw:"):
                 ck = rid.split(":", 1)[1]
-                on = self.cfg["cards"].get(ck, ck != "usage")
+                on = self._card_on(ck)
                 pill = pygame.Rect(W - 52, y - 2, 36, 15)
                 pygame.draw.rect(surf,
                                  acc if on else self.th("track"), pill,
@@ -6739,7 +6756,7 @@ class App:
         vis = [(lab, key) for lab, key in
                (("提醒/行程", "sched"), ("每日一句", "hitokoto"),
                 ("新闻", "news"), ("USAGE", "usage"), ("自选股", "fin"))
-               if ck.get(key, key != "usage")][:3]  # 右列最多 3 卡 (用户定版)
+               if self._card_on(key)][:3]      # 右列最多 3 卡 (用户定版)
         nc = max(1, len(vis))
         gap = M
         chh = (137 - M * (nc - 1)) // nc           # 动态均分右列高
