@@ -709,8 +709,9 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
 #    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
 TOOL_APPS = [("fx", "汇率"), ("unit", "换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
-             ("music", "音乐"), ("mail", "邮件"), ("tv", "电视"),
+             ("music", "音乐"), ("tv", "电视"),
              ("set", "设置")]   # 设置: API KEY + 主页卡片显隐 (无数字键)
+# 邮件不在工具网格 (2026-11-16 用户定版): 主页底栏 9 邮件 直达
 TOOL_GRID = 5                            # 每行卡片数
 MAIL_BODY_ROWS = 5                       # 邮件详情每屏正文行数 (13px, 用户定版原生字号)
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")   # 设置: API KEY + 主页卡片显隐
@@ -4295,6 +4296,9 @@ class App:
             self.page = k - pygame.K_3        # 想法=4 电台=5 行情=6 新闻=7 工具=8
                                               # (主页仅长按 Esc)
             self.in_input = False
+        elif self.page == 0 and k == pygame.K_9:
+            self.tool_open("mail")            # 主页底栏 9 邮件直达 (2026-11-16
+                                              #   用户定版; 工具网格不再列)
         elif k in (pygame.K_LEFT, pygame.K_UP):
             if self.page == 5:
                 self.tool_grid_key(k)
@@ -7638,15 +7642,17 @@ class App:
                      (i * slot + (slot - textw(lab, 12)) // 2, 151))
 
     def draw_tabs(self, surf):
-        """快捷入口条: 仅主页显示 (其他页长按 Esc 回主页), 不含主页自身."""
+        """快捷入口条: 仅主页显示 (其他页长按 Esc 回主页), 不含主页自身;
+        末位 9 邮件 = 主页直达邮件工具 (2026-11-16 用户定版)."""
         if self.page != 0:
             return
         y = H - 22
-        entries = PAGES[1:]
+        entries = PAGES[1:] + [("邮件", "mail")]
         cw = W // len(entries)
         for j, (name, _) in enumerate(entries):
             x = j * cw
-            text(surf, str(j + 4), 11, self.th("accent"), (x + 7, y + 7))
+            text(surf, "9" if j == 5 else str(j + 4), 11, self.th("accent"),
+                 (x + 7, y + 7))
             text(surf, name, 13, self.th("soft"), (x + 24, y + 5))
 
     def draw_osd(self, surf):

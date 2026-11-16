@@ -501,6 +501,14 @@ def test_tools():
     assert app.tool is None and app.page == 5     # Esc 回网格 (主页 Esc 才回主页)
     app.key(pygame.K_8)
     assert app.page == 5                          # 8 → 工具页
+    # 主页底栏 9 邮件直达 (2026-11-16 用户定版): 工具网格不再列邮件
+    assert "mail" not in [t for t, _ in dash.TOOL_APPS]
+    app.tool = None
+    app.page = 0
+    app.key(pygame.K_9)
+    assert app.tool == "mail"                     # 主页 9 直开邮件
+    app.tool_close()
+    app.page = 5
     app.tool_open("music")
     assert app.tool == "music" and app.mu_view == "play"   # 主页即播放页
     app.key(pygame.K_ESCAPE)                      # Esc 直接退出 (无 1s 长按)
@@ -1816,9 +1824,9 @@ def test_mail_keys():
     tmp = tempfile.mkdtemp(prefix="oneapp")
     mailmod.MAIL_FILE = os.path.join(tmp, "mail.json")
     app = dash.App(FakeNet())
-    # 网格数字直开: 邮件第 7 卡
-    app.page = 5
-    app.key(pygame.K_7)
+    # 主页底栏 9 直开邮件 (2026-11-16 定版: 网格不再列邮件)
+    app.page = 0
+    app.key(pygame.K_9)
     assert app.tool == "mail" and app.mail_lv == "acct"
     # 登录表单: 邮箱 → Enter → 授权码 → Enter 提交
     app.key(pygame.K_RETURN)
