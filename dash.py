@@ -5189,11 +5189,11 @@ class App:
                      10, acc if over else dim, (8, y + 1))
                 badge = "\u884c" if it["kind"] == "trip" else "\u63d0"
                 text(surf, badge, 10,
-                     acc if it["kind"] == "trip" else soft, (56, y + 1))
+                     acc if it["kind"] == "trip" else soft, (76, y + 1))
                 label = it["text"] + ((" \u00b7 " + it["loc"]) if it["loc"]
                                       else "")
-                text(surf, clip_text(label, 13, W - 84), 13,
-                     hi if sel else soft, (68, y))
+                text(surf, clip_text(label, 13, W - 98), 13,
+                     hi if sel else soft, (90, y))
         self.tool_foot(surf, ["4 \u5237\u65b0", "Enter \u5b8c\u6210",
                               "7 \u5220\u9664", "Esc \u8fd4\u56de"])
 
