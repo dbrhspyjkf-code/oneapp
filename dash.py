@@ -6856,26 +6856,25 @@ class App:
                 else:
                     utxt = "DS 余额 ¥%s" % (udat.get("cny") or "?")
                 text(surf, utxt, BODY, soft, (cx + 8, vy3))
-        # 提醒/行程卡: 本地缓存最近几条秒显 (300s 节流后台拉新)
+        # 提醒/行程卡: 最近条目单行居中, 3s 轮播 (300s 节流后台拉新)
         tops_s = tops.get("提醒/行程")
         if tops_s is not None:
             if time.monotonic() - self._sched_home_at > 300:
                 self._sched_home_at = time.monotonic()
                 self.sched_refresh(False)
-            nrow = min(4, max(1, (chh - 19) // 15))
-            its = self._sched_items()[:nrow]
+            its = self._sched_items()
             if its:
-                yy = tops_s + 17
-                for it2 in its:
-                    lt2 = time.localtime(it2["t"] or time.time())
-                    text(surf, "%02d-%02d %02d:%02d"
-                         % (lt2.tm_mon, lt2.tm_mday, lt2.tm_hour,
-                            lt2.tm_min), 12, soft, (cx + 8, yy + 1))
-                    text(surf, "行" if it2["kind"] == "trip" else "提",
-                         12, soft, (cx + 86, yy + 1))
-                    text(surf, clip_text(it2["text"], 12, cw2 - 110), 12,
-                         soft, (cx + 102, yy + 1))
-                    yy += 15
+                si = int(time.monotonic() // 3) % len(its)   # 3s 轮播一条
+                it2 = its[si]
+                lt2 = time.localtime(it2["t"] or time.time())
+                vy = tops_s + 13 + (chh - 13 - BODY) // 2    # 标签下垂直居中
+                text(surf, "%02d-%02d %02d:%02d"
+                     % (lt2.tm_mon, lt2.tm_mday, lt2.tm_hour, lt2.tm_min),
+                     12, soft, (cx + 8, vy))
+                text(surf, "行" if it2["kind"] == "trip" else "提",
+                     12, soft, (cx + 86, vy))
+                text(surf, clip_text(it2["text"], 12, cw2 - 110), 12,
+                     soft, (cx + 102, vy))
             else:
                 text(surf, "暂无 · iPhone 同步后按4刷新", BODY, dim,
                      (cx + 8, tops_s + 13 + (chh - 13 - BODY) // 2))
