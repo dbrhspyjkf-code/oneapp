@@ -5188,14 +5188,14 @@ class App:
                     (it["kind"] == "remind" or (it["tend"] or t) < now)
                 text(surf, "%02d-%02d %02d:%02d" % (lt.tm_mon, lt.tm_mday,
                                                     lt.tm_hour, lt.tm_min),
-                     12, acc if over else dim, (8, y + 4))
+                     16, acc if over else dim, (8, y + 1))
                 badge = "\u884c" if it["kind"] == "trip" else "\u63d0"
-                text(surf, badge, 12,
-                     acc if it["kind"] == "trip" else soft, (90, y + 4))
+                text(surf, badge, 16,
+                     acc if it["kind"] == "trip" else soft, (116, y + 1))
                 label = it["text"] + ((" \u00b7 " + it["loc"]) if it["loc"]
                                       else "")
-                text(surf, clip_text(label, 16, W - 116), 16,
-                     hi if sel else soft, (108, y))
+                text(surf, clip_text(label, 16, W - 148), 16,
+                     hi if sel else soft, (140, y))
         self.tool_foot(surf, ["4 \u5237\u65b0", "Enter \u5b8c\u6210",
                               "7 \u5220\u9664", "Esc \u8fd4\u56de"])
 
@@ -6870,12 +6870,12 @@ class App:
                     lt2 = time.localtime(it2["t"] or time.time())
                     text(surf, "%02d-%02d %02d:%02d"
                          % (lt2.tm_mon, lt2.tm_mday, lt2.tm_hour,
-                            lt2.tm_min), 10, dim, (cx + 8, yy + 2))
+                            lt2.tm_min), 12, dim, (cx + 8, yy + 1))
                     text(surf, "行" if it2["kind"] == "trip" else "提",
-                         10, acc if it2["kind"] == "trip" else soft,
-                         (cx + 74, yy + 2))
-                    text(surf, clip_text(it2["text"], 12, cw2 - 98), 12,
-                         soft, (cx + 88, yy))
+                         12, acc if it2["kind"] == "trip" else soft,
+                         (cx + 86, yy + 1))
+                    text(surf, clip_text(it2["text"], 12, cw2 - 110), 12,
+                         soft, (cx + 102, yy))
                     yy += 15
             else:
                 text(surf, "暂无 · iPhone 同步后按4刷新", BODY, dim,
