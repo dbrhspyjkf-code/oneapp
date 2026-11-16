@@ -1489,10 +1489,11 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=11; 云/账户四行+管理员两行插入后位移) → 开启被拒
+    # sw:usage 行 (sel=12; 提醒/行程卡行插入后再位移) → 开启被拒
     # (前三已开, 上限 3) + OSD 提醒
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
     assert app._set_rows()[11][0] == "sw:usage"
+    assert app._set_rows()[12][0] == "sw:sched"    # 提醒/行程卡 = 末行
     app.set_sel = 11
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
@@ -2922,7 +2923,12 @@ def test_sched():
                {"op": "done", "id": "a" * 12, "st": 500})
     assert len(app.net.jobs) > n_jobs
     netmod.http_raw = orig_raw
-    print("sched OK  (fetch/cache/sort/done/delete/rollback)")
+    # 主页右列「提醒/行程」卡: 开关默认开 + 渲染冒烟 (缓存 2 条 → 画得出)
+    app.cfg["cards"]["sched"] = True
+    app.tool = None
+    app.page = 0
+    app.draw(canvas)
+    print("sched OK  (fetch/cache/sort/done/delete/rollback/home-card)")
 
 
 if __name__ == "__main__":

@@ -710,7 +710,7 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
 TOOL_APPS = [("fx", "汇率"), ("unit", "换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
              ("music", "音乐"), ("tv", "电视"),
-             ("set", "设置"), ("sched", "日程")]   # 设置+日程: KEY/显隐 · 提醒+行程
+             ("sched", "日程"), ("set", "设置")]   # 日程=8 设置=9 (2026-11-16 定版: 设置挪日程后)
 # 邮件不在工具网格 (2026-11-16 用户定版): 主页底栏 9 邮件 直达
 TOOL_GRID = 5                            # 每行卡片数
 MAIL_BODY_ROWS = 5                       # 邮件详情每屏正文行数 (13px, 用户定版原生字号)
@@ -1303,6 +1303,7 @@ class App:
         self.sched = netmod.load_json_file(SCHED_CACHE,
                                            {"reminds": [], "trips": []})
         self.ssel = 0                         # 日程列表光标
+        self._sched_home_at = 0.0             # 主页日程卡刷新节流
         self.watch = netmod.load_json_file(WATCH_FILE, WATCH_SEED)
         self.wx_loc = netmod.load_json_file(WX_LOC_FILE, None) or dict(WX_HOME)
         # 语音想法: 录音 (arecord) + 本地播放 (ffplay)
@@ -4556,7 +4557,8 @@ class App:
                 ("reg", "注册新账号"), ("logout", "退出登录"),
                 ("key:admin", "管理员 TOKEN"), ("minv", "生成注册码"),
                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
-                ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡")]
+                ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡"),
+                ("sw:sched", "提醒/行程卡")]
 
     def cfg_save(self):
         netmod.save_json_file(SETTINGS_FILE, self.cfg)
@@ -5150,50 +5152,50 @@ class App:
         acc = self.th("accent")
         items = self._sched_items()
         logged = bool(self._cloud_cfg()[1])
-        text(surf, "日程", 12, hi, (6, 3))
+        text(surf, "日程", 14, hi, (6, 3))
         text(surf, "\u00b7 %d \u6761" % len(items), 10, dim,
-             (6 + textw("\u65e5\u7a0b", 12) + 6, 5))
+             (6 + textw("\u65e5\u7a0b", 14) + 6, 5))
         head = ("@%s" % (self.cfg.get("cloud_user") or "")) if logged \
             else "\u672a\u767b\u5f55"
         text(surf, head, 10, dim, (W - 6, 5), right=True)
         if not logged:
             textc(surf, "\u672a\u767b\u5f55 \u00b7 \u8bbe\u7f6e\u91cc\u914d\u7f6e\u60f3\u6cd5\u4e91\u540e\u53ef\u7528",
-                  13, dim, W // 2, 62)
+                  14, dim, W // 2, 62)
             textc(surf, "\u8bbe\u7f6e \u00b7 \u767b\u5f55 \u6216 \u6ce8\u518c\u65b0\u8d26\u53f7",
                   12, acc, W // 2, 82)
             self.tool_foot(surf, ["4 \u5237\u65b0", "Esc \u8fd4\u56de"])
             return
         now = time.time()
         if not items:
-            textc(surf, "\u6682\u65e0\u63d0\u9192 / \u884c\u7a0b", 13, dim, W // 2, 60)
-            textc(surf, "iPhone \u5feb\u6377\u6307\u4ee4\u53d1\u9001\u540e \u00b7 \u63094 \u5237\u65b0",
+            textc(surf, "\u6682\u65e0\u63d0\u9192 / \u884c\u7a0b", 14, dim, W // 2, 60)
+            textc(surf, "iPhone \u5feb\u6377\u6307\u4ee4\u540c\u6b65\u540e \u00b7 \u63094 \u5237\u65b0",
                   12, acc, W // 2, 80)
         else:
-            start = max(0, min(self.ssel - 7, len(items) - 8))
-            for i in range(8):
+            start = max(0, min(self.ssel - 5, len(items) - 6))
+            for i in range(6):
                 idx = start + i
                 if idx >= len(items):
                     break
                 it = items[idx]
                 sel = idx == self.ssel
-                y = 18 + i * 15
+                y = 20 + i * 20
                 if sel:
                     pygame.draw.rect(surf, self.th("track"),
-                                     (4, y - 1, W - 8, 14), border_radius=3)
+                                     (4, y - 1, W - 8, 19), border_radius=3)
                 t = it["t"]
                 lt = time.localtime(t or now)
                 over = t and t < now and \
                     (it["kind"] == "remind" or (it["tend"] or t) < now)
                 text(surf, "%02d-%02d %02d:%02d" % (lt.tm_mon, lt.tm_mday,
                                                     lt.tm_hour, lt.tm_min),
-                     10, acc if over else dim, (8, y + 1))
+                     12, acc if over else dim, (8, y + 4))
                 badge = "\u884c" if it["kind"] == "trip" else "\u63d0"
-                text(surf, badge, 10,
-                     acc if it["kind"] == "trip" else soft, (76, y + 1))
+                text(surf, badge, 12,
+                     acc if it["kind"] == "trip" else soft, (90, y + 4))
                 label = it["text"] + ((" \u00b7 " + it["loc"]) if it["loc"]
                                       else "")
-                text(surf, clip_text(label, 13, W - 98), 13,
-                     hi if sel else soft, (90, y))
+                text(surf, clip_text(label, 16, W - 116), 16,
+                     hi if sel else soft, (108, y))
         self.tool_foot(surf, ["4 \u5237\u65b0", "Enter \u5b8c\u6210",
                               "7 \u5220\u9664", "Esc \u8fd4\u56de"])
 
@@ -6735,8 +6737,8 @@ class App:
         cw2 = W - cx - M                           # 192
         ck = self.cfg.get("cards", {})
         vis = [(lab, key) for lab, key in
-               (("每日一句", "hitokoto"), ("新闻", "news"),
-                ("USAGE", "usage"), ("自选股", "fin"))
+               (("提醒/行程", "sched"), ("每日一句", "hitokoto"),
+                ("新闻", "news"), ("USAGE", "usage"), ("自选股", "fin"))
                if ck.get(key, key != "usage")][:3]  # 右列最多 3 卡 (用户定版)
         nc = max(1, len(vis))
         gap = M
@@ -6854,6 +6856,30 @@ class App:
                 else:
                     utxt = "DS 余额 ¥%s" % (udat.get("cny") or "?")
                 text(surf, utxt, BODY, soft, (cx + 8, vy3))
+        # 提醒/行程卡: 本地缓存最近几条秒显 (300s 节流后台拉新)
+        tops_s = tops.get("提醒/行程")
+        if tops_s is not None:
+            if time.monotonic() - self._sched_home_at > 300:
+                self._sched_home_at = time.monotonic()
+                self.sched_refresh(False)
+            nrow = min(4, max(1, (chh - 19) // 15))
+            its = self._sched_items()[:nrow]
+            if its:
+                yy = tops_s + 17
+                for it2 in its:
+                    lt2 = time.localtime(it2["t"] or time.time())
+                    text(surf, "%02d-%02d %02d:%02d"
+                         % (lt2.tm_mon, lt2.tm_mday, lt2.tm_hour,
+                            lt2.tm_min), 10, dim, (cx + 8, yy + 2))
+                    text(surf, "行" if it2["kind"] == "trip" else "提",
+                         10, acc if it2["kind"] == "trip" else soft,
+                         (cx + 74, yy + 2))
+                    text(surf, clip_text(it2["text"], 12, cw2 - 98), 12,
+                         soft, (cx + 88, yy))
+                    yy += 15
+            else:
+                text(surf, "暂无 · iPhone 同步后按4刷新", BODY, dim,
+                     (cx + 8, tops_s + 13 + (chh - 13 - BODY) // 2))
 
     FIN_TABS = ["自选股", "指数", "商品"]
 
