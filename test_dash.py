@@ -640,14 +640,19 @@ def test_music():
             app.mu_view = "play"
             app.mu_aud_up = None
             app.draw(pygame.Surface((dash.W, dash.H)))
-            # 回归 (2026-11-16 键位定版): 9=选源 (播放态后台继续), 0 兼容
-            app.key(pygame.K_9, "9")
-            assert app.mu_view == "src" and app.mu_playing  # 播放后台继续
+            # 回归 (2026-11-16 键位定版2): 播放页 5=输出 7=停止 8=选源, 0 兼容
             app.mu_view = "play"
-            app.key(pygame.K_0, "0")
+            app.key(pygame.K_5, "5")              # 输出 (无设备→OSD 保持本机)
+            assert app.mu_view == "play" and app.mu_playing
+            app.key(pygame.K_8, "8")              # 选源 (播放后台继续)
+            assert app.mu_view == "src" and app.mu_playing
+            app.mu_view = "play"
+            app.key(pygame.K_0, "0")              # 0 兼容选源
             assert app.mu_view == "src"
             app.mu_view = "play"
-            app.draw(pygame.Surface((dash.W, dash.H)))   # 新底栏渲染无异常
+            app.key(pygame.K_7, "7")              # 停止 → 回源选择
+            assert app.mu_playing is None and app.mu_view == "src"
+            app.draw(pygame.Surface((dash.W, dash.H)))   # 均分底栏渲染无异常
             # 回归 (2026-11-14 歌词不显示): _pl_lrc_parse 丢 @staticmethod →
             # on_net 投递 TypeError 被主循环 except 吞 → mu_lyr 永远空
             app.on_net("data", "mulyr:t", {
@@ -754,11 +759,11 @@ def test_mu_airplay():
         real_raop = dash.App._mu_play_raop
         dash.App._mu_play_raop = fake_raop
         try:
-            app.key(pygame.K_7)
+            app.key(pygame.K_5)                   # 5=输出 (2026-11-16 定版)
             assert app.mu_out == 1 and played == []
-            app.key(pygame.K_7)
+            app.key(pygame.K_5)
             assert app.mu_out == 2 and played == []
-            app.key(pygame.K_7)
+            app.key(pygame.K_5)
             assert app.mu_out == 0
             assert netmod.load_json_file(dash.MU_OUT_CACHE, {}) == {"id": ""}
             # 播放中切输出 = 同曲同位续播
@@ -770,7 +775,7 @@ def test_mu_airplay():
             app.mu_pos0, app.mu_t0 = 30.0, _time.monotonic() - 5
             app.mu_aud_up = _time.monotonic() - 5
             app.mu_proc = _P(["ffplay"], "prod")
-            app.key(pygame.K_7)
+            app.key(pygame.K_5)
             assert app.mu_out == 1 and played and played[-1][2] == "ida"
             assert abs(played[-1][1] - 35.0) < 1.5, played  # 墙钟同位续播
         finally:

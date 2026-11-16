@@ -3104,17 +3104,17 @@ class App:
                 self.mu_view = "src"           # 9=选源 (2026-11-16 用户定版;
                                                #   0 兼容)
             return True
-        # play 视图: 4/Enter/P 暂停切换, 7 输出, 9 选源, 8 停 + 回源选择
+        # play 视图: 4/Enter/P 播停, 5 输出, 7 停止, 8 选源 (2026-11-16 定版)
         if k in (pygame.K_4, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_p):
             self.mu_pause_toggle()        # 4=暂停 (2026-11-14 用户定版, 对齐
                                           #   实体键 4; P 保留)
-        elif k == pygame.K_8:
-            self.mu_stop()
-            self.mu_view = "src"          # 8=停止 (跨页统一)
+        elif k == pygame.K_5:
+            self.mu_out_cycle()           # 5=输出 (2026-11-16 用户定版)
         elif k == pygame.K_7:
-            self.mu_out_cycle()           # 7=输出 (家庭版音乐同款键位)
-        elif k in (pygame.K_0, pygame.K_9):
-            self.mu_view = "src"          # 9=选源 (2026-11-16 用户定版; 0 兼容)
+            self.mu_stop()
+            self.mu_view = "src"          # 7=停止 (2026-11-16 用户定版)
+        elif k in (pygame.K_0, pygame.K_8):
+            self.mu_view = "src"          # 8=选源 (2026-11-16 用户定版; 0 兼容)
                                           #   播放后台继续
         elif k == pygame.K_LEFT:
             self.mu_seek(-10)
@@ -7631,9 +7631,11 @@ class App:
             frac = min(1.0, (time.monotonic() - self.esc_hold_at) / 1.0)
             self.draw_exit_bar(surf, frac)
         else:
-            self.tool_foot(surf, ("4 播/停", "7 输出", "↑↓ 切曲",
-                                  "8 停止", "9 选源"))   # ±10s 不显示
-                                                  #   (2026-11-16 用户定版)
+            foot = ("4 播/停", "5 输出", "↑↓ 切曲", "7 停止", "8 选源")
+            slot = W // len(foot)         # 5 标签槽内居中 = 水平均分
+            for i, lab in enumerate(foot):   #   (2026-11-16 用户定版)
+                text(surf, lab, 12, self.th("soft"),
+                     (i * slot + (slot - textw(lab, 12)) // 2, 151))
 
     def draw_tabs(self, surf):
         """快捷入口条: 仅主页显示 (其他页长按 Esc 回主页), 不含主页自身."""
