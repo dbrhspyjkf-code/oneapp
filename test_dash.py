@@ -524,6 +524,22 @@ def test_tools():
     assert app.fx_from == 2 and app.fx_to == 0
     app.key(pygame.K_DOWN)
     assert app.fx_from == 1 and app.fx_to == 0
+    # 单位换算: r 换类 / e 交换 (真实键值+unicode 形态 — 走 key() 全链,
+    # key(0,ch) 绕过映射层抓不住丝印劫持, 2026-11-16 用户报 r/e 失效补测)
+    app.tool_open("unit")
+    assert app.tool == "unit"
+    app.cv_field = 0                  # 与 fx 共用字段模型, fx 段落残留 1
+    c0, f0, t0 = app.u_cat, app.u_from, app.u_to
+    app.key(pygame.K_r, "r")                      # r 换类
+    assert app.u_cat == (c0 + 1) % len(dash.UCATS)
+    nu = len(dash.UCATS[app.u_cat][1])
+    assert app.u_from < nu and app.u_to < nu      # 类别切换后光标钳位
+    app.key(pygame.K_e, "e")                      # e 交换源/目标
+    assert app.u_from == t0 and app.u_to == f0
+    app.key(pygame.K_LEFT)
+    assert app.cv_field == 3                      # 类别字段 (unit 4 字段, 环绕)
+    app.key(pygame.K_ESCAPE)
+    assert app.tool is None                       # Esc 回网格
     # 计时器: 预设 (数字1-6→TM_PRESETS) + 起停
     app.tool_open("timer")
     app.key(pygame.K_3)

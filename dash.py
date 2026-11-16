@@ -4937,10 +4937,10 @@ class App:
         self.tool = None
         self.osd = None
 
-    def tool_head(self, surf, title, hint, dy=0):
+    def tool_head(self, surf, title, hint, dy=0, hfs=9):
         text(surf, title, 14, self.th("hi"), (6, 2 + dy))
         if hint:
-            text(surf, hint, 9, self.th("dim"), (W - 6, 5 + dy), right=True)
+            text(surf, hint, hfs, self.th("dim"), (W - 6, 5 + dy), right=True)
 
     def tool_foot(self, surf, labels):
         hx = 6
@@ -7121,7 +7121,7 @@ class App:
     def draw_fx(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
-        self.tool_head(surf, "汇率", "e 兑换 · ←→ 字段")
+        self.tool_head(surf, "汇率", "e 兑换 · ←→ 字段", hfs=11)
         j = self.data.get("rate") or {}
         rates = (j.get("rates") or {}) if j.get("ok") else FX_FALLBACK
         try:
@@ -7131,26 +7131,26 @@ class App:
         fcode, tcode = FX_CODES[self.fx_from], FX_CODES[self.fx_to]
         f = self.cv_field
         # 主行: 金额/源/→/目标 加高放大, 水平均匀分布
-        # (8 | 116 g12 66 g12 18(→) g12 68 | 8, 全宽 320)
-        y0, bh = 34, 30
-        self._cv_box(surf, 8, y0, 116, self.fx_amt, f == 0, h=bh, fs=15)
-        self._cv_box(surf, 136, y0, 66, fcode, f == 1, h=bh, fs=14)
-        textc(surf, "→", 16, dim, 223, y0 + bh // 2 - 8)
-        self._cv_box(surf, 244, y0, 68, tcode, f == 2, h=bh, fs=14)
-        textc(surf, FX_NAMES[fcode], 9, dim, 169, y0 + bh + 3)
-        textc(surf, FX_NAMES[tcode], 9, dim, 278, y0 + bh + 3)
+        # (8 | 124 g12 60 g12 16(→) g12 68 | 8, 全宽 320)
+        y0, bh = 30, 36
+        self._cv_box(surf, 8, y0, 124, self.fx_amt, f == 0, h=bh, fs=17)
+        self._cv_box(surf, 144, y0, 60, fcode, f == 1, h=bh, fs=16)
+        textc(surf, "→", 18, dim, 224, y0 + bh // 2 - 9)
+        self._cv_box(surf, 244, y0, 68, tcode, f == 2, h=bh, fs=16)
+        textc(surf, FX_NAMES[fcode], 10, dim, 174, y0 + bh + 2)
+        textc(surf, FX_NAMES[tcode], 10, dim, 278, y0 + bh + 2)
         v = amt / (rates.get(fcode) or 1.0) * (rates.get(tcode) or 1.0)
         textc(surf, "%s %s" % (fmt_num(round(v, 4)), FX_NAMES[tcode]),
-              21, acc, W // 2, 92)
+              26, acc, W // 2, 92)
         u = (rates.get(tcode) or 1.0) / (rates.get(fcode) or 1.0)
         textc(surf, "1 %s = %s %s" % (fcode, fmt_num(round(u, 4)), tcode),
-              10, soft, W // 2, 120)
+              12, soft, W // 2, 122)
         if j.get("updated"):
             label = "更新 " + time.strftime("%m-%d %H:%M",
                                             time.localtime(j["updated"]))
         else:
             label = "离线静态表"
-        textc(surf, label, 8, dim, W // 2, 136)
+        textc(surf, label, 10, dim, W // 2, 138)
         self.tool_foot(surf, ("数字 金额", "↑↓ 调整", "e 交换", "Esc 返回"))
 
     # ── 工具·单位换算 (与汇率同版式: 主行均匀分布 + 大结果) ──
@@ -7158,7 +7158,7 @@ class App:
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
         cat, units = UCATS[self.u_cat]
-        self.tool_head(surf, "单位换算", "r 换类 · e 交换")
+        self.tool_head(surf, "单位换算", "r 换类 · e 交换", hfs=11)
         fd = dict(units)
         try:
             a = float(self.u_amt)
@@ -7166,27 +7166,27 @@ class App:
             a = 0.0
         fcode, tcode = units[self.u_from][0], units[self.u_to][0]
         f = self.cv_field
-        # 主行: 金额/源/→/目标 与汇率同几何 (8|116 g12 66 g12 → g12 68|8)
-        y0, bh = 34, 30
-        self._cv_box(surf, 8, y0, 116, self.u_amt, f == 0, h=bh, fs=15)
-        self._cv_box(surf, 136, y0, 66, fcode, f == 1, h=bh, fs=14)
-        textc(surf, "→", 16, dim, 223, y0 + bh // 2 - 8)
-        self._cv_box(surf, 244, y0, 68, tcode, f == 2, h=bh, fs=14)
+        # 主行: 金额/源/→/目标 与汇率同几何 (8|124 g12 60 g12 16(→) g12 68|8)
+        y0, bh = 30, 36
+        self._cv_box(surf, 8, y0, 124, self.u_amt, f == 0, h=bh, fs=17)
+        self._cv_box(surf, 144, y0, 60, fcode, f == 1, h=bh, fs=16)
+        textc(surf, "→", 18, dim, 224, y0 + bh // 2 - 9)
+        self._cv_box(surf, 244, y0, 68, tcode, f == 2, h=bh, fs=16)
         # 类别 (字段3): 居中小胶囊
         lab = "◁ %s ▷" % cat
-        cw_ = textw(lab, 10) + 16
-        self._cv_box(surf, W // 2 - cw_ // 2, y0 + bh + 3, cw_, lab, f == 3,
-                     h=16, fs=10)
+        cw_ = textw(lab, 12) + 16
+        self._cv_box(surf, W // 2 - cw_ // 2, y0 + bh + 2, cw_, lab, f == 3,
+                     h=20, fs=12)
         if cat == "温度":
             v = temp_convert(a, fcode, tcode)
             u = temp_convert(1, fcode, tcode)
         else:
             v = a * fd[fcode] / fd[tcode]
             u = fd[fcode] / fd[tcode]
-        textc(surf, "%s %s" % (self._u_fmt(v), tcode), 21, acc, W // 2, 92)
+        textc(surf, "%s %s" % (self._u_fmt(v), tcode), 26, acc, W // 2, 92)
         textc(surf, "1 %s = %s %s" % (fcode, self._u_fmt(u), tcode),
-              10, soft, W // 2, 120)
-        textc(surf, "%s · %d 单位" % (cat, len(units)), 8, dim, W // 2, 136)
+              12, soft, W // 2, 122)
+        textc(surf, "%s · %d 单位" % (cat, len(units)), 10, dim, W // 2, 138)
         self.tool_foot(surf, ("数字 金额", "↑↓ 调整", "←→ 字段", "Esc 返回"))
 
     @staticmethod
