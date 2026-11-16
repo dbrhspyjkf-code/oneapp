@@ -5195,7 +5195,7 @@ class App:
                 label = it["text"] + ((" \u00b7 " + it["loc"]) if it["loc"]
                                       else "")
                 text(surf, clip_text(label, 16, W - 148), 16,
-                     hi if sel else soft, (140, y))
+                     hi if sel else soft, (140, y + 1))
         self.tool_foot(surf, ["4 \u5237\u65b0", "Enter \u5b8c\u6210",
                               "7 \u5220\u9664", "Esc \u8fd4\u56de"])
 
@@ -6870,12 +6870,11 @@ class App:
                     lt2 = time.localtime(it2["t"] or time.time())
                     text(surf, "%02d-%02d %02d:%02d"
                          % (lt2.tm_mon, lt2.tm_mday, lt2.tm_hour,
-                            lt2.tm_min), 12, dim, (cx + 8, yy + 1))
+                            lt2.tm_min), 12, soft, (cx + 8, yy + 1))
                     text(surf, "行" if it2["kind"] == "trip" else "提",
-                         12, acc if it2["kind"] == "trip" else soft,
-                         (cx + 86, yy + 1))
+                         12, soft, (cx + 86, yy + 1))
                     text(surf, clip_text(it2["text"], 12, cw2 - 110), 12,
-                         soft, (cx + 102, yy))
+                         soft, (cx + 102, yy + 1))
                     yy += 15
             else:
                 text(surf, "暂无 · iPhone 同步后按4刷新", BODY, dim,
