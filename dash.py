@@ -4291,14 +4291,16 @@ class App:
                      3: (4, 5, 6, 8), 4: tuple(range(1, 8)),
                      5: tuple(range(0, 10))}
         digit = k - pygame.K_0                # pygame 常量值 → 数字序号
-        if (k in (pygame.K_4, pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8)
+        if self.page == 0 and k == pygame.K_9:
+            self.page = 5                     # 主页 9 工具 (2026-11-16 用户定版:
+            self.in_input = False             #   与邮件对调; 网格不列邮件)
+        elif self.page == 0 and k == pygame.K_8:
+            self.tool_open("mail")            # 主页 8 邮件直达 (工具网格不再列)
+        elif (k in (pygame.K_4, pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8)
                 and digit not in page_keys.get(self.page, ())):
             self.page = k - pygame.K_3        # 想法=4 电台=5 行情=6 新闻=7 工具=8
                                               # (主页仅长按 Esc)
             self.in_input = False
-        elif self.page == 0 and k == pygame.K_9:
-            self.tool_open("mail")            # 主页底栏 9 邮件直达 (2026-11-16
-                                              #   用户定版; 工具网格不再列)
         elif k in (pygame.K_LEFT, pygame.K_UP):
             if self.page == 5:
                 self.tool_grid_key(k)
@@ -7643,16 +7645,16 @@ class App:
 
     def draw_tabs(self, surf):
         """快捷入口条: 仅主页显示 (其他页长按 Esc 回主页), 不含主页自身;
-        末位 9 邮件 = 主页直达邮件工具 (2026-11-16 用户定版)."""
+        8 邮件 9 工具 (2026-11-16 用户定版, 邮件与工具对调)."""
         if self.page != 0:
             return
         y = H - 22
-        entries = PAGES[1:] + [("邮件", "mail")]
+        entries = [(n, str(4 + j)) for j, (n, _) in enumerate(PAGES[1:5])]
+        entries += [("邮件", "8"), ("工具", "9")]
         cw = W // len(entries)
-        for j, (name, _) in enumerate(entries):
+        for j, (name, num) in enumerate(entries):
             x = j * cw
-            text(surf, "9" if j == 5 else str(j + 4), 11, self.th("accent"),
-                 (x + 7, y + 7))
+            text(surf, num, 11, self.th("accent"), (x + 7, y + 7))
             text(surf, name, 13, self.th("soft"), (x + 24, y + 5))
 
     def draw_osd(self, surf):

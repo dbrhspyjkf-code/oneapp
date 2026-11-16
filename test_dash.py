@@ -427,14 +427,20 @@ def test_render():
     assert app3.fin_items()[0].get("price") == 1513.0   # 缓存秒显合并行情
     app3.page = 0
     app3.draw(canvas)
-    # 快捷键 4-8 → 页 1-5 (主页触发; 新闻/电台页数字为功能键)
+    # 快捷键 4-7/9 → 页 1-5, 8 邮件 (2026-11-16 主页对调: 8=邮件 9=工具;
+    # 新闻/电台页数字为功能键)
     pg = pygame
     for key, page in [(pg.K_4, 1), (pg.K_5, 2), (pg.K_6, 3),
-                      (pg.K_7, 4), (pg.K_8, 5)]:
+                      (pg.K_7, 4), (pg.K_9, 5)]:
         app.dialog = None
         app.page = 0
         app.key(key)
         assert app.page == page, (key, app.page)
+    app.dialog = None
+    app.page = 0
+    app.key(pg.K_8)
+    assert app.tool == "mail" and app.page == 0   # 主页 8 直开邮件
+    app.tool_close()
     # 新闻页数字直达: 2 → 第2条详情
     app.page = 4
     app.key(pg.K_2)
@@ -501,12 +507,16 @@ def test_tools():
     assert app.tool is None and app.page == 5     # Esc 回网格 (主页 Esc 才回主页)
     app.key(pygame.K_8)
     assert app.page == 5                          # 8 → 工具页
-    # 主页底栏 9 邮件直达 (2026-11-16 用户定版): 工具网格不再列邮件
+    # 主页底栏 8 邮件 / 9 工具 (2026-11-16 用户定版: 对调): 网格不再列邮件
     assert "mail" not in [t for t, _ in dash.TOOL_APPS]
     app.tool = None
     app.page = 0
     app.key(pygame.K_9)
-    assert app.tool == "mail"                     # 主页 9 直开邮件
+    assert app.page == 5                          # 主页 9 → 工具网格
+    app.key(pygame.K_ESCAPE)
+    assert app.page == 0
+    app.key(pygame.K_8)
+    assert app.tool == "mail"                     # 主页 8 直开邮件
     app.tool_close()
     app.page = 5
     app.tool_open("music")
@@ -1824,9 +1834,9 @@ def test_mail_keys():
     tmp = tempfile.mkdtemp(prefix="oneapp")
     mailmod.MAIL_FILE = os.path.join(tmp, "mail.json")
     app = dash.App(FakeNet())
-    # 主页底栏 9 直开邮件 (2026-11-16 定版: 网格不再列邮件)
+    # 主页底栏 8 直开邮件 (2026-11-16 定版: 对调后 8=邮件; 网格不再列)
     app.page = 0
-    app.key(pygame.K_9)
+    app.key(pygame.K_8)
     assert app.tool == "mail" and app.mail_lv == "acct"
     # 登录表单: 邮箱 → Enter → 授权码 → Enter 提交
     app.key(pygame.K_RETURN)
