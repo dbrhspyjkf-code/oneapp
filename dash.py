@@ -7645,8 +7645,9 @@ class App:
 
     def draw_tabs(self, surf):
         """快捷入口条: 仅主页显示 (其他页长按 Esc 回主页), 不含主页自身;
-        8 邮件 9 工具 (2026-11-16 用户定版, 邮件与工具对调)."""
-        if self.page != 0:
+        8 邮件 9 工具 (2026-11-16 用户定版, 邮件与工具对调).
+        工具开着时一律不画 (主页 8 直开邮件 page 保持 0, 页签会压工具底栏)."""
+        if self.page != 0 or self.tool:
             return
         y = H - 22
         entries = [(n, str(4 + j)) for j, (n, _) in enumerate(PAGES[1:5])]

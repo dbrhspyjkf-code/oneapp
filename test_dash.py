@@ -517,7 +517,15 @@ def test_tools():
     assert app.page == 0
     app.key(pygame.K_8)
     assert app.tool == "mail"                     # 主页 8 直开邮件
+    # 回归 (2026-11-16 底栏重叠): 工具态 page 仍 0, 页签条必须让位工具底栏
+    s2 = pygame.Surface((dash.W, dash.H))
+    s2.fill((1, 2, 3))                            # 哨兵底色
+    SENT = [(x, yy) for x in range(5, 20) for yy in range(150, 168)]
+    app.draw_tabs(s2)
+    assert all(s2.get_at(p)[:3] == (1, 2, 3) for p in SENT)   # 工具开着不画
     app.tool_close()
+    app.draw_tabs(s2)
+    assert any(s2.get_at(p)[:3] != (1, 2, 3) for p in SENT)   # 主页正常画
     app.page = 5
     app.tool_open("music")
     assert app.tool == "music" and app.mu_view == "play"   # 主页即播放页
