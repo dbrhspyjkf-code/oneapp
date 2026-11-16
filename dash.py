@@ -3058,8 +3058,9 @@ class App:
                                                  #  2026-11-14 网易绑定闭环拆占位门)
             elif k == pygame.K_6:
                 self.mu_view = "src"             # 6=返回源选择 (实体键 6)
-            elif k == pygame.K_0:
-                self.mu_view = "src"             # 0=选源 (跨页统一)
+            elif k in (pygame.K_0, pygame.K_9):
+                self.mu_view = "src"             # 9=选源 (2026-11-16 用户定版;
+                                                 #   0 兼容)
             elif k == pygame.K_8:
                 self.mu_stop()                   # 8=停止 (实体键 8)
             return True
@@ -3074,8 +3075,9 @@ class App:
                 self.mu_out_cycle()              # 7=输出
             elif k == pygame.K_6:
                 self._mu_open_search()           # 6=回搜索 (实体键 6)
-            elif k == pygame.K_0:
-                self.mu_view = "src"             # 0=选源 (跨页统一)
+            elif k in (pygame.K_0, pygame.K_9):
+                self.mu_view = "src"             # 9=选源 (2026-11-16 用户定版;
+                                                 #   0 兼容)
             elif k == pygame.K_8:
                 self.mu_stop()                   # 8=停止 (实体键 8)
             elif k == pygame.K_7:
@@ -3098,10 +3100,11 @@ class App:
                 self.mu_rescan()
                 self.osd = ("已重扫 %d 首" % len(self.mu_files),
                             time.monotonic() + 1.2)
-            elif k == pygame.K_0:
-                self.mu_view = "src"           # 0=选源 (跨页统一)
+            elif k in (pygame.K_0, pygame.K_9):
+                self.mu_view = "src"           # 9=选源 (2026-11-16 用户定版;
+                                               #   0 兼容)
             return True
-        # play 视图: 4/Enter/P 暂停切换, 7 输出, 0 选源, x/8 停 + 回源选择
+        # play 视图: 4/Enter/P 暂停切换, 7 输出, 9 选源, 8 停 + 回源选择
         if k in (pygame.K_4, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_p):
             self.mu_pause_toggle()        # 4=暂停 (2026-11-14 用户定版, 对齐
                                           #   实体键 4; P 保留)
@@ -3110,8 +3113,9 @@ class App:
             self.mu_view = "src"          # 8=停止 (跨页统一)
         elif k == pygame.K_7:
             self.mu_out_cycle()           # 7=输出 (家庭版音乐同款键位)
-        elif k == pygame.K_0:
-            self.mu_view = "src"          # 0=选源 (跨页统一; 播放后台继续)
+        elif k in (pygame.K_0, pygame.K_9):
+            self.mu_view = "src"          # 9=选源 (2026-11-16 用户定版; 0 兼容)
+                                          #   播放后台继续
         elif k == pygame.K_LEFT:
             self.mu_seek(-10)
         elif k == pygame.K_RIGHT:
@@ -4908,7 +4912,7 @@ class App:
             self.esc_hold_at = None           # 进 app 不残留长按态
             if self.mu_playing is None:
                 self.mu_session_restore()     # 空态 → 恢复上次会话 (暂停在位)
-            self.mu_view = "play"             # 主页=播放页 (空态显示无标题, 0 选源)
+            self.mu_view = "play"             # 主页=播放页 (空态显示无标题, 9 选源)
         if tid == "tv":
             self.tv_restore()                 # 恢复上次分组/光标
 
@@ -7379,7 +7383,7 @@ class App:
                 textc(surf, "~/music 为空", 12, dim, W // 2, 70)
                 textc(surf, "scp 拷入 mp3 / flac / wav 即自动出现", 10, dim,
                       W // 2, 92)
-                self.tool_foot(surf, ("r 重扫", "0 选源", "Esc 返回"))
+                self.tool_foot(surf, ("r 重扫", "9 选源", "Esc 返回"))
                 return
             nrow = 4
             r0 = max(0, min(self.mu_sel - (nrow - 1), max(0,
@@ -7407,7 +7411,7 @@ class App:
                 text(surf, clip_text(meta, 9, W - 110), 9, dim,
                      (28 if cur else 12, y + 15))
             self.tool_foot(surf, ("↑↓ 选", "Enter 播", "r 重扫",
-                                  "0 选源", "Esc 返回"))
+                                  "9 选源", "Esc 返回"))
             return
         # src 源选择 (想法页卡片风; 卡底不压 y151 底栏)
         self.tool_head(surf, "音乐", "♪ 播放中" if self.mu_playing else "")
@@ -7556,10 +7560,8 @@ class App:
         track = self.th("track")
         warn = self.th("warn")
         p = self.mu_playing or {}
-        sub = "♪ 播放页 · 0 选源 · 长按Esc退出"
-        if self.mu_out >= 1 and self.raop:
-            sub = "♪ %s · 0 选源 · 长按Esc退出" % self.mu_out_name()
-        self.tool_head(surf, "音乐", sub)
+        self.tool_head(surf, "音乐", "")      # 右上角提示不要 (2026-11-16
+                                              #   用户定版; 输出名只在 OSD)
         playing = bool(self.mu_proc) and not self.mu_paused
         # VU 电平 (播放=pulse monitor / ffmpeg fd3; 暂停=回落静默衰减)
         lvb, lvm, lvt = self.lvl.lvl if playing else (0.0, 0.0, 0.0)
@@ -7629,8 +7631,9 @@ class App:
             frac = min(1.0, (time.monotonic() - self.esc_hold_at) / 1.0)
             self.draw_exit_bar(surf, frac)
         else:
-            self.tool_foot(surf, ("4 播/停", "7 输出", "←→ ±10s", "↑↓ 切曲",
-                                  "8 停止"))   # 0 选源见头部
+            self.tool_foot(surf, ("4 播/停", "7 输出", "↑↓ 切曲",
+                                  "8 停止", "9 选源"))   # ±10s 不显示
+                                                  #   (2026-11-16 用户定版)
 
     def draw_tabs(self, surf):
         """快捷入口条: 仅主页显示 (其他页长按 Esc 回主页), 不含主页自身."""

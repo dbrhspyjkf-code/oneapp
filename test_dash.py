@@ -640,6 +640,14 @@ def test_music():
             app.mu_view = "play"
             app.mu_aud_up = None
             app.draw(pygame.Surface((dash.W, dash.H)))
+            # 回归 (2026-11-16 键位定版): 9=选源 (播放态后台继续), 0 兼容
+            app.key(pygame.K_9, "9")
+            assert app.mu_view == "src" and app.mu_playing  # 播放后台继续
+            app.mu_view = "play"
+            app.key(pygame.K_0, "0")
+            assert app.mu_view == "src"
+            app.mu_view = "play"
+            app.draw(pygame.Surface((dash.W, dash.H)))   # 新底栏渲染无异常
             # 回归 (2026-11-14 歌词不显示): _pl_lrc_parse 丢 @staticmethod →
             # on_net 投递 TypeError 被主循环 except 吞 → mu_lyr 永远空
             app.on_net("data", "mulyr:t", {
