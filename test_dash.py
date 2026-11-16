@@ -1231,6 +1231,38 @@ def test_voice():
         _time.sleep(0.3)
         app.play_voice(items[0])               # 再按 = 停
         assert app.playing_voice is None and app.player is None
+        # 2×2 视窗滚动: 6 条时 ↓↓ 翻窗, ←→ 行内不出行
+        for i in range(2):
+            vfx = os.path.join(dash.VOICES_DIR, "x%d.wav" % i)
+            mkwav(vfx, 1.0)
+            app.ideas["voices"].append({"id": "x%d" % i, "cid": "%07d" % i,
+                                        "file": vfx, "dur": 1,
+                                        "createdAt": 300 + i})
+        app.ideas["texts"].append({"id": "t2", "cid": "7" * 12,
+                                   "text": "更多", "createdAt": 400})
+        app.sel = 0
+        app.move_sel(2)                        # ↓ 第二行
+        assert app.sel == 2, app.sel
+        app.move_sel(2)                        # ↓ 第三行 → 视口滚动
+        assert app.sel == 4 and app.scroll == 2, (app.sel, app.scroll)
+        app.move_sel(1)                        # → (idx4 = 末行单卡, 行尾不动)
+        assert app.sel == 4, app.sel
+        app.move_sel(1)                        # 已在行尾, 仍不动
+        assert app.sel == 4, app.sel
+        app.move_sel(-2)                       # ↑ 回第二行 (保持列), 窗口已对
+        assert app.sel == 2 and app.scroll == 2, (app.sel, app.scroll)
+        # 清理滚动测试追加物, 恢复删除断言前置态
+        for v in list(app.ideas["voices"]):
+            if v["id"].startswith("x"):
+                try:
+                    os.remove(v["file"])
+                except OSError:
+                    pass
+        app.ideas["voices"] = [v for v in app.ideas["voices"]
+                               if not v["id"].startswith("x")]
+        app.ideas["texts"] = [t for t in app.ideas["texts"] if t["id"] != "t2"]
+        app.items_sorted = None
+        app.sel = 0
         # 删除: 文件 + 索引一起清
         assert os.path.exists(vf)
         app.delete_selected()
@@ -2812,6 +2844,87 @@ def test_tv():
     print("tv OK  (95 源 · 状态机/看门狗/重试梯级/焦点/持久化)")
 
 
+def test_sched():
+    """日程卡: 无登录态不拉取/进卡拉取落盘/排序渲染/Enter 完成同步/7 删除/失败强刷回滚."""
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
+    dash.SCHED_CACHE = os.path.join(tmp, "sched.json")
+    app = dash.App(FakeNet())
+    # 未登录: 渲染冒烟, 4 刷新不入队 (无 token)
+    app.tool = "sched"
+    app.draw(canvas)
+    app.key(pygame.K_4)
+    assert not app.net.jobs
+    # 想法云同 token → 拉取落盘
+    app.cfg["cloud_url"] = "https://notes.apisz.top"
+    app.cfg["cloud_tok"] = "b" * 24
+    app.sched_refresh(False)
+    assert app.net.last_job("schedget") is not None
+    orig_raw = netmod.http_raw
+    calls = []
+    payload = {"now": 100.0,
+               "reminds": [
+                   {"id": "a" * 12, "text": "milk", "due": 1800000000.0,
+                    "done": 0},
+                   {"id": "c" * 12, "text": "old", "due": 100.0, "done": 0}],
+               "trips": [{"id": "e" * 12, "text": "trip", "due": 1800003600.0,
+                          "tend": 1800036000.0, "loc": "hq"}]}
+    netmod.http_raw = lambda url, **k: (
+        calls.append((k.get("method", "GET"), url))
+        or (200, json.dumps(payload).encode()))
+    d = app.net.last_job("schedget")()
+    assert d["ok"] == 1 and len(d["reminds"]) == 2 and len(d["trips"]) == 1
+    app.on_net("data", "schedget", d)
+    assert json.load(open(dash.SCHED_CACHE))["reminds"][0]["id"] == "a" * 12
+    items = app._sched_items()
+    assert [x["id"][0] for x in items] == ["c", "a", "e"]   # 时间升序
+    app.draw(canvas)                                        # 渲染冒烟
+    # Enter 完成 → 本地即时移除 + POST /v1/done/<id>
+    app.key(pygame.K_RETURN)
+    assert all(x["id"] != "c" * 12 for x in app._sched_items())
+    calls.clear()
+    fn = app.net.last_job("schedop:done:" + "c" * 12)
+    assert fn is not None
+    d = fn()
+    assert d["op"] == "done" and d["st"] == 200
+    assert any(m == "POST" and u.endswith("/v1/done/" + "c" * 12)
+               for m, u in calls)
+    app.on_net("data", "schedop:done:" + "c" * 12, d)
+    # 行程无完成态: 不入队
+    items = app._sched_items()
+    app.ssel = [i for i, x in enumerate(items) if x["kind"] == "trip"][0]
+    n_jobs = len(app.net.jobs)
+    app.key(pygame.K_RETURN)
+    assert len(app.net.jobs) == n_jobs
+    # 7 删除 → dialog 确认 → DELETE /v1/notes/<id>
+    app.key(pygame.K_7)
+    assert app.dialog and app.dialog[0] == "scheddel"
+    it = app.dialog[1]
+    app.key(pygame.K_RETURN)
+    assert app.dialog is None
+    calls.clear()
+    fn = app.net.last_job("schedop:del:" + it["id"])
+    assert fn is not None
+    d = fn()
+    assert d["op"] == "del" and d["st"] == 200
+    assert any(m == "DELETE" and u.endswith("/v1/notes/" + it["id"])
+               for m, u in calls)
+    app.on_net("data", "schedop:del:" + it["id"], d)
+    assert all(x["id"] != it["id"] for x in app._sched_items())
+    # 操作失败 (HTTP 500) → 强刷回滚 (schedget 重新入队)
+    n_jobs = len(app.net.jobs)
+    app.on_net("data", "schedop:done:" + "a" * 12,
+               {"op": "done", "id": "a" * 12, "st": 500})
+    assert len(app.net.jobs) > n_jobs
+    netmod.http_raw = orig_raw
+    print("sched OK  (fetch/cache/sort/done/delete/rollback)")
+
+
 if __name__ == "__main__":
     test_lunar()
     test_wx()
@@ -2832,6 +2945,7 @@ if __name__ == "__main__":
     test_mail_accounts()
     test_settings_app()
     test_cloud()
+    test_sched()
     test_reg()
     test_login()
     test_mail_keys()

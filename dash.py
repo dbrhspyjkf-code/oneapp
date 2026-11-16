@@ -710,7 +710,7 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
 TOOL_APPS = [("fx", "汇率"), ("unit", "换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
              ("music", "音乐"), ("tv", "电视"),
-             ("set", "设置")]   # 设置: API KEY + 主页卡片显隐 (无数字键)
+             ("set", "设置"), ("sched", "日程")]   # 设置+日程: KEY/显隐 · 提醒+行程
 # 邮件不在工具网格 (2026-11-16 用户定版): 主页底栏 9 邮件 直达
 TOOL_GRID = 5                            # 每行卡片数
 MAIL_BODY_ROWS = 5                       # 邮件详情每屏正文行数 (13px, 用户定版原生字号)
@@ -728,6 +728,7 @@ MU_OUT_CACHE = os.path.join(STATE_DIR, "mu_out.json")   # 音乐输出 (按设�
 TV_LAST_CACHE = os.path.join(STATE_DIR, "tv_last.json")  # 电视上次分组/光标
 TV_FAV_CACHE = os.path.join(STATE_DIR, "tv_fav.json")    # 电视收藏 (频道名表)
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
+SCHED_CACHE = os.path.join(STATE_DIR, "sched.json")      # 日程卡缓存 (提醒/行程)
 CLOUD_URL_DEFAULT = "https://notes.apisz.top"   # 注册成功自动配 (可改设置)
 CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
 _SENT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1298,6 +1299,10 @@ class App:
         self.csel = 0                         # 云端列表光标
         self.cloud_notes = []                 # 云端条目快照 (job 拉取)
         self._cloud_trig = 0.0                # 上次云同步触发 (节流)
+        # 日程卡 (提醒/行程, noteserver /v1/sched; 与想法云同账号 token)
+        self.sched = netmod.load_json_file(SCHED_CACHE,
+                                           {"reminds": [], "trips": []})
+        self.ssel = 0                         # 日程列表光标
         self.watch = netmod.load_json_file(WATCH_FILE, WATCH_SEED)
         self.wx_loc = netmod.load_json_file(WX_LOC_FILE, None) or dict(WX_HOME)
         # 语音想法: 录音 (arecord) + 本地播放 (ffplay)
@@ -1704,6 +1709,26 @@ class App:
                                            if b.get("st") else "网络异常")
                     self.osd = ("登录失败 %s" % err,
                                 time.monotonic() + 2.5)
+            elif a == "schedget" and isinstance(b, dict) \
+                    and not b.get("skip"):
+                if b.get("ok"):
+                    self.sched = {"reminds": b.get("reminds") or [],
+                                  "trips": b.get("trips") or []}
+                    netmod.save_json_file(SCHED_CACHE, self.sched)
+                    self.ssel = max(0, min(self.ssel,
+                                           len(self._sched_items()) - 1))
+                    if self.tool == "sched":
+                        self.osd = ("日程 %d 条"
+                                    % len(self._sched_items()),
+                                    time.monotonic() + 1.2)
+                elif self.tool == "sched":
+                    st = b.get("st")
+                    self.osd = (("日程获取失败 HTTP %s" % st) if st
+                                else "日程获取失败",
+                                time.monotonic() + 2.5)
+            elif a.startswith("schedop:") and isinstance(b, dict) \
+                    and not b.get("skip"):
+                self.sched_op_done(b)
         elif kind == "error":                 # worker 里 fn 抛异常 (None) —
             if a.startswith("mail_list"):     # 以前静默吞, 失败根本不可见
                 self.mail_err = "网络异常 · 稍后刷新"
@@ -1727,6 +1752,12 @@ class App:
                 self.osd = ("登录失败 网络异常", time.monotonic() + 2.5)
             elif a == "cloudinvite":
                 self.osd = ("生成失败 网络异常", time.monotonic() + 2.5)
+            elif a == "schedget":
+                if self.tool == "sched":
+                    self.osd = ("日程获取失败 · 网络异常",
+                                time.monotonic() + 2.5)
+            elif a.startswith("schedop:"):
+                self.sched_op_done({"id": "", "op": "", "netfail": 1})
         elif kind == "text":
             self.data[a] = b
             if b and a in ("quotes", "idx"):
@@ -4108,6 +4139,8 @@ class App:
                     self.watch_del(self.dialog[1])   # ("delwatch", idx)
                 elif self.dialog[0] == "delmail":
                     self.mail_del(self.dialog[1])    # ("delmail", email)
+                elif self.dialog[0] == "scheddel":
+                    self.sched_del(self.dialog[1])   # ("scheddel", item)
                 else:
                     self.delete_selected()   # ("del", item) 确认删除
                 self.dialog = None
@@ -4921,6 +4954,8 @@ class App:
             self.mu_view = "play"             # 主页=播放页 (空态显示无标题, 9 选源)
         if tid == "tv":
             self.tv_restore()                 # 恢复上次分组/光标
+        if tid == "sched":
+            self.sched_refresh(False)         # 进卡拉取 (TTL 300s 节流)
 
     def tool_grid_key(self, k):
         """入口网格: 方向键移光标 / 数字 1-9,0 直开 / Enter 打开."""
@@ -4974,11 +5009,194 @@ class App:
             return self.mail_key(k, ch)
         if t == "tv":
             return self.tv_key(k)
+        if t == "sched":
+            return self.sched_key(k)
         if t == "set":
             return self.set_key(k, ch)
         return True
 
     # ── 邮件 (工具第 7 卡; IMAP 授权码直连, 协议层 mail.py, net.job 后台跑) ──
+    # ── 日程 (工具第 9 卡: 提醒+行程; noteserver /v1/sched, 想法云同 token;
+    #    iPhone 快捷指令 POST /v1/remind|/v1/trip → ECS → 本卡查看/完成/删除) ──
+    def _sched_items(self):
+        """提醒+行程合并按时间升序 (渲染/键位同一条排序口径)."""
+        out = []
+        for r in self.sched.get("reminds", []):
+            out.append({"kind": "remind", "id": r.get("id") or "",
+                        "text": r.get("text") or "", "t": r.get("due") or 0,
+                        "tend": 0, "loc": ""})
+        for r in self.sched.get("trips", []):
+            out.append({"kind": "trip", "id": r.get("id") or "",
+                        "text": r.get("text") or "", "t": r.get("due") or 0,
+                        "tend": r.get("tend") or 0, "loc": r.get("loc") or ""})
+        out.sort(key=lambda x: x["t"])
+        return out
+
+    def sched_refresh(self, force):
+        url, tok = self._cloud_cfg()
+        if not (url and tok):
+            return
+        if force:
+            self.net.invalidate("schedget")    # 强刷 = 弹 TTL 缓存重跑
+        self.net.job("schedget", self._sched_fetch_fn, ttl=300)
+
+    def _sched_fetch_fn(self):
+        """worker: GET /v1/sched → {"ok",now,reminds,trips} | {"ok":0}."""
+        url, tok = self._cloud_cfg()
+        if not (url and tok):
+            return {"skip": 1}
+        st, body = netmod.http_raw(
+            url + "/v1/sched",
+            headers={"Authorization": "Bearer " + tok})
+        if st != 200 or not body:
+            return {"ok": 0, "st": st}
+        try:
+            j = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            return {"ok": 0, "st": st}
+        return {"ok": 1, "now": j.get("now") or time.time(),
+                "reminds": j.get("reminds") or [],
+                "trips": j.get("trips") or []}
+
+    def _sched_save(self):
+        netmod.save_json_file(SCHED_CACHE, self.sched)
+
+    def _sched_drop(self, nid):
+        """本地即时移除 (乐观), 失败由 sched_op_done 强刷拉回服务端真相."""
+        for key in ("reminds", "trips"):
+            self.sched[key] = [x for x in self.sched.get(key, [])
+                               if x.get("id") != nid]
+        self._sched_save()
+        self.ssel = max(0, min(self.ssel,
+                               len(self._sched_items()) - 1))
+
+    def sched_mark_done(self, it):
+        self._sched_drop(it["id"])
+        tag = "schedop:done:%s" % it["id"]     # 每操作唯一 tag 防撞 job 缓存
+        self.net.invalidate(tag)
+        self.net.job(tag,
+                     lambda i=it["id"]: self._sched_op_fn("done", i), ttl=0)
+        self.osd = ("已完成", time.monotonic() + 1.2)
+
+    def sched_del(self, it):
+        self._sched_drop(it["id"])
+        tag = "schedop:del:%s" % it["id"]
+        self.net.invalidate(tag)
+        self.net.job(tag,
+                     lambda i=it["id"]: self._sched_op_fn("del", i), ttl=0)
+        self.osd = ("删除中", time.monotonic() + 1.2)
+
+    def _sched_op_fn(self, op, nid):
+        """worker: done=POST /v1/done/<id>, del=DELETE /v1/notes/<id>."""
+        url, tok = self._cloud_cfg()
+        if not (url and tok):
+            return {"skip": 1, "op": op, "id": nid}
+        if op == "done":
+            st, _ = netmod.http_raw(
+                url + "/v1/done/" + nid, method="POST",
+                body=b'{"done": 1}',
+                headers={"Authorization": "Bearer " + tok,
+                         "Content-Type": "application/json"})
+        else:
+            st, _ = netmod.http_raw(
+                url + "/v1/notes/" + nid, method="DELETE",
+                headers={"Authorization": "Bearer " + tok})
+        return {"op": op, "id": nid, "st": st}
+
+    def sched_op_done(self, b):
+        """UI 线程: 成功保持乐观态; 失败/网络异常 = 强刷回滚到服务端真相."""
+        op, st = b.get("op"), b.get("st")
+        if b.get("netfail"):
+            self.sched_refresh(True)
+            self.osd = ("操作失败 · 网络异常", time.monotonic() + 2.5)
+            return
+        if st == 200 or (op == "del" and st == 404):   # 404=云端已无, 同成功
+            self.osd = ("已删除" if op == "del" else "已完成",
+                        time.monotonic() + 1.2)
+            return
+        self.sched_refresh(True)
+        self.osd = (("操作失败 HTTP %s" % st) if st else "操作失败 · 网络异常",
+                    time.monotonic() + 2.5)
+
+    def sched_key(self, k):
+        items = self._sched_items()
+        n = len(items)
+        if k in (pygame.K_UP, pygame.K_DOWN):
+            self.ssel = max(0, min(n - 1,
+                                   self.ssel + (-1 if k == pygame.K_UP
+                                                else 1)))
+            return True
+        if k == pygame.K_4:
+            self.sched_refresh(True)
+            self.osd = ("刷新中", time.monotonic() + 1.0)
+            return True
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if 0 <= self.ssel < n:
+                it = items[self.ssel]
+                if it["kind"] != "remind":
+                    self.osd = ("行程无完成态 · 7 删除",
+                                time.monotonic() + 1.5)
+                else:
+                    self.sched_mark_done(it)
+            return True
+        if k in (pygame.K_d, pygame.K_7):
+            if 0 <= self.ssel < n:
+                self.dialog = ("scheddel", items[self.ssel])
+            return True
+        return True
+
+    def draw_sched(self, surf):
+        hi, soft, dim = self.th("hi"), self.th("soft"), self.th("dim")
+        acc = self.th("accent")
+        items = self._sched_items()
+        logged = bool(self._cloud_cfg()[1])
+        text(surf, "日程", 12, hi, (6, 3))
+        text(surf, "\u00b7 %d \u6761" % len(items), 10, dim,
+             (6 + textw("\u65e5\u7a0b", 12) + 6, 5))
+        head = ("@%s" % (self.cfg.get("cloud_user") or "")) if logged \
+            else "\u672a\u767b\u5f55"
+        text(surf, head, 10, dim, (W - 6, 5), right=True)
+        if not logged:
+            textc(surf, "\u672a\u767b\u5f55 \u00b7 \u8bbe\u7f6e\u91cc\u914d\u7f6e\u60f3\u6cd5\u4e91\u540e\u53ef\u7528",
+                  13, dim, W // 2, 62)
+            textc(surf, "\u8bbe\u7f6e \u00b7 \u767b\u5f55 \u6216 \u6ce8\u518c\u65b0\u8d26\u53f7",
+                  12, acc, W // 2, 82)
+            self.tool_foot(surf, ["4 \u5237\u65b0", "Esc \u8fd4\u56de"])
+            return
+        now = time.time()
+        if not items:
+            textc(surf, "\u6682\u65e0\u63d0\u9192 / \u884c\u7a0b", 13, dim, W // 2, 60)
+            textc(surf, "iPhone \u5feb\u6377\u6307\u4ee4\u53d1\u9001\u540e \u00b7 \u63094 \u5237\u65b0",
+                  12, acc, W // 2, 80)
+        else:
+            start = max(0, min(self.ssel - 7, len(items) - 8))
+            for i in range(8):
+                idx = start + i
+                if idx >= len(items):
+                    break
+                it = items[idx]
+                sel = idx == self.ssel
+                y = 18 + i * 15
+                if sel:
+                    pygame.draw.rect(surf, self.th("track"),
+                                     (4, y - 1, W - 8, 14), border_radius=3)
+                t = it["t"]
+                lt = time.localtime(t or now)
+                over = t and t < now and \
+                    (it["kind"] == "remind" or (it["tend"] or t) < now)
+                text(surf, "%02d-%02d %02d:%02d" % (lt.tm_mon, lt.tm_mday,
+                                                    lt.tm_hour, lt.tm_min),
+                     10, acc if over else dim, (8, y + 1))
+                badge = "\u884c" if it["kind"] == "trip" else "\u63d0"
+                text(surf, badge, 10,
+                     acc if it["kind"] == "trip" else soft, (56, y + 1))
+                label = it["text"] + ((" \u00b7 " + it["loc"]) if it["loc"]
+                                      else "")
+                text(surf, clip_text(label, 13, W - 84), 13,
+                     hi if sel else soft, (68, y))
+        self.tool_foot(surf, ["4 \u5237\u65b0", "Enter \u5b8c\u6210",
+                              "7 \u5220\u9664", "Esc \u8fd4\u56de"])
+
     def mail_esc(self):
         """Esc 逐层回退. 返回 True=已消化, False=账号层 (调用方回工具网格)."""
         lv = self.mail_lv
@@ -6019,20 +6237,19 @@ class App:
         n = len(self.idea_items())
         if not n:
             return
-        vis = min(n, 4)
-        if self.scroll <= self.sel < self.scroll + vis:
-            row, col = divmod(self.sel - self.scroll, 2)   # 2×2 网格行保持环绕
-            if abs(d) == 2:
-                row = (row + d // 2) % 2
-            else:
-                col = (col + d) % 2
-            self.sel = self.scroll + row * 2 + col
-        else:
+        if abs(d) == 2:                        # ↑↓: 跨行, 视口窗口跟随 (2 行一窗)
             self.sel = max(0, min(n - 1, self.sel + d))
-        if self.sel < self.scroll:
-            self.scroll = (self.sel // 4) * 4
-        if self.sel >= self.scroll + 4:
-            self.scroll = (self.sel // 4) * 4
+        else:                                  # ←→: 行内移动 (不出行)
+            row = self.sel // 2
+            self.sel = max(row * 2, min(row * 2 + 1, self.sel + d))
+        self.sel = min(self.sel, n - 1)
+        row = self.sel // 2                    # 视口 2 行一窗, 整行滚动 (偶对齐)
+        top = self.scroll // 2
+        if row < top:
+            top = row
+        elif row > top + 1:
+            top = row - 1
+        self.scroll = min(top * 2, max(0, ((n - 1) // 2) * 2))
 
     @staticmethod
     def _pl_lrc_parse(s):
@@ -6260,13 +6477,18 @@ class App:
         self.cloud_sync_trigger()                # 在页期间 15s 节流双写对账
         if self.iview == "cloud":
             return self._draw_ideas_cloud(surf)
+        if self.scroll >= len(items):            # 删除/换号后窗口越界防呆
+            self.scroll = max(0, (len(items) - 1) // 2 * 2 if items else 0)
 
         # 头部 (右侧: 登录用户名 / 未登录仅本地; "按9看云端"=键位提示)
         text(surf, "想法", 12, hi, (6, 3))
         cuser = self.cfg.get("cloud_user") or ""
         chead = ("@%s · 按9看云端" % cuser) if self.cfg.get("cloud_tok") \
             else "仅本地 · 按9看云端"
-        text(surf, "· %d 条" % len(items), 10, dim,
+        pages = " · %d-%d" % (self.scroll + 1,
+                              min(self.scroll + 4, len(items))) \
+            if len(items) > 4 else ""
+        text(surf, "· %d 条%s" % (len(items), pages), 10, dim,
              (6 + textw("想法", 12) + 6, 5))
         text(surf, chead, 10, dim, (W - 6, 5), right=True)
 
@@ -7050,7 +7272,8 @@ class App:
          "cal": self.draw_cal_app, "ssq": self.draw_ssq,
          "timer": self.draw_timer, "music": self.draw_mu,
          "mail": self.draw_mail, "tv": self.draw_tv,
-         "set": self.draw_set}[self.tool](surf)
+         "set": self.draw_set,
+         "sched": self.draw_sched}[self.tool](surf)
 
     def draw_tools(self, surf):
         acc, hi, soft = self.th("accent"), self.th("hi"), self.th("soft")
