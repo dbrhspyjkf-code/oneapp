@@ -24,6 +24,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import threading
@@ -42,6 +43,21 @@ import news_rss
 import portal as portalmod
 
 W, H = 320, 170
+
+# ── 全局 DNS 双栈保护 (2026-11-17 Atour 酒店网实测): 网关劫持 53 端口后
+#    对 AAAA 查询静默丢弃 (A 0.01s / AAAA 全家超时) → AF_UNSPEC 解析每连接
+#    卡 15-20s, 全 app 联网超时假死. 设备恒无 IPv6, 解析强制 A-only
+#    (进程级替换, net/mail/musrc/portal/fetchers 全覆盖). ──
+_orig_gai = socket.getaddrinfo
+
+
+def _gai_v4(host, port, family=0, type=0, proto=0, flags=0):
+    if family in (0, socket.AF_UNSPEC):
+        family = socket.AF_INET
+    return _orig_gai(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _gai_v4
 
 
 def _is_pcm_wav(path):
