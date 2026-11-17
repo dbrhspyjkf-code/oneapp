@@ -2866,7 +2866,7 @@ def test_tv():
 
 
 def test_sched():
-    """日程卡: 无登录态不拉取/进卡拉取落盘/排序渲染/Enter 完成同步/7 删除/失败强刷回滚."""
+    """日程卡 (只读): 无登录态不拉取/进卡拉取落盘/排序渲染/无管理动作/主页卡冒烟."""
     import dash
     pygame.init()
     pygame.display.set_mode((1, 1))
@@ -2905,50 +2905,22 @@ def test_sched():
     items = app._sched_items()
     assert [x["id"][0] for x in items] == ["c", "a", "e"]   # 时间升序
     app.draw(canvas)                                        # 渲染冒烟
-    # Enter 完成 → 本地即时移除 + POST /v1/done/<id>
-    app.key(pygame.K_RETURN)
-    assert all(x["id"] != "c" * 12 for x in app._sched_items())
-    calls.clear()
-    fn = app.net.last_job("schedop:done:" + "c" * 12)
-    assert fn is not None
-    d = fn()
-    assert d["op"] == "done" and d["st"] == 200
-    assert any(m == "POST" and u.endswith("/v1/done/" + "c" * 12)
-               for m, u in calls)
-    app.on_net("data", "schedop:done:" + "c" * 12, d)
-    # 行程无完成态: 不入队
-    items = app._sched_items()
-    app.ssel = [i for i, x in enumerate(items) if x["kind"] == "trip"][0]
+    # 只读: Enter/7 均无管理动作 (零新 job, 无 dialog, 数据不变)
     n_jobs = len(app.net.jobs)
     app.key(pygame.K_RETURN)
-    assert len(app.net.jobs) == n_jobs
-    # 7 删除 → dialog 确认 → DELETE /v1/notes/<id>
     app.key(pygame.K_7)
-    assert app.dialog and app.dialog[0] == "scheddel"
-    it = app.dialog[1]
-    app.key(pygame.K_RETURN)
+    app.key(pygame.K_UP)
+    app.key(pygame.K_DOWN)
+    assert len(app.net.jobs) == n_jobs
     assert app.dialog is None
-    calls.clear()
-    fn = app.net.last_job("schedop:del:" + it["id"])
-    assert fn is not None
-    d = fn()
-    assert d["op"] == "del" and d["st"] == 200
-    assert any(m == "DELETE" and u.endswith("/v1/notes/" + it["id"])
-               for m, u in calls)
-    app.on_net("data", "schedop:del:" + it["id"], d)
-    assert all(x["id"] != it["id"] for x in app._sched_items())
-    # 操作失败 (HTTP 500) → 强刷回滚 (schedget 重新入队)
-    n_jobs = len(app.net.jobs)
-    app.on_net("data", "schedop:done:" + "a" * 12,
-               {"op": "done", "id": "a" * 12, "st": 500})
-    assert len(app.net.jobs) > n_jobs
-    netmod.http_raw = orig_raw
-    # 主页右列「提醒/行程」卡: 开关默认开 + 渲染冒烟 (缓存 2 条 → 画得出)
+    assert [x["id"][0] for x in app._sched_items()] == ["c", "a", "e"]
+    # 主页右列「提醒/行程」卡: 开关默认开 + 渲染冒烟
     app.cfg["cards"]["sched"] = True
     app.tool = None
     app.page = 0
     app.draw(canvas)
-    print("sched OK  (fetch/cache/sort/done/delete/rollback/home-card)")
+    netmod.http_raw = orig_raw
+    print("sched OK  (fetch/cache/sort/readonly/home-card)")
 
 
 if __name__ == "__main__":
