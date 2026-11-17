@@ -40,14 +40,13 @@ import mail as mailmod
 import musrc
 import net as netmod
 import news_rss
-import portal as portalmod
 
 W, H = 320, 170
 
 # ── 全局 DNS 双栈保护 (2026-11-17 Atour 酒店网实测): 网关劫持 53 端口后
 #    对 AAAA 查询静默丢弃 (A 0.01s / AAAA 全家超时) → AF_UNSPEC 解析每连接
 #    卡 15-20s, 全 app 联网超时假死. 设备恒无 IPv6, 解析强制 A-only
-#    (进程级替换, net/mail/musrc/portal/fetchers 全覆盖). ──
+#    (进程级替换, net/mail/musrc/fetchers 全覆盖). ──
 _orig_gai = socket.getaddrinfo
 
 
@@ -727,8 +726,7 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
 TOOL_APPS = [("fx", "汇率"), ("unit", "换算"),
              ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
              ("music", "音乐"), ("tv", "电视"),
-             ("sched", "日程"), ("set", "设置"),
-             ("portal", "门户")]   # 日程=8 设置=9 门户=10/0键 (酒店 WiFi 门户认证)
+             ("sched", "日程"), ("set", "设置")]   # 日程=8 设置=9 (2026-11-16 定版: 设置挪日程后)
 # 邮件不在工具网格 (2026-11-16 用户定版): 主页底栏 9 邮件 直达
 TOOL_GRID = 5                            # 每行卡片数
 MAIL_BODY_ROWS = 5                       # 邮件详情每屏正文行数 (13px, 用户定版原生字号)
@@ -747,7 +745,6 @@ TV_LAST_CACHE = os.path.join(STATE_DIR, "tv_last.json")  # 电视上次分组/�
 TV_FAV_CACHE = os.path.join(STATE_DIR, "tv_fav.json")    # 电视收藏 (频道名表)
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
 SCHED_CACHE = os.path.join(STATE_DIR, "sched.json")      # 日程卡缓存 (提醒/行程)
-PORTAL_FILE = os.path.join(STATE_DIR, "portal.json")     # 门户卡: 各门户记住的字段值
 CLOUD_URL_DEFAULT = "https://notes.apisz.top"   # 注册成功自动配 (可改设置)
 CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
 _SENT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1324,20 +1321,6 @@ class App:
         self.sched = netmod.load_json_file(SCHED_CACHE,
                                            {"reminds": [], "trips": []})
         self._sched_home_at = 0.0             # 主页日程卡刷新节流
-        # Wi-Fi 门户卡 (captive portal 认证: 探针→表单→提交→自动复探)
-        self.portal_lv = "probe"              # probe=状态层 form=表单层
-        self.portal = {}                      # 最近探测结果 (portalmod.probe)
-        self.portal_form = {}                 # parse_form 结果 (fields/action)
-        self.portal_page = {}                 # 门户页 fetch 结果 (cookies/url)
-        self.portal_sel = 0
-        self.portal_edit = None               # 正编辑的字段 idx (None=非编辑态)
-        self.portal_busy = False              # 提交/拉页在飞
-        self.portal_cookies = ""
-        self.portal_local = {}                # local_info (本机 IP/网关)
-        self.portal_n = 0                     # 提交计数 (tag 防撞 job 缓存)
-        self.portal_wait = False              # 提交后等复探裁决
-        self.portal_fetched = ""              # 已自动拉过的门户 URL (防循环)
-        self.portal_hist = netmod.load_json_file(PORTAL_FILE, {})
         self.watch = netmod.load_json_file(WATCH_FILE, WATCH_SEED)
         self.wx_loc = netmod.load_json_file(WX_LOC_FILE, None) or dict(WX_HOME)
         # 语音想法: 录音 (arecord) + 本地播放 (ffplay)
@@ -1794,16 +1777,6 @@ class App:
                     self.osd = (("日程获取失败 HTTP %s" % st) if st
                                 else "日程获取失败",
                                 time.monotonic() + 2.5)
-            elif a == "portalinfo" and isinstance(b, dict):
-                self.portal_local = b if b.get("ok") else {}
-            elif a == "portalprobe":
-                self._portal_probe_done(b)
-            elif a == "portalpage":
-                self._portal_page_done(b)
-            elif a == "portalget":
-                self._portal_get_done(b)
-            elif a.startswith("portalsubmit:"):
-                self._portal_submit_done(b)
         elif kind == "error":                 # worker 里 fn 抛异常 (None) —
             if a.startswith("mail_list"):     # 以前静默吞, 失败根本不可见
                 self.mail_err = "网络异常 · 稍后刷新"
@@ -1835,21 +1808,6 @@ class App:
             elif a == "schedget":
                 if self.tool == "sched":
                     self.osd = ("日程获取失败 · 网络异常",
-                                time.monotonic() + 2.5)
-            elif a == "portalprobe":
-                self.portal_busy = False
-                if self.tool == "portal":
-                    self.osd = ("探测失败 · 网络异常",
-                                time.monotonic() + 2.5)
-            elif a == "portalpage" or a == "portalget":
-                self.portal_busy = False
-                if self.tool == "portal":
-                    self.osd = ("门户页拉取失败 · 网络异常",
-                                time.monotonic() + 2.5)
-            elif a.startswith("portalsubmit:"):
-                self.portal_busy = False
-                if self.tool == "portal":
-                    self.osd = ("认证提交失败 · 网络异常",
                                 time.monotonic() + 2.5)
         elif kind == "text":
             self.data[a] = b
@@ -4208,8 +4166,6 @@ class App:
                 or self.mu_input
                 or (self.tool == "mail"
                     and self.mail_lv in ("login", "compose"))
-                or (self.tool == "portal"
-                    and self.portal_edit is not None)
                 or (self.tool == "set" and (self.set_edit is not None
                                             or self.reg is not None
                                             or self.login is not None)))
@@ -4404,9 +4360,6 @@ class App:
                     self.mu_view = "play" if self.mu_view == "src" else "src"
                 elif self.tool == "mail":
                     if not self.mail_esc():       # 逐层回退; 账号层 → 网格
-                        self.tool_close()
-                elif self.tool == "portal":
-                    if not self.portal_esc():     # 编辑→表单→状态 逐层
                         self.tool_close()
                 else:
                     self.tool_close()
@@ -5181,8 +5134,6 @@ class App:
             self.tv_restore()                 # 恢复上次分组/光标
         if tid == "sched":
             self.sched_refresh(False)         # 进卡拉取 (TTL 300s 节流)
-        if tid == "portal":
-            self.portal_refresh()             # 进卡即强探 (TTL 0, 门户状态随认证瞬时变)
 
     def tool_grid_key(self, k):
         """入口网格: 方向键移光标 / 数字 1-9,0 直开 / Enter 打开."""
@@ -5238,8 +5189,6 @@ class App:
             return self.tv_key(k)
         if t == "sched":
             return self.sched_key(k)
-        if t == "portal":
-            return self.portal_key(k, ch)
         if t == "set":
             return self.set_key(k, ch)
         return True
@@ -5335,398 +5284,6 @@ class App:
                 text(surf, clip_text(label, 16, W - 148), 16,
                      soft, (140, y + 1))
         self.tool_foot(surf, ["4 \u5237\u65b0", "Esc \u8fd4\u56de"])
-
-    # ── Wi-Fi 门户 (工具第 10 卡: 探针探测→表单解析→键盘填写→POST 认证,
-    #    协议层 portal.py; 提交后自动复探裁决是否放行; 探测/提交 ttl 全 0 —
-    #    门户状态随认证瞬时变化, 任何一步都绝不吃 job 缓存) ──
-    def portal_refresh(self, with_local=False):
-        """强探 (进卡 / 4 重探 / 提交后复探 共用)."""
-        self.net.invalidate("portalprobe")
-        self.net.job("portalprobe", portalmod.probe, 0)
-        if with_local or not self.portal_local:
-            self.net.invalidate("portalinfo")
-            self.net.job("portalinfo", portalmod.local_info, 300)
-
-    def _portal_action(self):
-        """当前门户地址 (表单 action > 跳转 URL > 劫持页 URL)."""
-        return (self.portal_form.get("action")
-                or self.portal.get("portal") or "")
-
-    def _portal_rows(self):
-        """form 层行模型: 可编辑字段 + [立即认证] (+ [打开跳转页])."""
-        rows = []
-        for i, f in enumerate(self.portal_form.get("fields", [])):
-            if f.get("type") != "hidden":
-                rows.append(("f", i))
-        if self.portal_form.get("has_form"):
-            rows.append(("go", None))
-        if self.portal.get("portal"):
-            rows.append(("open", None))
-        return rows
-
-    def _portal_probe_done(self, b):
-        self.portal_busy = False
-        if not isinstance(b, dict) or not b.get("ok"):
-            self.portal = b if isinstance(b, dict) else {}
-            if self.tool == "portal" and isinstance(b, dict):
-                self.osd = (b.get("err") or "探测失败",
-                            time.monotonic() + 2.5)
-            return
-        self.portal = b
-        if b.get("online"):
-            if self.portal_wait:              # 提交后复探放行 = 认证成功
-                self.portal_wait = False
-                self.portal_lv = "probe"      # 回状态层亮 ✓
-                self.osd = ("✓ 认证成功 · 已联网", time.monotonic() + 4)
-            return
-        if self.portal_wait:
-            self.osd = ("已提交但仍未放行 · 检查账号/门户类型",
-                        time.monotonic() + 4)
-            self.portal_wait = False
-        if b.get("page_html"):                # DNS 劫持: 响应体即门户页
-            self._portal_form_apply(portalmod.parse_form(
-                b["page_html"], b.get("page_url") or ""), "")
-        elif b.get("portal"):
-            if b["portal"] != self.portal_fetched:
-                self.portal_page_fetch()      # 30x → 自动拉跳转页解析表单
-                                                # (同 URL 已拉过则不重复, 防死循环)
-
-    def portal_page_fetch(self):
-        url = self.portal.get("portal") or ""
-        if not url or self.portal_busy:
-            return
-        self.portal_busy = True
-        self.portal_fetched = url
-        self.net.invalidate("portalpage")
-        self.net.job("portalpage", self._portal_page_fn(url), 0)
-
-    def _portal_page_fn(self, url):
-        def f():
-            return portalmod.fetch(url)
-        return f
-
-    def _portal_page_done(self, b):
-        """拉页/GET 共用: 有表单→备填; 无表单→token 已随 GET 提交, 复探说话."""
-        self.portal_busy = False
-        if isinstance(b, dict) and b.get("ok"):
-            self.portal_page = b
-            form = portalmod.parse_form(b.get("html", ""), b.get("url", ""))
-            self._portal_form_apply(form, b.get("cookies", ""))
-            if not form.get("has_form"):
-                self.portal_wait = True
-                self.portal_refresh()
-            elif self.tool == "portal":
-                self.osd = ("门户页已解析 · Enter 填写认证",
-                            time.monotonic() + 3)
-        elif self.tool == "portal":
-            self.osd = ("门户页拉取失败", time.monotonic() + 2.5)
-
-    def _portal_form_apply(self, form, cookies):
-        """存解析结果 + 按门户 host 预填历史值 (portal.json)."""
-        self.portal_form = form if isinstance(form, dict) else {}
-        self.portal_cookies = cookies or ""
-        host = portalmod.urlhost(self._portal_action()) or "?"
-        hist = self.portal_hist.get(host, {})
-        for f in self.portal_form.get("fields", []):
-            v = hist.get(f.get("name", ""))
-            if v is not None and f.get("type") in portalmod.EDITABLE:
-                f["value"] = str(v)
-        self.portal_sel = min(self.portal_sel,
-                              max(0, len(self._portal_rows()) - 1))
-
-    def portal_key(self, k, ch):
-        if self.portal_edit is not None:      # 编辑态 (compose 全口径)
-            return self._portal_edit_key(k, ch)
-        if self.portal_lv == "form":
-            return self._portal_form_key(k, ch)
-        # ── 状态层 ──
-        if k == pygame.K_4:
-            self.portal_refresh(True)
-            self.osd = ("重探中…", time.monotonic() + 1.2)
-        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            p = self.portal
-            if not p:
-                self.portal_refresh(True)     # 进卡首探未见结果 → 再来
-            elif p.get("ok") and not p.get("online"):
-                if self._portal_rows():
-                    self.portal_lv = "form"
-                    self.portal_sel = 0
-                else:
-                    self.osd = ("门户页暂无可用动作 · 4 重探",
-                                time.monotonic() + 2.5)
-            elif p.get("ok"):
-                self.osd = ("已联网 · 无门户拦截", time.monotonic() + 2)
-        return True
-
-    def _portal_form_key(self, k, ch):
-        if k == pygame.K_4:
-            self.portal_refresh(True)
-            self.osd = ("重探中…", time.monotonic() + 1.2)
-            return True
-        rows = self._portal_rows()
-        if not rows:
-            return True
-        if k == pygame.K_UP:
-            self.portal_sel = (self.portal_sel - 1) % len(rows)
-        elif k == pygame.K_DOWN:
-            self.portal_sel = (self.portal_sel + 1) % len(rows)
-        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            if self.portal_busy:
-                return True
-            kind, i = rows[self.portal_sel % len(rows)]
-            if kind == "f":
-                f = self.portal_form["fields"][i]
-                if f.get("type") == "checkbox":
-                    f["checked"] = not f.get("checked")   # Enter 切勾选
-                else:
-                    self.portal_edit = i
-                    self.ime_mode = False     # 英文直输优先 (房号/账号)
-                    self.ime_clear()
-            elif kind == "go":
-                self.portal_submit()
-            else:
-                self.portal_get()
-        return True
-
-    def _portal_editables(self):
-        """编辑态可循环的字段 idx (文本类; checkbox 行 Enter 即切换不入编辑)."""
-        fields = self.portal_form.get("fields", [])
-        return [ri[1] for ri in self._portal_rows() if ri[0] == "f"
-                and fields[ri[1]].get("type") != "checkbox"]
-
-    def _portal_edit_key(self, k, ch):
-        fields = self.portal_form.get("fields", [])
-        if self.portal_edit >= len(fields):   # 表单被强刷顶掉 → 退编辑
-            self._portal_edit_close()
-            return True
-        f = fields[self.portal_edit]
-        if k in (pygame.K_LEFT, pygame.K_RIGHT):
-            self._portal_edit_move(1 if k == pygame.K_RIGHT else -1)
-        elif k == pygame.K_SLASH:             # / 中英切换
-            self.ime_mode = not self.ime_mode
-            self.ime_clear()
-        elif self.ime_mode:
-            if not self.ime_buf and k in (pygame.K_RETURN,
-                                          pygame.K_KP_ENTER):
-                self.ime_clear()
-                self._portal_edit_next()
-                return True
-            act = self.ime_key(k, ch)
-            if act is None:
-                return True
-            tag, val = act                    # ime_key 契约: None 或二元组
-            if tag == "del":
-                f["value"] = f.get("value", "")[:-1]
-            elif tag == "submit":             # 防御残留 (现行不产生)
-                self.ime_clear()
-                self._portal_edit_next()
-            else:                             # char / word
-                f["value"] = (f.get("value", "") + val)[:64]
-            return True
-        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            self._portal_edit_next()
-        elif k == pygame.K_BACKSPACE:
-            f["value"] = f.get("value", "")[:-1]
-        elif ch and 0x20 <= ord(ch) < 0x7F:
-            if len(f.get("value", "")) < 64:
-                f["value"] += ch
-        return True
-
-    def _portal_edit_move(self, d):
-        eds = self._portal_editables()
-        if len(eds) <= 1:                     # 只剩一个字段 → 直接收笔
-            self._portal_edit_close()
-            return
-        try:
-            idx = eds.index(self.portal_edit)
-        except ValueError:
-            self._portal_edit_close()
-            return
-        self.portal_edit = eds[(idx + d) % len(eds)]
-        self.ime_clear()
-
-    def _portal_edit_next(self):
-        """Enter 空串: 下一字段; 末字段 → 收笔并提交认证 (compose 口径)."""
-        eds = self._portal_editables()
-        try:
-            idx = eds.index(self.portal_edit)
-        except ValueError:
-            self._portal_edit_close()
-            return
-        if idx + 1 < len(eds):
-            self.portal_edit = eds[idx + 1]
-            self.ime_clear()
-        else:
-            self._portal_edit_close()
-            self.portal_submit()
-
-    def _portal_edit_close(self):
-        self.portal_edit = None
-        self.ime_clear()
-
-    def portal_esc(self):
-        """Esc 逐层: 编辑→表单→状态; probe 层 False = 退卡 (tool_close)."""
-        if self.portal_edit is not None:
-            if self.ime_buf:                  # 同音乐搜索口径: 先退拼音串
-                self.ime_clear()
-            else:
-                self._portal_edit_close()
-            return True
-        if self.portal_lv == "form":
-            self.portal_lv = "probe"
-            return True
-        return False
-
-    def portal_submit(self):
-        form = self.portal_form
-        if not form.get("has_form") or self.portal_busy:
-            return
-        self.portal_n += 1
-        self.portal_busy = True
-        self.portal_wait = True
-        self.osd = ("认证提交中…", time.monotonic() + 15)
-        tag = "portalsubmit:%d" % self.portal_n   # 每次唯一 tag 防撞缓存
-        self.net.invalidate(tag)
-        self.net.job(tag, self._portal_submit_fn(
-            form.get("method", "POST"), form.get("action", ""),
-            self.portal_cookies,
-            self.portal_page.get("url") or self._portal_action()), 0)
-
-    def _portal_submit_fn(self, method, action, cookies, referer):
-        fields = [dict(f) for f in self.portal_form.get("fields", [])]
-        button = dict(self.portal_form["button"]) \
-            if self.portal_form.get("button") else None
-
-        def f():
-            return portalmod.submit(method, action, fields, button=button,
-                                    cookies=cookies, referer=referer)
-        return f
-
-    def _portal_submit_done(self, b):
-        self.portal_busy = False
-        if not isinstance(b, dict) or not b.get("ok"):
-            self.portal_wait = False
-            if self.tool == "portal":
-                err = (b.get("err") if isinstance(b, dict) else "") or ""
-                self.osd = ("认证提交失败 %s" % err,
-                            time.monotonic() + 2.5)
-            return
-        self.portal_save_hist()
-        self.osd = ("已提交 HTTP %s · 复探中…" % b.get("st"),
-                    time.monotonic() + 8)
-        self.portal_refresh()                 # 复探裁决放行与否
-
-    def portal_get(self):
-        """打开跳转页 (token 在 URL 的门户 GET 一次即过; 无表单页也走这)."""
-        url = self.portal.get("portal") or ""
-        if not url or self.portal_busy:
-            return
-        self.portal_busy = True
-        self.osd = ("打开跳转页…", time.monotonic() + 10)
-        self.net.invalidate("portalget")
-        self.net.job("portalget", self._portal_page_fn(url), 0)
-
-    def _portal_get_done(self, b):
-        self._portal_page_done(b)             # 与自动拉页同一处理逻辑
-
-    def portal_save_hist(self):
-        """认证成功路径上记住各字段值 (按门户 host, portal.json 0600)."""
-        host = portalmod.urlhost(self._portal_action()) or "?"
-        d = self.portal_hist.setdefault(host, {})
-        for f in self.portal_form.get("fields", []):
-            if f.get("type") in portalmod.EDITABLE:
-                d[f.get("name", "")] = f.get("value", "")
-        netmod.save_json_file(PORTAL_FILE, self.portal_hist)
-
-    def draw_portal(self, surf):
-        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
-                              self.th("soft"), self.th("dim"))
-        p = self.portal
-        editing = self.portal_edit is not None
-        if self.portal_lv != "form":
-            # ── 状态层 ──
-            self.tool_head(surf, "门户", "Wi-Fi 认证")
-            if not p:
-                textc(surf, "探测中…", 13, dim, W // 2, 58)
-            elif not p.get("ok"):
-                textc(surf, "探针全部超时", 14, dim, W // 2, 54)
-                textc(surf, "可能没连上此 WiFi", 11, soft, W // 2, 78)
-            elif p.get("online"):
-                textc(surf, "✓ 已联网 · 无门户拦截", 14, self.th("ok"),
-                      W // 2, 54)
-            else:
-                textc(surf, "! 待认证 · 已检测到门户", 14,
-                      self.th("warn"), W // 2, 54)
-                if self.portal_form.get("has_form"):
-                    n_h = len([f for f in
-                               self.portal_form.get("fields", [])
-                               if f.get("type") == "hidden"])
-                    t = self.portal_form.get("title", "")
-                    textc(surf, "%s · %d 字段 (%d 隐藏)" % (
-                        clip_text(t, 11, 170) or "门户页",
-                        len(self.portal_form.get("fields", [])), n_h),
-                        11, soft, W // 2, 76)
-                else:
-                    textc(surf, clip_text(p.get("portal")
-                                          or p.get("page_url") or "",
-                                          9, 300), 9, dim, W // 2, 76)
-            loc = self.portal_local
-            if loc:
-                textc(surf, "IP %s · 网关 %s" % (loc.get("ip", "?"),
-                                                loc.get("gw", "?")),
-                      9, dim, W // 2, 126)
-            self.tool_foot(surf, ["4 重探", "Enter 确认", "Esc 退出"])
-            return
-        # ── 表单层 (含编辑态) ──
-        rows = self._portal_rows()
-        fields = self.portal_form.get("fields", [])
-        self.tool_head(surf, "门户 · 认证", "%d 项" % len(rows))
-        vis = 5
-        start = max(0, min(self.portal_sel - (vis - 1),
-                           max(0, len(rows) - vis)))
-        y = 17
-        for ridx in range(start, min(len(rows), start + vis)):
-            kind, i = rows[ridx]
-            sel = ridx == self.portal_sel and not editing
-            r = pygame.Rect(6, y, W - 12, 22)
-            pygame.draw.rect(surf, self.card(0), r, border_radius=4)
-            pygame.draw.rect(surf, acc if sel else self.th("border"), r,
-                             2 if sel else 1, border_radius=4)
-            if kind == "f":
-                f = fields[i]
-                lab = f.get("ph") or f.get("name") or "字段"
-                if f.get("type") == "checkbox":
-                    text(surf, "%s %s" % ("[*]" if f.get("checked")
-                                          else "[ ]", clip_text(lab, 12, 120)),
-                         12, acc if f.get("checked") else dim, (14, y + 6))
-                else:
-                    val = f.get("value", "")
-                    if f.get("type") == "password":
-                        val = "●" * len(val)
-                    cur = editing and i == self.portal_edit
-                    if cur and int(time.monotonic() * 2) % 2 == 0:
-                        val += "_"
-                    text(surf, clip_text(lab, 11, 92), 11,
-                         acc if cur else dim, (14, y + 7))
-                    text(surf, clip_text(val, 13, W - 130) if val
-                         else "(未填)", 13, hi if val else dim, (64, y + 5))
-                    if cur:                   # 输入法模式标 (拼/EN)
-                        text(surf, "拼" if self.ime_mode else "EN", 10,
-                             acc, (W - 14, y + 6), right=True)
-            elif kind == "go":
-                text(surf, "> 立即认证", 13,
-                     dim if self.portal_busy else acc, (14, y + 5))
-            else:
-                text(surf, "> 打开跳转页", 13, soft, (14, y + 5))
-            y += 24
-        n_h = len([f for f in fields if f.get("type") == "hidden"])
-        if n_h:
-            text(surf, "隐藏字段 %d 个自动带上" % n_h, 9, dim, (8, y + 1))
-        if editing:
-            if not self.ime_bar(surf, 146):   # 候选条在时让位底栏
-                self.tool_foot(surf, ["Enter 下一项", "/ 中英", "Esc 返回"])
-        else:
-            self.tool_foot(surf, ["Enter 选定", "4 重探", "Esc 返回"])
 
     def mail_esc(self):
         """Esc 逐层回退. 返回 True=已消化, False=账号层 (调用方回工具网格)."""
@@ -7826,7 +7383,7 @@ class App:
          "timer": self.draw_timer, "music": self.draw_mu,
          "mail": self.draw_mail, "tv": self.draw_tv,
          "set": self.draw_set,
-         "sched": self.draw_sched, "portal": self.draw_portal}[self.tool](surf)
+         "sched": self.draw_sched}[self.tool](surf)
 
     def draw_tools(self, surf):
         acc, hi, soft = self.th("accent"), self.th("hi"), self.th("soft")
