@@ -787,6 +787,11 @@ WATCH_SEED = {"items": [
     {"code": "sz300750", "name": "宁德时代"},
     {"code": "sh688981", "name": "中芯国际"},
 ]}
+# Oneapp 账户 kv 云同步 (noteserver /v1/kv/<key>): 本地文件=真相, 变更即推;
+# 登录后逐服务对齐 (本地有记录→确认框: Enter 上传 / Esc 云端覆盖);
+# 开机拉取按文件 mtime 判新旧 (LWW, 静默)
+KV_FILES = {"radio_fav": RADIO_FAV_CACHE, "watch": WATCH_FILE}
+KV_LABEL = {"radio_fav": "电台收藏", "watch": "自选股"}
 VOICES_DIR = os.path.join(STATE_DIR, "voices")   # 语音想法 (本地 wav)
 # 录音 (ES8389 麦克风; amixer 路由照抄 xiaozhi_launcher 已知良好配置 —
 # 驱动默认态=错误路由, 底噪 RMS 2767, 配置后 258; 每次录音前重置, 默认会漂)
@@ -1503,6 +1508,8 @@ class App:
         self.login_busy = False                # 登录验证中 (防重复)
         self.qrlogin = None                    # 扫码登录态 {st,dc,url,mat,err}
         self.qr_poll_at = 0.0                  # 扫码轮询节流
+        self.kv_confirm = None                 # kv 云同步确认框 {k,n,cn,v}
+        self.kv_queue = []                     # 登录对齐待处理服务队列
         self.inv_show = None                   # 注册码结果态 (code, uses)
         self.set_buf = ""
         self._usage_at = 0.0
@@ -1537,6 +1544,8 @@ class App:
         self.ime_cands = []                    # 候选 (词组+单字, ≤24)
         self.ime_assoc = None                  # 联想词 (上次提交后, None=无)
         self.ime_page = 0                      # 候选页 (每页 8)
+        if self.cfg.get("cloud_tok"):
+            self.kv_start_pull()               # Oneapp 账户 kv 开机静默 LWW
         # 链路探测由 net 层启动时自发
 
     def th(self, key):
@@ -1576,7 +1585,7 @@ class App:
                                   self.watch.get("items", [])
                                   if it.get("code") not in got]
                     self.watch = {"items": b.get("items") or []}
-                    netmod.save_json_file(WATCH_FILE, self.watch)
+                    self.watch_save()
                     self.fsel = self.fscroll = 0
                     if local_only:             # 推送失败/离线时加的, 提醒
                         self.osd = ("已同步 %d 只 · %s 等 %d 只未上云"
@@ -1694,6 +1703,7 @@ class App:
                         self.ideas["csync"] = b["now"]
                         netmod.save_json_file(IDEAS_FILE, self.ideas)
                     self.cloud_ping_trigger()
+                    self.kv_align_trigger()    # Oneapp 账户: 登录即对齐
                     self.osd = ("注册成功 已连接 %s" % b.get("user"),
                                 time.monotonic() + 2.5)
                 else:
@@ -1723,6 +1733,7 @@ class App:
                         self.ideas["csync"] = b["now"]   #   不向新号回放)
                         netmod.save_json_file(IDEAS_FILE, self.ideas)
                     self.cloud_ping_trigger()
+                    self.kv_align_trigger()    # Oneapp 账户: 登录即对齐
                     self.osd = ("已登录 %s" % b.get("user"),
                                 time.monotonic() + 2.5)
                 else:
@@ -1753,6 +1764,7 @@ class App:
                         self.ideas["csync"] = b["now"]
                         netmod.save_json_file(IDEAS_FILE, self.ideas)
                     self.cloud_ping_trigger()
+                    self.kv_align_trigger()    # Oneapp 账户: 登录即对齐
                     self.osd = ("扫码登录 ✓ %s" % b.get("user"),
                                 time.monotonic() + 2.5)
                 elif stt == "none":            # 设备码过期 → 自动重出码
@@ -1762,6 +1774,22 @@ class App:
                     self.qrlogin.update(st="fail", err="授权已被领取, 重试")
                 elif stt == "pending":
                     self.qrlogin.update(st="wait")
+            elif a.startswith("kvput:"):
+                pass                           # 推送结果静默 (失败开机补推)
+            elif a.startswith("kvalign:") and isinstance(b, dict):
+                self._kv_align_step(a.split(":", 1)[1], b)
+            elif a.startswith("kvsync:") and isinstance(b, dict):
+                k = a.split(":", 1)[1]
+                if b.get("ok"):
+                    try:
+                        lm = os.path.getmtime(KV_FILES[k])
+                    except OSError:
+                        lm = 0.0
+                    cu = b.get("updated") or 0
+                    if cu > lm + 2:
+                        self.kv_apply(k, b.get("v"))   # 云端更新 → 覆盖
+                    elif lm > cu + 2:
+                        self.kv_push(k)                # 本地更新 → 补推
             elif a == "schedget" and isinstance(b, dict) \
                     and not b.get("skip"):
                 if b.get("ok"):
@@ -1803,6 +1831,12 @@ class App:
                     self.qrlogin.update(st="fail", err="网络异常")
             elif a == "cloudqrpoll":
                 self.qr_poll_at = 0.0          # 网络异常: 下帧重试 poll
+            elif a.startswith("kvalign:"):
+                if self.kv_queue:
+                    self.kv_queue.pop(0)
+                self.kv_align_next()
+            elif a.startswith("kvsync:") or a.startswith("kvput:"):
+                pass
             elif a == "cloudinvite":
                 self.osd = ("生成失败 网络异常", time.monotonic() + 2.5)
             elif a == "schedget":
@@ -1985,7 +2019,7 @@ class App:
             self.osd = ("已在自选股", time.monotonic() + 1.5)
             return
         self.watch.setdefault("items", []).append({"code": code, "name": ""})
-        netmod.save_json_file(WATCH_FILE, self.watch)
+        self.watch_save()
         self.osd = ("已添加 " + code, time.monotonic() + 1.5)
         self._em_push(code, True)          # 开同步 → 云端账户同步加
 
@@ -2011,7 +2045,7 @@ class App:
         n0 = len(items)
         self.watch["items"] = [x for x in items if x.get("code") != code]
         if len(self.watch["items"]) != n0:
-            netmod.save_json_file(WATCH_FILE, self.watch)
+            self.watch_save()
             self.fsel = max(0, min(self.fsel,
                                    len(self.watch["items"]) - 1))
             self.osd = ("已删除 " + (code or ""), time.monotonic() + 1.2)
@@ -2192,10 +2226,109 @@ class App:
         else:
             self.radio_fav.append(k)
             self.osd = ("已收藏 · %s" % st["name"], time.monotonic() + 1.5)
-        netmod.save_json_file(RADIO_FAV_CACHE, self.radio_fav)
+        self.radio_fav_save()
         n = len(self.radio_list())            # 收藏组可能变短, 光标钳回
         if self.radio_grp == 0 and n:
             self.rsel = min(self.rsel, n - 1)
+
+    # ── Oneapp 账户 kv 云同步 (radio_fav / watch; noteserver /v1/kv) ──
+    def watch_save(self):
+        netmod.save_json_file(WATCH_FILE, self.watch)
+        self.kv_push("watch")
+
+    def radio_fav_save(self):
+        netmod.save_json_file(RADIO_FAV_CACHE, self.radio_fav)
+        self.kv_push("radio_fav")
+
+    def _cloud_base(self):
+        return (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
+
+    def kv_push(self, k):
+        """本地文件变更后推云端 (登录态才推; 失败静默, 下次变更/开机补)."""
+        if not self.cfg.get("cloud_tok"):
+            return
+        self.net.invalidate(("job", "kvput:" + k))
+        self.net.job("kvput:" + k, lambda k=k: self._kv_put_fn(k), ttl=10)
+
+    def _kv_put_fn(self, k):
+        tok = (self.cfg.get("cloud_tok") or "").strip()
+        try:
+            data = open(KV_FILES[k]).read()
+            json.loads(data)
+        except Exception:
+            return {"ok": 0, "st": 0}
+        st, _b = netmod.http_raw(self._cloud_base() + "/v1/kv/" + k,
+                                 method="PUT", body=data.encode(),
+                                 timeout=8,
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + tok})
+        return {"ok": 1 if st == 200 else 0, "st": st}
+
+    def _kv_get_fn(self, k):
+        tok = (self.cfg.get("cloud_tok") or "").strip()
+        st, body = netmod.http_raw(self._cloud_base() + "/v1/kv/" + k,
+                                   timeout=8,
+                                   headers={"Authorization":
+                                            "Bearer " + tok})
+        try:
+            j = json.loads(body.decode("utf-8", "replace"))
+        except Exception:
+            j = {}
+        return {"ok": 1 if (st == 200 and j.get("ok")) else 0, "st": st,
+                "v": j.get("v"), "updated": j.get("updated") or 0}
+
+    def kv_start_pull(self):
+        """开机静默 LWW: 云端 updated 比本地文件 mtime 新 → 云端覆盖;
+        本地更新 → 补推; 相近 (±2s) 不动."""
+        for k in KV_FILES:
+            self.net.invalidate(("job", "kvsync:" + k))
+            self.net.job("kvsync:" + k, lambda k=k: self._kv_get_fn(k),
+                         ttl=10)
+
+    def kv_align_trigger(self):
+        """登录成功后: 逐服务本地 vs 云端对齐; 本地有记录→确认框."""
+        self.kv_confirm = None
+        self.kv_queue = list(KV_FILES)
+        self.kv_align_next()
+
+    def kv_align_next(self):
+        if not self.kv_queue or not self.cfg.get("cloud_tok"):
+            self.kv_queue = []
+            return
+        k = self.kv_queue[0]
+        self.net.invalidate(("job", "kvalign:" + k))
+        self.net.job("kvalign:" + k, lambda k=k: self._kv_get_fn(k), ttl=10)
+
+    def _kv_align_step(self, k, b):
+        """拉取结果裁决: 双空/失败跳过; 本地空→直接跟随云端;
+        本地有→确认框 (Enter 上传 / Esc 云端覆盖)."""
+        if self.kv_queue and self.kv_queue[0] == k:
+            self.kv_queue.pop(0)
+        if not b.get("ok"):
+            return self.kv_align_next()
+        local = netmod.load_json_file(KV_FILES[k], None)
+        cv = b.get("v")
+        if local:
+            n = len(local) if isinstance(local, list) else \
+                len(local.get("items", []) or [])
+            cn = len(cv) if isinstance(cv, list) else \
+                len((cv or {}).get("items", []) or [])
+            self.kv_confirm = {"k": k, "n": n, "cn": cn, "v": cv}
+            return                             # 模态: set_key 裁决后继续
+        if cv is not None:
+            self.kv_apply(k, cv)
+        self.kv_align_next()
+
+    def kv_apply(self, k, v):
+        """云端覆盖本地 (内存+文件; 直写不走 save helpers 防回推)."""
+        if k == "radio_fav":
+            self.radio_fav = [x for x in (v or []) if isinstance(x, str)]
+            netmod.save_json_file(KV_FILES[k], self.radio_fav)
+        else:
+            items = (v or {}).get("items", []) if isinstance(v, dict) else []
+            self.watch = {"items": items}
+            self.fsel = self.fscroll = 0
+            netmod.save_json_file(KV_FILES[k], self.watch)
 
     def radio_st_by_key(self, key):
         import radio_stations
@@ -4617,7 +4750,7 @@ class App:
             return [("theme:%d" % i, t["name"])
                     for i, t in enumerate(THEMES)]
         return [("key:glm", "GLM KEY"), ("key:ds", "DS KEY"),
-                ("key:cloud", "想法云地址"),
+                ("key:cloud", "账户服务器"),
                 ("login", "更换账户" if self.cfg.get("cloud_tok")
                  else "登录"),
                 ("qrlogin", "扫码登录 (免输token)"),
@@ -4636,6 +4769,23 @@ class App:
                    "admin": "cloud_admin"}
 
     def set_key(self, k, ch):
+        if self.kv_confirm is not None:        # kv 同步确认框 (模态)
+            d = self.kv_confirm
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.kv_confirm = None
+                self.kv_push(d["k"])           # 上传本地到云端
+                self.osd = ("%s 已上传本地到云端"
+                            % KV_LABEL.get(d["k"], d["k"]),
+                            time.monotonic() + 2)
+                self.kv_align_next()
+            elif k in (pygame.K_ESCAPE, pygame.K_c):
+                self.kv_confirm = None
+                self.kv_apply(d["k"], d.get("v"))   # 云端覆盖本地
+                self.osd = ("%s 已用云端覆盖本地"
+                            % KV_LABEL.get(d["k"], d["k"]),
+                            time.monotonic() + 2)
+                self.kv_align_next()
+            return True                        # 其余键模态吞掉
         if self.qrlogin is not None:           # 扫码登录态: Esc/q 关, 其余忽略
             if k in (pygame.K_ESCAPE, pygame.K_q):
                 self.qrlogin = None
@@ -4718,7 +4868,7 @@ class App:
                     self.cfg["cloud_tok"] = ""
                     self.cfg["cloud_user"] = ""
                     self.cfg_save()
-                    self.osd = ("已退出 %s · 想法仅本地" % u
+                    self.osd = ("已退出 %s · 云数据仅本地" % u
                                 if u else "已退出",
                                 time.monotonic() + 2.5)
                 else:
@@ -5038,7 +5188,7 @@ class App:
             box = pygame.Rect(24, 44, W - 48, 94)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
-            text(surf, "注册云端账号", 13, hi, (box.x + 12, box.y + 8))
+            text(surf, "注册 Oneapp 账号", 13, hi, (box.x + 12, box.y + 8))
             for i, (lab2, key2) in enumerate((("用户名", "name"),
                                               ("邀请码", "invite"))):
                 y2 = box.y + 30 + i * 18
@@ -5064,7 +5214,7 @@ class App:
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
             cur = self.cfg.get("cloud_user") or ""
             title = ("更换账户 (当前 @%s)" % cur) \
-                if self.cfg.get("cloud_tok") else "登录想法云"
+                if self.cfg.get("cloud_tok") else "登录 Oneapp 账户"
             text(surf, title, 13, hi, (box.x + 12, box.y + 8))
             text(surf, "TOKEN", 12, dim, (box.x + 12, box.y + 30))
             shown = clip_text(self.login["tok"][-24:] + "_", 12, 170)
@@ -5078,6 +5228,20 @@ class App:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
                      self.th("danger"), (box.right - 12, box.y + 53),
                      right=True)
+        # ── kv 云同步确认框 (覆盖): 本地 vs 云端 ──
+        if self.kv_confirm is not None:
+            d = self.kv_confirm
+            box = pygame.Rect(28, 40, W - 56, 92)
+            pygame.draw.rect(surf, self.card(0), box, border_radius=6)
+            pygame.draw.rect(surf, acc, box, 2, border_radius=6)
+            text(surf, "同步 %s" % KV_LABEL.get(d["k"], d["k"]), 13, hi,
+                 (box.x + 12, box.y + 8))
+            text(surf, "本地 %d 条 · 云端 %d 条" % (d["n"], d["cn"]), 12, hi,
+                 (box.x + 12, box.y + 30))
+            text(surf, "Enter 上传本地到云端", 11, acc,
+                 (box.x + 12, box.y + 54))
+            text(surf, "Esc 用云端覆盖本地", 11, soft,
+                 (box.x + 12, box.y + 70))
         # ── 扫码登录 (覆盖): QR 直绘 + 状态行, Esc/q 取消 ──
         if self.qrlogin is not None:
             stt = self.qrlogin.get("st")

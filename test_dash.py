@@ -1991,6 +1991,99 @@ def test_qrlogin():
           "pending/approved-persist/expire-restart/netfail/esc)")
 
 
+def test_kv_sync():
+    """Oneapp 账户 kv 云同步: 开机拉取/变更即推/LWW (mtime 判新旧)/
+    登录对齐确认框 (Enter 上传/Esc 云端覆盖)/模态吞键/队列顺序."""
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    fr = os.path.join(tmp, "radio_fav.json")
+    fw = os.path.join(tmp, "watch.json")
+    dash.KV_FILES.update({"radio_fav": fr, "watch": fw})
+    dash.RADIO_FAV_CACHE = fr
+    dash.WATCH_FILE = fw
+    json.dump({"cloud_tok": "t" * 24, "cloud_user": "u"},
+              open(dash.SETTINGS_FILE, "w"))
+    orig_raw = netmod.http_raw
+    now = _time.time()
+    try:
+        # 开机: 已登录 → kvsync 两服务拉取入队
+        app = dash.App(FakeNet())
+        tags = [t for t, _ in app.net.jobs if t.startswith("kvsync:")]
+        assert tags == ["kvsync:radio_fav", "kvsync:watch"], tags
+        # LWW: 云端明显新 → 覆盖本地 (文件+内存)
+        json.dump(["old1"], open(fr, "w"))
+        os.utime(fr, (now - 100, now - 100))
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "k": "radio_fav", "v": ["cloud1", "cloud2"],
+             "updated": now}).encode())
+        d = app.net.last_job("kvsync:radio_fav")()
+        assert d["ok"] == 1 and d["v"] == ["cloud1", "cloud2"]
+        app.on_net("data", "kvsync:radio_fav", d)
+        assert app.radio_fav == ["cloud1", "cloud2"]
+        assert json.load(open(fr)) == ["cloud1", "cloud2"]
+        # LWW: 本地明显新 → 补推 (kvput 入队, PUT 200)
+        netmod.http_raw = lambda url, **k: (
+            (200, json.dumps({"ok": 1}).encode()) if url.endswith("/radio_fav")
+            and k.get("method") == "PUT"
+            else (404, b'{"err": "no such key"}'))
+        app.radio_fav = ["mine"]
+        app.radio_fav_save()               # 变更即推 (kvput 入队)
+        d = app.net.last_job("kvput:radio_fav")()
+        assert d["ok"] == 1 and d["st"] == 200
+        # 登录对齐: 本地有 → 确认框; 模态吞键
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": ["cloud1", "cloud2", "cloud3"],
+             "updated": now}).encode())
+        app.kv_align_trigger()
+        d = app.net.last_job("kvalign:radio_fav")()
+        assert d["ok"] == 1
+        app.on_net("data", "kvalign:radio_fav", d)
+        assert app.kv_confirm and app.kv_confirm["k"] == "radio_fav" \
+            and app.kv_confirm["n"] == 1 and app.kv_confirm["cn"] == 3
+        app.set_key(pygame.K_5, "5")       # 非裁决键 → 吞掉
+        assert app.kv_confirm is not None
+        app.draw(canvas)                   # 确认框渲染冒烟
+        # Enter → 上传本地 (kvput 入队) + 队列走到 watch
+        netmod.http_raw = lambda url, **k: (200, json.dumps({"ok": 1}).encode())
+        app.set_key(pygame.K_RETURN, "")
+        assert app.kv_confirm is None
+        assert app.net.last_job("kvput:radio_fav") is not None
+        assert app.kv_queue == ["watch"]
+        # watch: Esc → 云端覆盖本地 (apply 不回推)
+        json.dump({"items": [{"code": "sz000001", "name": "平安银行"}]},
+                  open(fw, "w"))              # 本地有记录 → 该出确认框
+        d = app.net.last_job("kvalign:watch")()
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": {"items": [{"code": "sh600519", "name": "贵州茅台"}]},
+             "updated": now}).encode())
+        d = app.net.last_job("kvalign:watch")()
+        app.on_net("data", "kvalign:watch", d)
+        assert app.kv_confirm and app.kv_confirm["k"] == "watch"
+        n_puts = len([t for t, _ in app.net.jobs if t.startswith("kvput:watch")])
+        app.set_key(pygame.K_ESCAPE, "")
+        assert app.kv_confirm is None
+        assert app.watch["items"][0]["code"] == "sh600519"
+        assert json.load(open(fw))["items"][0]["code"] == "sh600519"
+        assert len([t for t, _ in app.net.jobs
+                    if t.startswith("kvput:watch")]) == n_puts  # 不回推
+        assert app.kv_queue == []          # 队列走完
+        # 未登录: 不入队不推
+        app2 = dash.App(FakeNet())
+        app2.cfg["cloud_tok"] = ""
+        app2.radio_fav_save()
+        assert app2.net.last_job("kvput:radio_fav") is None
+    finally:
+        netmod.http_raw = orig_raw
+    print("kv_sync OK (boot-pull/lww-apply/lww-push/change-push/"
+          "align-confirm/modal-swallow/enter-upload/esc-overwrite/"
+          "no-push-on-apply/not-logged-in)")
+
+
+
 def test_mail_keys():
     """邮件 app 键流: 网格直开 → 登录表单 → 文件夹 → 列表 → 详情 → 逐层 Esc."""
     import mail as mailmod
