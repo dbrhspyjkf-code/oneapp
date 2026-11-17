@@ -2923,6 +2923,279 @@ def test_sched():
     print("sched OK  (fetch/cache/sort/readonly/home-card)")
 
 
+def test_portal():
+    """门户卡 (第 10 卡): 注册/探测三态/gbk 表单解析/编辑 IME/提交 payload/
+    自动复探放行/历史预填/Esc 逐层/无表单 GET 直开/错误分支."""
+    import dash
+    import portal as portalmod
+    from urllib.parse import parse_qs
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    dash.PORTAL_FILE = os.path.join(tmp, "portal.json")
+    orig_open = portalmod._open
+    calls = []
+
+    def set_fake(fn):
+        portalmod._open = fn
+
+    # ── 1. 注册: 第 10 卡 + 工具网格 0 键直开 + 进卡即探 ──
+    assert len(dash.TOOL_APPS) == 10 and dash.TOOL_APPS[-1][0] == "portal"
+    app = dash.App(FakeNet())
+    app.page = 5
+    app.tsel = 9
+    app.key(pygame.K_0)
+    assert app.tool == "portal"
+    assert any(t == "portalprobe" for t, _ in app.net.jobs)
+    assert any(t == "portalinfo" for t, _ in app.net.jobs)
+    app.draw(canvas)
+
+    # ── 2. 探测 302 → 自动拉页 → gbk 表单解析 ──
+    portal_html = (
+        '<html><head><title>酒店认证</title></head><body>'
+        '<form action="http://10.0.0.55/auth.do" method="POST">'
+        '<input type="hidden" name="wlanuserip" value="10.1.2.3">'
+        '<input type="text" name="room" placeholder="房间号">'
+        '<input type="password" name="pwd">'
+        '<input type="checkbox" name="agree" value="1" checked>'
+        '<button type="submit" name="op" value="login">登录</button>'
+        '</form></body></html>')
+
+    def fake_302(url, method="GET", body=None, headers=None, timeout=8,
+                 follow=False):
+        if "generate_204" in url:
+            return (302, {"Location": "http://10.0.0.55/portal.html"},
+                    b"", url)
+        if "portal.html" in url:
+            return (200, {"Content-Type": "text/html; charset=gbk",
+                          "Set-Cookie": "SID=abc; Path=/"},
+                    portal_html.encode("gbk"), url)
+        return (204, {}, b"", url)
+
+    set_fake(fake_302)
+    app.tool_open("portal")
+    d = app.net.last_job("portalprobe")()
+    app.on_net("data", "portalprobe", d)
+    assert app.portal["online"] == 0
+    assert app.portal["portal"] == "http://10.0.0.55/portal.html"
+    d2 = app.net.last_job("portalpage")()
+    assert d2["ok"] == 1 and d2["cookies"] == "SID=abc"
+    app.on_net("data", "portalpage", d2)
+    assert app.portal_form["has_form"] == 1
+    assert app.portal_form["action"] == "http://10.0.0.55/auth.do"
+    fs = {f["name"]: f for f in app.portal_form["fields"]}
+    assert set(fs) == {"wlanuserip", "room", "pwd", "agree"}
+    assert fs["room"]["ph"] == "房间号"          # gbk 正确解码
+    assert fs["agree"]["checked"] is True
+    assert app.portal_form["button"] == {"name": "op", "value": "login"}
+    app.draw(canvas)                              # 状态层渲染冒烟
+
+    # ── 3. 表单层: 编辑/丝印保护/IME/caps/末字段 Enter=提交 ──
+    app.key(pygame.K_RETURN)
+    assert app.portal_lv == "form"
+    rows = app._portal_rows()
+    assert [r[0] for r in rows] == ["f", "f", "f", "go", "open"]
+    app.draw(canvas)
+    app.key(pygame.K_RETURN)                      # sel=0 → room 进编辑
+    assert app.portal_edit == 1 and app.ime_mode is False
+    assert app._silk_input_active() is True       # 丝印 F/X 保持字母
+    app.key(pygame.K_f, "f")
+    app.key(pygame.K_8, "8")
+    app.key(pygame.K_0, "0")
+    app.key(pygame.K_3, "3")
+    assert fs["room"]["value"] == "f803"
+    app.key(pygame.K_SLASH)                       # / 切中文
+    assert app.ime_mode is True and app.ime_buf == ""
+    app.key(pygame.K_a, "a")
+    assert app.ime_buf == "a"
+    app.key(pygame.K_SPACE)                       # 首选上屏
+    assert fs["room"]["value"].startswith("f803")
+    assert len(fs["room"]["value"]) > 4
+    app.key(pygame.K_RETURN)                      # 下一字段 → pwd
+    assert app.portal_edit == 2
+    assert app.ime_mode is True                   # 中英态跨字段保持 (compose 同)
+    app.key(pygame.K_SLASH)                       # 切回英文
+    assert app.ime_mode is False
+    app.key(pygame.K_1, "1")
+    app.key(pygame.K_2, "2")
+    assert fs["pwd"]["value"] == "12"
+    app.key(pygame.K_ESCAPE)                      # 退编辑 (不退层)
+    assert app.portal_edit is None and app.portal_lv == "form"
+    app.portal_sel = 1                            # pwd 行
+    app.key(pygame.K_RETURN)                      # 再进 pwd 编辑
+    assert app.portal_edit == 2
+    fs["pwd"]["value"] = "x" * 64
+    app.key(pygame.K_a, "a")
+    assert fs["pwd"]["value"] == "x" * 64         # caps 64 封顶
+    app.key(pygame.K_ESCAPE)
+    # ── 4. 提交: payload/头断言 → 自动复探 204 → ✓ ──
+    app.key(pygame.K_RETURN)                      # 进 pwd
+    fs["pwd"]["value"] = "123456"
+    app.key(pygame.K_RETURN)                      # 末字段 Enter = 提交
+    assert app.portal_busy is True and app.portal_wait is True
+    sub_tag = [t for t, _ in app.net.jobs if t.startswith("portalsubmit:")][-1]
+    state = {"ok": False}
+
+    def fake_submit(url, method="GET", body=None, headers=None, timeout=8,
+                    follow=False):
+        if "auth.do" in url:
+            state["ok"] = True
+            calls.append(("submit", method, url, body, headers))
+            return (200, {}, "<html>成功</html>".encode(), url)
+        if "generate_204" in url:                 # 提交后探针已放行
+            return (204, {}, b"", url)
+        return (0, {}, b"", url)
+
+    set_fake(fake_submit)
+    d3 = app.net.last_job(sub_tag)()
+    app.on_net("data", sub_tag, d3)
+    scalls = [c for c in calls if c[0] == "submit"]
+    assert scalls and scalls[-1][1] == "POST"
+    q = parse_qs(scalls[-1][3].decode())
+    assert q["wlanuserip"] == ["10.1.2.3"]        # hidden 自动带上
+    assert q["room"][0].startswith("f803")
+    assert q["pwd"] == ["123456"]
+    assert q["agree"] == ["1"]                    # 勾选才交
+    assert q["op"] == ["login"]                   # submit button 必带
+    hd = scalls[-1][4]
+    assert hd["Content-Type"] == "application/x-www-form-urlencoded"
+    assert hd["Cookie"] == "SID=abc"
+    assert "portal.html" in hd["Referer"]
+    assert app.net.last_job("portalprobe") is not None   # 已自动复探
+    d4 = app.net.last_job("portalprobe")()
+    app.on_net("data", "portalprobe", d4)
+    assert app.portal["online"] == 1 and app.portal_wait is False
+    assert app.portal_lv == "probe" and "认证成功" in app.osd[0]
+    app.draw(canvas)
+    # 历史按门户 host 落盘 (0600) + 重进预填
+    hist = json.load(open(dash.PORTAL_FILE))
+    assert hist["10.0.0.55"]["room"].startswith("f803")
+    assert hist["10.0.0.55"]["pwd"] == "123456"
+    app2 = dash.App(FakeNet())
+    app2.portal = {"ok": 1, "online": 0,
+                   "portal": "http://10.0.0.55/portal.html"}
+    app2.on_net("data", "portalpage", {
+        "ok": 1, "url": "http://10.0.0.55/portal.html",
+        "html": portal_html, "cookies": ""})
+    fs2 = {f["name"]: f for f in app2.portal_form["fields"]}
+    assert fs2["room"]["value"].startswith("f803")       # 预填
+    assert fs2["pwd"]["value"] == "123456"
+    app2.portal_lv = "form"
+    app2.draw_portal(canvas)                      # 表单层渲染冒烟
+
+    # ── 5. Esc 逐层: 编辑→表单→状态→退卡 ──
+    app.portal_lv = "form"                        # (上节复探成功已自动回状态层)
+    app.portal_sel = 0
+    app.key(pygame.K_RETURN)
+    assert app.portal_edit is not None
+    app.key(pygame.K_ESCAPE)                      # 编辑 → 表单
+    assert app.portal_edit is None and app.portal_lv == "form"
+    app.key(pygame.K_ESCAPE)                      # 表单 → 状态
+    assert app.portal_lv == "probe"
+    app.key(pygame.K_ESCAPE)                      # 状态 → 网格
+    assert app.tool is None
+
+    # ── 6. 无表单门户 (token 在 URL): 自动拉页 GET 即过 → 自动复探 ✓ ──
+    app3 = dash.App(FakeNet())
+    st3 = {"authed": False}
+
+    def fake3(url, method="GET", body=None, headers=None, timeout=8,
+             follow=False):
+        if "generate_204" in url:
+            if st3["authed"]:
+                return (204, {}, b"", url)
+            return (302, {"Location": "http://gw/portal?token=x"},
+                    b"", url)
+        if "token" in url:
+            st3["authed"] = True                  # GET 一次即过
+            return (200, {}, "<html>联网成功</html>".encode(), url)
+        return (204, {}, b"", url)
+
+    set_fake(fake3)
+    app3.tool_open("portal")
+    d = app3.net.last_job("portalprobe")()
+    app3.on_net("data", "portalprobe", d)
+    assert app3.portal["portal"] == "http://gw/portal?token=x"
+    d5 = app3.net.last_job("portalpage")()        # 自动拉跳转页 (GET 即认证)
+    app3.on_net("data", "portalpage", d5)
+    d6 = app3.net.last_job("portalprobe")()       # 无表单 → 自动复探
+    app3.on_net("data", "portalprobe", d6)
+    assert app3.portal["online"] == 1 and "认证成功" in app3.osd[0]
+
+    # ── 6b. 无表单且 GET 无效: 手动 open 行 + 仍未放行 + 无探测死循环 ──
+    app3b = dash.App(FakeNet())
+
+    def fake3b(url, method="GET", body=None, headers=None, timeout=8,
+               follow=False):
+        if "generate_204" in url:
+            return (302, {"Location": "http://gw/portal?token=y"},
+                    b"", url)
+        return (200, {}, "<html>请扫码</html>".encode(), url)
+
+    set_fake(fake3b)
+    app3b.tool_open("portal")
+    d = app3b.net.last_job("portalprobe")()
+    app3b.on_net("data", "portalprobe", d)
+    d = app3b.net.last_job("portalpage")()
+    app3b.on_net("data", "portalpage", d)         # 无表单 → 已自动复探
+    n_jobs = len(app3b.net.jobs)
+    d = app3b.net.last_job("portalprobe")()
+    app3b.on_net("data", "portalprobe", d)        # 同 URL 已拉过 → 不再自动拉
+    assert len(app3b.net.jobs) == n_jobs          # 探测→拉页→复探 无死循环
+    assert "仍未放行" in app3b.osd[0]
+    app3b.key(pygame.K_RETURN)                    # probe 层 → form (仅 open 行)
+    assert app3b.portal_lv == "form"
+    rows3 = app3b._portal_rows()
+    assert rows3 == [("open", None)]
+    app3b.key(pygame.K_RETURN)                    # 手动 GET
+    assert app3b.net.last_job("portalget") is not None
+    d = app3b.net.last_job("portalget")()
+    app3b.on_net("data", "portalget", d)          # 无表单 → 复探
+    d = app3b.net.last_job("portalprobe")()
+    app3b.on_net("data", "portalprobe", d)
+    assert app3b.portal["online"] == 0
+    app3b.draw(canvas)
+
+    # ── 7. 其余探测态: 已联网 / 全超时 / DNS 劫持 200 / worker 异常 ──
+    set_fake(lambda url, method="GET", body=None, headers=None, timeout=8,
+             follow=False: (204, {}, b"", url))
+    app4 = dash.App(FakeNet())
+    app4.tool_open("portal")
+    d = app4.net.last_job("portalprobe")()
+    app4.on_net("data", "portalprobe", d)
+    assert app4.portal["online"] == 1
+    app4.draw(canvas)
+    set_fake(lambda url, method="GET", body=None, headers=None, timeout=8,
+             follow=False: (0, {}, b"", url))
+    d = app4.net.last_job("portalprobe")()
+    app4.on_net("data", "portalprobe", d)
+    assert app4.portal["ok"] == 0
+    app4.draw(canvas)                             # 超时层渲染冒烟
+    hijack = ('<html><head><title>上网认证</title></head><body>'
+              '<form action="/auth" method="POST">'
+              '<input type="text" name="user">'
+              '<input type="submit" name="go" value="上网"></form></body>')
+    set_fake(lambda url, method="GET", body=None, headers=None, timeout=8,
+             follow=False: (200, {"Content-Type": "text/html"},
+                            hijack.encode(), "http://192.168.10.1/login.html"))
+    app5 = dash.App(FakeNet())
+    app5.tool_open("portal")
+    d = app5.net.last_job("portalprobe")()
+    app5.on_net("data", "portalprobe", d)
+    assert app5.portal["online"] == 0 and app5.portal["portal"] == ""
+    assert app5.portal_form["has_form"] == 1
+    assert app5.portal_form["action"] == "http://192.168.10.1/auth"  # 相对补全
+    app5.draw(canvas)
+    app.on_net("error", "portalsubmit:9", None)   # worker 异常分支
+    assert app.portal_busy is False
+    app.on_net("error", "portalprobe", None)
+    assert isinstance(portalmod.local_info(), dict)       # Mac 无 /proc 不炸
+    portalmod._open = orig_open
+    print("portal OK  (probe3态/gbk表单/IME/提交payload/复探/历史/Esc层)")
+
+
 if __name__ == "__main__":
     test_lunar()
     test_wx()
@@ -2951,6 +3224,7 @@ if __name__ == "__main__":
     test_mail_sess()
     test_driver_sym()
     test_mail_compose()
+    test_portal()
     if os.environ.get("RUN_NET"):
         test_net_live()
         test_mail_live()

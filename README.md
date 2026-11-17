@@ -15,7 +15,7 @@ M5Stack CardputerZero (320×170) 的 pygame 工具箱 app。**零本地服务依
 | 电台 | 20 台内置直连流 (中/英), 12 条频谱 VU, 输出 O 键循环 (本机 / 局域网 AirPlay 音箱) | qingting.fm / cnr.cn / BBC / NPR… |
 | 行情 | 自选股+指数+贵金属, 分时/250日K | 腾讯 qt.gtimg.cn |
 | 新闻 | 7 个中文 RSS 源 | IT之家 / 少数派 / Solidot… |
-| 工具 | 汇率 / 单位换算 / 万年历 / 双色球 / 计时器 / 音乐 / 电视 | open.er-api.com / 中彩官网 / QQ·网易直连 / 公共直播源 |
+| 工具 | 汇率 / 单位换算 / 万年历 / 双色球 / 计时器 / 音乐 / 电视 / 日程 / 设置 / 门户 | open.er-api.com / 中彩官网 / QQ·网易直连 / 公共直播源 / captive 门户 |
 
 音乐 app: 本地曲库 (mp3/flac/wav) + QQ 音乐 / 网易云**直连协议**
 (musrc.py 自实现 weapi/eapi, 扫码绑定, 歌词走 LRCLIB+网易兜底);
@@ -29,7 +29,14 @@ pyatv RAOP 直推, 台名进音箱元数据)。AirPlay 播放中 Fn+S/D/A 音量
 --break-system-packages pyatv==0.18.0 srptools==1.0.1`;
 缺库/无设备时自动回落本机播放。
 
-电视 app (工具第 8 卡): **95 个实测可用公共直播频道** (★收藏页签 5 键收/取消) (央视/卫视/地方/国际
+门户 app (工具第 10 卡, 0 键直开): 酒店等 captive WiFi 的**免浏览器认证** —
+自动探针 (`generate_204`, 国内可达优先) 判定是否被门户拦截, 302 跳转/DNS 劫持
+都认; 拉门户页解析 `<form>` (hidden token 全收, GBK 自适应, https 自签证书不验),
+三层键盘 + 拼音 IME 填房号/账号, POST 提交后**自动复探**裁决是否放行并 OSD 报告;
+无表单门户 (token 在 URL) 自动 GET 一次即过。认证值按门户 host 记忆
+`portal.json` (0600), 下次免重填。协议层 `portal.py` 纯标准库。
+
+电视 app (工具第 7 卡): **95 个实测可用公共直播频道** (★收藏页签 5 键收/取消) (央视/卫视/地方/国际
 四分组, 源自官方 cardputer-zero-iptv 的 public-live.m3u 全量体检后取稳定无
 短时效 token 的 95 条, 见 `tv_channels.py`)。单 ffmpeg 进程直推面板: HLS →
 `fps=12,scale=320:170` → rgb24 管道 + 音频同进程 pulse (播放链移植其
