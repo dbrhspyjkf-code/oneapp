@@ -790,8 +790,9 @@ WATCH_SEED = {"items": [
 # Oneapp 账户 kv 云同步 (noteserver /v1/kv/<key>): 本地文件=真相, 变更即推;
 # 登录后逐服务对齐 (本地有记录→确认框: Enter 上传 / Esc 云端覆盖);
 # 开机拉取按文件 mtime 判新旧 (LWW, 静默)
-KV_FILES = {"radio_fav": RADIO_FAV_CACHE, "watch": WATCH_FILE}
-KV_LABEL = {"radio_fav": "电台收藏", "watch": "自选股"}
+KV_FILES = {"radio_fav": RADIO_FAV_CACHE, "watch": WATCH_FILE,
+            "tv_fav": TV_FAV_CACHE}
+KV_LABEL = {"radio_fav": "电台收藏", "watch": "自选股", "tv_fav": "电视收藏"}
 VOICES_DIR = os.path.join(STATE_DIR, "voices")   # 语音想法 (本地 wav)
 # 录音 (ES8389 麦克风; amixer 路由照抄 xiaozhi_launcher 已知良好配置 —
 # 驱动默认态=错误路由, 底噪 RMS 2767, 配置后 258; 每次录音前重置, 默认会漂)
@@ -2240,6 +2241,10 @@ class App:
         netmod.save_json_file(RADIO_FAV_CACHE, self.radio_fav)
         self.kv_push("radio_fav")
 
+    def tv_fav_save(self):
+        netmod.save_json_file(TV_FAV_CACHE, self.tv_fav)
+        self.kv_push("tv_fav")
+
     def _cloud_base(self):
         return (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
 
@@ -2321,14 +2326,16 @@ class App:
 
     def kv_apply(self, k, v):
         """云端覆盖本地 (内存+文件; 直写不走 save helpers 防回推)."""
-        if k == "radio_fav":
-            self.radio_fav = [x for x in (v or []) if isinstance(x, str)]
-            netmod.save_json_file(KV_FILES[k], self.radio_fav)
-        else:
+        if k == "watch":
             items = (v or {}).get("items", []) if isinstance(v, dict) else []
             self.watch = {"items": items}
             self.fsel = self.fscroll = 0
             netmod.save_json_file(KV_FILES[k], self.watch)
+            return
+        if k in ("radio_fav", "tv_fav"):
+            val = [x for x in (v or []) if isinstance(x, str)]
+            setattr(self, k, val)
+            netmod.save_json_file(KV_FILES[k], val)
 
     def radio_st_by_key(self, key):
         import radio_stations
@@ -3890,7 +3897,7 @@ class App:
         else:
             self.tv_fav.append(name)
             self.osd = ("已收藏 · %s" % name, time.monotonic() + 1.5)
-        netmod.save_json_file(TV_FAV_CACHE, self.tv_fav)
+        self.tv_fav_save()
         n = len(self.tv_list())                # 收藏组可能变短, 光标钳回
         if self.tv_grp == 0 and n:
             self.tv_sel = min(self.tv_sel, n - 1)

@@ -2013,7 +2013,8 @@ def test_kv_sync():
         # 开机: 已登录 → kvsync 两服务拉取入队
         app = dash.App(FakeNet())
         tags = [t for t, _ in app.net.jobs if t.startswith("kvsync:")]
-        assert tags == ["kvsync:radio_fav", "kvsync:watch"], tags
+        assert tags == ["kvsync:radio_fav", "kvsync:watch",
+                        "kvsync:tv_fav"], tags
         # LWW: 云端明显新 → 覆盖本地 (文件+内存)
         json.dump(["old1"], open(fr, "w"))
         os.utime(fr, (now - 100, now - 100))
@@ -2052,7 +2053,7 @@ def test_kv_sync():
         app.set_key(pygame.K_RETURN, "")
         assert app.kv_confirm is None
         assert app.net.last_job("kvput:radio_fav") is not None
-        assert app.kv_queue == ["watch"]
+        assert app.kv_queue == ["watch", "tv_fav"]
         # watch: Esc → 云端覆盖本地 (apply 不回推)
         json.dump({"items": [{"code": "sz000001", "name": "平安银行"}]},
                   open(fw, "w"))              # 本地有记录 → 该出确认框
@@ -2070,6 +2071,12 @@ def test_kv_sync():
         assert json.load(open(fw))["items"][0]["code"] == "sh600519"
         assert len([t for t, _ in app.net.jobs
                     if t.startswith("kvput:watch")]) == n_puts  # 不回推
+        assert app.kv_queue == ["tv_fav"]
+        # tv_fav: 云端没存过 (404) → 跳过走完
+        netmod.http_raw = lambda url, **k: (404, json.dumps(
+            {"err": "no such key"}).encode())
+        d = app.net.last_job("kvalign:tv_fav")()
+        app.on_net("data", "kvalign:tv_fav", d)
         assert app.kv_queue == []          # 队列走完
         # 未登录: 不入队不推
         app2 = dash.App(FakeNet())
