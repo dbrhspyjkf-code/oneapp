@@ -1489,12 +1489,12 @@ def test_settings_app():
     assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=11; sched 行在 12) → 有效 4 张 (含 sched 缺省 True) 被拒
+    # sw:usage 行 (sel=12, qrlogin 插入后移; sched 行在 13) → 有效 4 张被拒
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True, usage=False)
-    assert app._set_rows()[11][0] == "sw:usage"
-    assert app._set_rows()[12][0] == "sw:sched"    # 提醒/行程卡 = 末行
+    assert app._set_rows()[12][0] == "sw:usage"
+    assert app._set_rows()[13][0] == "sw:sched"    # 提醒/行程卡 = 末行
     assert app._card_on_n() == 4
-    app.set_sel = 11
+    app.set_sel = 12
     app.key(pygame.K_RETURN)
     assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
     assert app.osd and "先关" in app.osd[0], app.osd
@@ -1708,10 +1708,10 @@ def test_reg():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     app = dash.App(FakeNet())
     assert "reg" in [r[0] for r in app._set_rows()]
-    # rid=reg 行 (sel=4) → Enter 开表单
+    # rid=reg 行 (sel=5, qrlogin 插入后移) → Enter 开表单
     app.tool = "set"
-    assert app._set_rows()[4][0] == "reg"
-    app.set_sel = 4
+    assert app._set_rows()[5][0] == "reg"
+    app.set_sel = 5
     app.key(pygame.K_RETURN)
     assert app.reg == {"name": "", "invite": "", "field": 0}
     # F/X/Z/C 真实键值 = 字母 (丝印方向让位, _silk_input_active 含 reg 表单;
@@ -1779,7 +1779,8 @@ def test_login():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     app = dash.App(FakeNet())
     rows = [r[0] for r in app._set_rows()]
-    assert rows.index("login") == 3 and rows.index("reg") == 4
+    assert rows.index("login") == 3 and rows.index("qrlogin") == 4 \
+        and rows.index("reg") == 5
     assert rows[2] == ("key:cloud")
     app.tool = "set"
     app.draw(canvas)                       # 未登录: login 行右侧 "未登录"
@@ -1883,6 +1884,111 @@ def test_login():
     netmod.http_raw = orig_raw
     print("login OK (form/fxzc/ping verify/persist/fail-retain/esc/"
           "switch+csync reset/logout/admin-invite)")
+
+
+def test_qrlogin():
+    """扫码登录: 设置行进入/出码(start)/pending 轮询节流/approved 存 token
+    +csync 重置/过期自动重出码/Esc 关/网络异常不断轮询/绘制冒烟."""
+    import dash
+    import types
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
+    app = dash.App(FakeNet())
+    rows = [r[0] for r in app._set_rows()]
+    assert rows.index("qrlogin") == 4
+    app.tool = "set"
+    # segno 桩 (Mac 无 segno; 设备真机已装)
+    fake_segno = types.SimpleNamespace(make=lambda u, error="m":
+                                       types.SimpleNamespace(
+                                           matrix=[[True, False],
+                                                   [False, True]]))
+    sys.modules["segno"] = fake_segno
+    orig_raw = netmod.http_raw
+    try:
+        app.set_sel = rows.index("qrlogin")
+        app.key(pygame.K_RETURN)
+        assert app.qrlogin is not None and app.qrlogin["st"] == "init"
+        assert app.net.last_job("cloudqrstart") is not None
+        # Esc 在出码中即可关
+        app.key(pygame.K_ESCAPE)
+        assert app.qrlogin is None and app.tool == "set"
+        # 重进: start 出码 → st=qr + mat
+        app.key(pygame.K_RETURN)
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "device_code": "d" * 32,
+             "url": "https://notes.apisz.top/login#dc=" + "d" * 32,
+             "exp": 0}).encode())
+        d = app.net.last_job("cloudqrstart")()
+        assert d["ok"] == 1 and d["dc"] == "d" * 32 and d["mat"]
+        app.on_net("data", "cloudqrstart", d)
+        assert app.qrlogin["st"] == "qr" and app.qrlogin["mat"] is not None
+        app.draw(canvas)                   # QR 渲染冒烟
+        # tick 节流: 首帧入队 poll, 2s 内不再入队
+        app.qr_poll_at = 0.0
+        app._cloud_qr_tick()
+        assert app.net.last_job("cloudqrpoll") is not None
+        n_jobs = len(app.net.jobs)
+        app._cloud_qr_tick()
+        assert len(app.net.jobs) == n_jobs
+        # pending → wait; 网络异常 → 下帧可重试
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"status": "pending"}).encode())
+        d = app.net.last_job("cloudqrpoll")()
+        assert d["st"] == "pending"
+        app.on_net("data", "cloudqrpoll", d)
+        assert app.qrlogin["st"] == "wait"
+        app.on_net("error", "cloudqrpoll", None)
+        assert app.qr_poll_at == 0.0
+        # approved → 存 token + user + csync 重置 + 关扫码页 + ping
+        def raw_ok(url, **k):
+            if "/v1/auth/device/poll" in url:
+                return 200, json.dumps({"status": "approved",
+                                        "token": "q" * 48,
+                                        "user": "zero"}).encode()
+            if "/v1/tombstones" in url:
+                return 200, json.dumps({"ids": [], "now": 888.0}).encode()
+            return 404, b"{}"
+        netmod.http_raw = raw_ok
+        app._cloud_qr_tick()
+        d = app.net.last_job("cloudqrpoll")()
+        assert d["st"] == "approved" and d["token"] == "q" * 48 \
+            and d["now"] == 888.0
+        app.on_net("data", "cloudqrpoll", d)
+        assert app.qrlogin is None
+        assert app.cfg["cloud_tok"] == "q" * 48
+        assert app.cfg["cloud_user"] == "zero"
+        assert app.ideas["csync"] == 888.0
+        assert app.net.last_job("cloudping") is not None
+        assert app.osd and "扫码登录" in app.osd[0]
+        json.load(open(dash.SETTINGS_FILE))
+        # 过期 (none) → 自动重出码 (新 qrlogin 态 + start 重入队)
+        app._cloud_qr_open()
+        app.on_net("data", "cloudqrstart",
+                   {"ok": 1, "dc": "e" * 32, "url": "u", "mat": [[1]]})
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"status": "none"}).encode())
+        app.qr_poll_at = 0.0
+        app._cloud_qr_tick()
+        d = app.net.last_job("cloudqrpoll")()
+        assert d["st"] == "none"
+        app.on_net("data", "cloudqrpoll", d)
+        assert app.qrlogin is not None and app.qrlogin["st"] == "init"
+        assert app.net.last_job("cloudqrstart") is not None
+        # 出码失败 (网络) → fail 态 + 提示, 不再轮询
+        app.on_net("error", "cloudqrstart", None)
+        assert app.qrlogin["st"] == "fail"
+        app.draw(canvas)
+        app.key(pygame.K_q)
+        assert app.qrlogin is None
+    finally:
+        netmod.http_raw = orig_raw
+        sys.modules.pop("segno", None)
+    print("qrlogin OK (row/esc-during-init/start-matrix/poll-throttle/"
+          "pending/approved-persist/expire-restart/netfail/esc)")
 
 
 def test_mail_keys():

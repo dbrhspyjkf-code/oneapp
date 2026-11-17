@@ -1502,6 +1502,8 @@ class App:
         self.reg_busy = False                  # 注册提交中 (防重复)
         self.login = None                      # 登录表单态 {tok}
         self.login_busy = False                # 登录验证中 (防重复)
+        self.qrlogin = None                    # 扫码登录态 {st,dc,url,mat,err}
+        self.qr_poll_at = 0.0                  # 扫码轮询节流
         self.inv_show = None                   # 注册码结果态 (code, uses)
         self.set_buf = ""
         self._usage_at = 0.0
@@ -1729,6 +1731,38 @@ class App:
                                            if b.get("st") else "网络异常")
                     self.osd = ("登录失败 %s" % err,
                                 time.monotonic() + 2.5)
+            elif a == "cloudqrstart" and isinstance(b, dict) \
+                    and self.qrlogin is not None:
+                if b.get("ok"):
+                    self.qrlogin.update(st="qr", dc=b["dc"], url=b["url"],
+                                        mat=b.get("mat"))
+                else:
+                    self.qrlogin.update(st="fail",
+                                        err=b.get("err") or "出码失败")
+            elif a == "cloudqrpoll" and isinstance(b, dict) \
+                    and self.qrlogin is not None:
+                stt = b.get("st")
+                if stt == "approved" and b.get("token"):
+                    if not self.cfg.get("cloud_url"):
+                        self.cfg["cloud_url"] = CLOUD_URL_DEFAULT
+                    self.cfg["cloud_tok"] = b["token"]
+                    self.cfg["cloud_user"] = b.get("user") or ""
+                    self.cfg_save()
+                    self.qrlogin = None        # 成功: 关扫码页
+                    self.qr_poll_at = 0.0
+                    if b.get("now"):           # 换号: csync 重置防回放
+                        self.ideas["csync"] = b["now"]
+                        netmod.save_json_file(IDEAS_FILE, self.ideas)
+                    self.cloud_ping_trigger()
+                    self.osd = ("扫码登录 ✓ %s" % b.get("user"),
+                                time.monotonic() + 2.5)
+                elif stt == "none":            # 设备码过期 → 自动重出码
+                    self.qr_poll_at = 0.0
+                    self._cloud_qr_open()
+                elif stt == "done":            # token 被别的端领走(不该发生)
+                    self.qrlogin.update(st="fail", err="授权已被领取, 重试")
+                elif stt == "pending":
+                    self.qrlogin.update(st="wait")
             elif a == "schedget" and isinstance(b, dict) \
                     and not b.get("skip"):
                 if b.get("ok"):
@@ -1775,6 +1809,11 @@ class App:
             elif a == "cloudlogin":
                 self.login_busy = False
                 self.osd = ("登录失败 网络异常", time.monotonic() + 2.5)
+            elif a == "cloudqrstart":
+                if self.qrlogin is not None:
+                    self.qrlogin.update(st="fail", err="网络异常")
+            elif a == "cloudqrpoll":
+                self.qr_poll_at = 0.0          # 网络异常: 下帧重试 poll
             elif a == "cloudinvite":
                 self.osd = ("生成失败 网络异常", time.monotonic() + 2.5)
             elif a == "schedget":
@@ -4319,11 +4358,14 @@ class App:
             if k == pygame.K_ESCAPE:
                 if self.tool == "set" and (self.set_edit is not None
                                            or self.reg is not None
-                                           or self.login is not None):
+                                           or self.login is not None
+                                           or self.qrlogin is not None):
                     self.set_edit = None       # 关 KEY 弹窗/注册/登录表单,
                     self.set_buf = ""          #   保持在设置页
                     self.reg = None
                     self.login = None
+                    self.qrlogin = None
+                    self.qr_poll_at = 0.0
                     return True
                 if self.tool == "tv" and self.tv_playing:
                     self.tv_stop()             # 播放态 Esc → 回列表 (不退 app)
@@ -4609,6 +4651,7 @@ class App:
                 ("key:cloud", "想法云地址"),
                 ("login", "更换账户" if self.cfg.get("cloud_tok")
                  else "登录"),
+                ("qrlogin", "扫码登录 (免输token)"),
                 ("reg", "注册新账号"), ("logout", "退出登录"),
                 ("key:admin", "管理员 TOKEN"), ("minv", "生成注册码"),
                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
@@ -4624,6 +4667,11 @@ class App:
                    "admin": "cloud_admin"}
 
     def set_key(self, k, ch):
+        if self.qrlogin is not None:           # 扫码登录态: Esc/q 关, 其余忽略
+            if k in (pygame.K_ESCAPE, pygame.K_q):
+                self.qrlogin = None
+                self.qr_poll_at = 0.0
+            return True
         if self.inv_show is not None:          # 注册码结果态: 任意键关
             self.inv_show = None
             return True
@@ -4691,6 +4739,8 @@ class App:
                             time.monotonic() + 2)
             elif rid == "reg":                 # 注册表单 (用户名+邀请码)
                 self.reg = {"name": "", "invite": "", "field": 0}
+            elif rid == "qrlogin":             # 扫码登录: 出码+轮询
+                self._cloud_qr_open()
             elif rid == "login":               # 登录/更换账户 表单
                 self.login = {"tok": ""}
             elif rid == "logout":              # 退出登录 (本地数据不动)
@@ -4846,6 +4896,80 @@ class App:
                 "token": j.get("token"), "user": j.get("user"), "url": url,
                 "now": now}
 
+    # ── 扫码登录 (通用账户设备码流程, noteserver /v1/auth/device/*) ──
+    def _cloud_qr_open(self):
+        """进扫码登录态: 出码 worker 起跑, 2s 节流轮询在 _cloud_qr_tick."""
+        self.qrlogin = {"st": "init", "dc": "", "url": "", "mat": None,
+                        "err": ""}
+        self.qr_poll_at = 0.0
+        self.net.invalidate(("job", "cloudqrstart"))
+        self.net.job("cloudqrstart", self._cloud_qrstart_fn, ttl=10)
+
+    def _cloud_qrstart_fn(self):
+        """worker: POST /v1/auth/device/start → segno 矩阵直绘数据."""
+        url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
+        body = json.dumps({"name": "zero"}).encode()
+        st, rbody = netmod.http_raw(url + "/v1/auth/device/start",
+                                    method="POST", body=body, timeout=10,
+                                    headers={"Content-Type":
+                                             "application/json"})
+        try:
+            j = json.loads(rbody.decode("utf-8", "replace"))
+        except ValueError:
+            j = {}
+        if st != 200 or not j.get("device_code"):
+            return {"ok": 0, "st": st,
+                    "err": "HTTP %s" % st if st else "网络异常"}
+        try:
+            import segno
+            q = segno.make(j["url"], error="m")
+            mat = [[1 if v else 0 for v in r] for r in q.matrix]
+        except Exception:
+            return {"ok": 0, "err": "需 pip3 install segno"}
+        return {"ok": 1, "dc": j["device_code"], "url": j["url"], "mat": mat}
+
+    def _cloud_qrpoll_fn(self):
+        """worker: POST /v1/auth/device/poll → pending/approved/done/none."""
+        dc = (self.qrlogin or {}).get("dc", "")
+        url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
+        if not dc:
+            return {"st": "none"}
+        body = json.dumps({"device_code": dc}).encode()
+        st, rbody = netmod.http_raw(url + "/v1/auth/device/poll",
+                                    method="POST", body=body, timeout=8,
+                                    headers={"Content-Type":
+                                             "application/json"})
+        try:
+            j = json.loads(rbody.decode("utf-8", "replace"))
+        except ValueError:
+            j = {}
+        out = {"st": j.get("status"), "token": j.get("token"),
+               "user": j.get("user")}
+        if out["st"] == "approved":
+            st2, b2 = netmod.http_raw(url + "/v1/tombstones?since=0",
+                                      timeout=8,
+                                      headers={"Authorization":
+                                               "Bearer " + out["token"]})
+            if st2 == 200:
+                try:
+                    out["now"] = json.loads(
+                        b2.decode("utf-8", "replace")).get("now")
+                except ValueError:
+                    pass
+        return out
+
+    def _cloud_qr_tick(self):
+        """draw_set 每帧调: 扫码态 2s 节流轮询 (draw 驱动, 离开页面即停)."""
+        if self.qrlogin is None or self.qrlogin.get("st") not in \
+                ("qr", "wait"):
+            return
+        now = time.monotonic()
+        if now - self.qr_poll_at < 2.0:
+            return
+        self.qr_poll_at = now
+        self.net.invalidate(("job", "cloudqrpoll"))
+        self.net.job("cloudqrpoll", self._cloud_qrpoll_fn, ttl=5)
+
     def _set_mask(self, v):
         return ("..." + v[-6:]) if len(v) > 10 else v
 
@@ -4853,6 +4977,7 @@ class App:
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
         border = self.th("border")
+        self._cloud_qr_tick()                  # 扫码登录轮询 (2s 节流)
         self.tool_head(surf, "设置", "←→ 切页 · ↑↓ 选 · Enter 确认")
         # ── TAB 页签栏 ──
         tabs = self.SET_TABS
@@ -4984,6 +5109,34 @@ class App:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
                      self.th("danger"), (box.right - 12, box.y + 53),
                      right=True)
+        # ── 扫码登录 (覆盖): QR 直绘 + 状态行, Esc/q 取消 ──
+        if self.qrlogin is not None:
+            stt = self.qrlogin.get("st")
+            box = pygame.Rect(78, 20, W - 156, H - 28)
+            pygame.draw.rect(surf, self.card(0), box, border_radius=6)
+            pygame.draw.rect(surf, acc, box, 2, border_radius=6)
+            text(surf, "扫码登录", 13, hi, (box.x + 12, box.y + 6))
+            mat = self.qrlogin.get("mat")
+            if mat:
+                n = len(mat)
+                px = min(118 // n, 4)
+                ox = box.x + (box.w - n * px) // 2
+                oy = box.y + 24
+                for my in range(n):
+                    for mx in range(n):
+                        if mat[my][mx]:
+                            pygame.draw.rect(surf, hi,
+                                             (ox + mx * px, oy + my * px,
+                                              px, px))
+            tip = {"init": "出码中…", "qr": "手机扫码 → 网页登录即授权",
+                   "wait": "已扫码? 网页确认后自动登录",
+                   "fail": "失败: %s" % self.qrlogin.get("err", "")[:20],
+                   }.get(stt, "")
+            textc(surf, clip_text(tip, 10, box.w - 20), 10,
+                  acc if stt == "wait" else soft, box.centerx,
+                  box.bottom - 22)
+            text(surf, "Esc 取消", 10, dim,
+                 (box.right - 12, box.bottom - 12), right=True)
         # ── 注册码结果 (覆盖): 任意键关闭 ──
         if self.inv_show is not None:
             code, uses = self.inv_show
