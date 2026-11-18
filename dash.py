@@ -1791,6 +1791,10 @@ class App:
                         self.kv_apply(k, b.get("v"))   # 云端更新 → 覆盖
                     elif lm > cu + 2:
                         self.kv_push(k)                # 本地更新 → 补推
+                else:                          # 云端没存过: 本地非空即首推
+                    local = netmod.load_json_file(KV_FILES[k], None)
+                    if local:
+                        self.kv_push(k)
             elif a == "schedget" and isinstance(b, dict) \
                     and not b.get("skip"):
                 if b.get("ok"):
