@@ -8265,8 +8265,8 @@ class App:
         cw = W // len(entries)
         for j, (name, num) in enumerate(entries):
             x = j * cw
-            text(surf, num, 11, self.th("accent"), (x + 7, y + 7))
-            text(surf, name, 13, self.th("soft"), (x + 24, y + 5))
+            text(surf, num, 12, self.th("accent"), (x + 6, y + 6))
+            text(surf, name, 15, self.th("soft"), (x + 20, y + 3))
 
     def draw_osd(self, surf):
         if not self.osd:
