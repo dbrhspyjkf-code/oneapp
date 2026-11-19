@@ -1651,12 +1651,20 @@ def test_settings_app():
     assert app.theme_idx == 6, app.theme_idx
     import json as json_mod
     assert json_mod.load(open(dash.THEME_FILE)).get("idx") == 6
-    # 主页: USAGE 卡渲染 (真实轮播数据)
+    # 主页: USAGE 卡渲染 (真实轮播数据; GLM=余量+重置 两行, DS=余额)
     app.tool = None
     app.page = 0
-    app.data["usage_glm"] = {"ok": True, "p5": 12, "pw": 34}
-    app.data["usage_ds"] = {"ok": True, "cny": "110.00"}
-    app.draw(canvas)
+    app.data["usage:glm"] = {"ok": True, "p5": 12, "pw": 34,
+                             "r5": 10604, "rw": 57956,
+                             "t5": _time.time() * 1000 + 3600_000}
+    app.data["usage:ds"] = {"ok": True, "cny": "110.00"}
+    app.draw(canvas)                       # GLM 帧
+    app.data["usage:glm"] = {"ok": True, "p5": 12, "pw": 34,
+                             "r5": 980, "rw": None, "t5": None}
+    app.draw(canvas)                       # GLM 缺字段帧 (t5 无 → 只一行)
+    assert dash._kfmt(980) == "980" and dash._kfmt(10604) == "10.6k" \
+        and dash._kfmt(57956) == "58k" and dash._kfmt(None) == "?"
+    app.draw(canvas)                       # DS 帧 (4s 轮播另一态)
     print("settings app OK (tabs/key popup 0600/toggle/remind/theme apply/usage)")
 
 

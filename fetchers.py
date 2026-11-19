@@ -360,8 +360,9 @@ def ipo_fetch():
 
 
 def glm_usage(key):
-    """GLM Coding Plan 用量配额 (Bearer key). → {ok, p5, pw} 5h/周用量百分比.
-    端点同官方 glm-plan-usage 插件: GET /api/monitor/usage/quota/limit."""
+    """GLM Coding Plan 配额 (Bearer key). 端点同官方 glm-plan-usage 插件:
+    GET /api/monitor/usage/quota/limit.
+    → {ok, p5, pw, r5, rw, t5} 5h/周 用量% + 余量 + 5h 窗重置时刻 (epoch ms)."""
     url = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
     try:
         req = urllib.request.Request(
@@ -373,14 +374,18 @@ def glm_usage(key):
             return {"ok": False, "err": str(j.get("msg", ""))[:40]}
         data = j.get("data") or {}
         items = data.get("quota_limits") or data.get("limits") or []
-        p5 = pw = None
+        p5 = pw = r5 = rw = t5 = None
         for it in items:
             u, pc = it.get("unit"), it.get("percentage")
             if u == 3 and pc is not None:
                 p5 = pc                     # unit3 = 5h token 配额
+                r5 = it.get("remaining")
+                t5 = it.get("nextResetTime")
             if u == 6 and pc is not None:
                 pw = pc                     # unit6 = 周 token 配额
-        return {"ok": True, "p5": p5, "pw": pw}
+                rw = it.get("remaining")
+        return {"ok": True, "p5": p5, "pw": pw,
+                "r5": r5, "rw": rw, "t5": t5}
     except Exception as e:
         return {"ok": False, "err": str(e)[:60]}
 

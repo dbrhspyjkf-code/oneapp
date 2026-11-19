@@ -535,6 +535,17 @@ def _cloud_id():
     return "".join(random.choice("0123456789abcdef") for _ in range(12))
 
 
+def _kfmt(n):
+    """配额余量缩写: 980→'980', 10604→'10.6k', 57956→'58k', 缺→'?'."""
+    if n is None:
+        return "?"
+    n = int(n)
+    if n < 1000:
+        return str(n)
+    s = "%.1fk" % (n / 1000.0)
+    return s[:-3] + "k" if s.endswith(".0k") else s
+
+
 def clip_text(s, size, maxw):
     """截断到 maxw 像素宽, 超出加省略号.
     邮件 preview 是 800 字符全文, 逐字符回退测宽是 O(n²) 渲染
@@ -1940,26 +1951,6 @@ class App:
                         and time.monotonic() - self.play_at > 50:
                     self.radio_stop()          # RAOP 预读+连接 50s 没到 = 挂死
                     self.osd = ("AirPlay 未连上", time.monotonic() + 2.0)
-
-    def poll_usage(self):
-        """主页 USAGE 卡: 每 300s 拉一次 GLM/DeepSeek (有 KEY 才拉)."""
-        nowm = time.monotonic()
-        if nowm - self._usage_at <= 300:
-            return
-        self._usage_at = nowm
-        if self.cfg.get("glm_key"):
-            self.net.job("usage:glm", self._usage_fn("glm"), 300)
-        if self.cfg.get("ds_key"):
-            self.net.job("usage:ds", self._usage_fn("ds"), 300)
-
-    def _usage_fn(self, which):
-        key = self.cfg.get("glm_key" if which == "glm" else "ds_key", "")
-
-        def f():
-            if which == "glm":
-                return fetchers.glm_usage(key)
-            return fetchers.ds_balance(key)
-        return f
 
     def poll_usage(self):
         """主页 USAGE 卡: 每 300s 拉一次 GLM/DeepSeek (有 KEY 才拉)."""
@@ -7218,14 +7209,24 @@ class App:
                 if not udat.get("ok"):
                     utxt = "获取中…" if not udat.get("err") \
                         else "失败 " + udat.get("err", "")[:14]
+                    text(surf, utxt, BODY, soft, (cx + 8, vy3))
                 elif ulab == "GLM":
-                    p5, pw = udat.get("p5"), udat.get("pw")
-                    utxt = "GLM 5h %s%% 周 %s%%" % (
-                        p5 if p5 is not None else "?",
-                        pw if pw is not None else "?")
+                    # 两行: 5h/周 余量 + 5h 窗重置时刻 (用户定版: 显余不显用)
+                    text(surf, "GLM 余 %s / %s" % (_kfmt(udat.get("r5")),
+                                                   _kfmt(udat.get("rw"))),
+                         BODY, soft, (cx + 8, topu + 16))
+                    t5 = udat.get("t5")
+                    if t5:
+                        lt5 = time.localtime(t5 / 1000.0)
+                        if lt5[:3] == time.localtime()[:3]:   # 今天 → 只显时刻
+                            rt = "%02d:%02d" % (lt5.tm_hour, lt5.tm_min)
+                        else:
+                            rt = "%02d-%02d %02d:%02d" % (lt5.tm_mon,
+                                 lt5.tm_mday, lt5.tm_hour, lt5.tm_min)
+                        text(surf, "重置 %s" % rt, 10, dim, (cx + 8, topu + 31))
                 else:
-                    utxt = "DS 余额 ¥%s" % (udat.get("cny") or "?")
-                text(surf, utxt, BODY, soft, (cx + 8, vy3))
+                    text(surf, "DS 余额 ¥%s" % (udat.get("cny") or "?"),
+                         BODY, soft, (cx + 8, vy3))
         # 提醒/行程卡: 最近条目单行居中, 3s 轮播 (300s 节流后台拉新)
         tops_s = tops.get("提醒/行程")
         if tops_s is not None:
