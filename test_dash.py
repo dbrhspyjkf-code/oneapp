@@ -708,7 +708,8 @@ def test_music():
 
 def test_mu_airplay():
     """音乐 AirPlay: 输出恢复/7 键循环+持久化/起播产端命令与消费端 argv/
-    mu_tick 双判据 (消费端退=曲终)/音量路由."""
+    mu_tick 双判据 (消费端退=曲终)/音量路由/外地死路隔离+16s 连接超时回本机/
+    本地时长探针记忆化."""
     import shutil as _sh
     import dash
 
@@ -717,9 +718,11 @@ def test_mu_airplay():
     tmp = tempfile.mkdtemp(prefix="onemuap")
     real_last, real_out = dash.MU_LAST_CACHE, dash.MU_OUT_CACHE
     real_cache = dash.RAOP_CACHE
+    real_net = dash._raop_local_net
     dash.MU_LAST_CACHE = os.path.join(tmp, "mu_last.json")
     dash.MU_OUT_CACHE = os.path.join(tmp, "mu_out.json")
     dash.RAOP_CACHE = os.path.join(tmp, "raop.json")
+    dash._raop_local_net = lambda: "1.1.1"    # 模拟"在家里" (音箱同网段)
     devs = [{"ip": "1.1.1.4", "port": 7000, "name": "A音箱", "id": "ida"},
             {"ip": "1.1.1.8", "port": 7000, "name": "B音箱", "id": "idb"}]
     netmod.save_json_file(dash.RAOP_CACHE, devs)
@@ -866,9 +869,92 @@ def test_mu_airplay():
         finally:
             dash.App._raop_volume = real_vol
         print("mu airplay OK (restore/cycle/cmd/argv/tick/vol)")
+
+        # ── 外地/换网 (音箱不在本网段): 5 键不进死路 + 僵会话回本机 ──
+        dash._raop_local_net = lambda: "9.9.9"
+        app.mu_out = 1
+        app.raop = devs
+        app.mu_playing = None
+        app.mu_proc = None
+        app.mu_ff = None
+        app.mu_view = "play"              # 上一段曲终 mu_view 已回 src
+        app.key(pygame.K_5)               # 未播放: 归位本机 + 明示本网段无音箱
+        assert app.mu_out == 0, app.mu_out
+        assert app.osd[0] == "无可用 AirPlay 音箱 (本网段)", app.osd
+        assert netmod.load_json_file(dash.MU_OUT_CACHE, {}) == {"id": ""}
+
+        # 本地时长探针记忆化: 首次 ffprobe 记回条目, 之后起播不再探
+        # (CM0 上 UI 线程同步 ffprobe = 播放/续播/切输出卡顿元凶)
+        probed = []
+        real_probe = dash.mu_probe_dur
+        dash.mu_probe_dur = lambda p: (probed.append(p) or 88.0)
+        loc = {"path": "/tmp/x.mp3", "title": "L"}     # 无 dur
+        app.mu_files = [loc]
+        real_pop2 = dash.subprocess.Popen
+        dash.subprocess.Popen = fake_popen
+        try:
+            app.mu_play(0)
+            app.mu_stop()
+            app.mu_play(0)
+            assert probed == ["/tmp/x.mp3"], probed    # 第二次不再探
+            assert loc.get("dur") == 88.0
+        finally:
+            dash.subprocess.Popen = real_pop2
+            dash.mu_probe_dur = real_probe
+
+        healed = []
+        real_mu_play = dash.App.mu_play
+        dash.App.mu_play = \
+            lambda self, i, p=0.0: healed.append((i, round(p, 1)))
+        try:
+            app.mu_playing = {"path": "/x.wav", "title": "T", "dur": 90}
+            app.mu_files = [app.mu_playing]
+            app.mu_play_idx = 0
+            app.mu_paused = False
+            app.mu_pos0, app.mu_t0 = 30.0, _time.monotonic() - 5
+            app.mu_proc = _P(["ffmpeg"], "prod")
+            app.mu_ff = _P([sys.executable, "-c"], "cons")   # 僵会话: 消费端
+            app.mu_aud_up = None                             #   活着但连不上
+            app.mu_out = 1
+            app.key(pygame.K_5)           # 播放中 → 僵会话立即回本机同位续播
+            assert app.mu_out == 0 and healed == [(0, 30.0)], (app.mu_out,
+                                                               healed)
+
+            # 16s 连接超时看门狗: RAOP-UP 未到 → mu_tick 自动回本机
+            app.mu_proc = _P(["ffmpeg"], "prod")
+            app.mu_ff = _P([sys.executable, "-c"], "cons")
+            app.mu_out = 1
+            app.mu_is_raop = True
+            app.mu_raop_t0 = _time.monotonic() - 20
+            app.mu_aud_up = None
+            app.mu_advance = True
+            app.mu_tick()
+            assert app.mu_out == 0 and len(healed) == 2, (app.mu_out, healed)
+            assert app.mu_is_raop is False and app.mu_raop_t0 is None
+            # 刚起播 (t0 新鲜): 不触发
+            app.mu_proc = _P(["ffmpeg"], "prod")
+            app.mu_ff = _P([sys.executable, "-c"], "cons")
+            app.mu_is_raop = True
+            app.mu_raop_t0 = _time.monotonic()
+            app.mu_aud_up = None
+            app.mu_tick()
+            assert len(healed) == 2
+            # 本机会话 (mu_is_raop=False): 看门狗永不误杀
+            app.mu_proc = _P(["ffplay"], "prod")
+            app.mu_ff = None
+            app.mu_is_raop = False
+            app.mu_raop_t0 = _time.monotonic() - 99
+            app.mu_aud_up = None
+            app.mu_tick()
+            assert len(healed) == 2 and app.mu_proc is not None
+            app.mu_kill()                 # 清场
+        finally:
+            dash.App.mu_play = real_mu_play
+        print("mu airplay OK (travel-dead-end/watchdog/probe-cache)")
     finally:
         dash.MU_LAST_CACHE, dash.MU_OUT_CACHE = real_last, real_out
         dash.RAOP_CACHE = real_cache
+        dash._raop_local_net = real_net
         _sh.rmtree(tmp, ignore_errors=True)
 
 
@@ -882,6 +968,8 @@ def test_radio_out():
     tmp = tempfile.mkdtemp(prefix="oneapp")
     dash.RAOP_CACHE = os.path.join(tmp, "raop.json")
     dash.RADIO_OUT_FILE = os.path.join(tmp, "radio_out.json")
+    real_net = dash._raop_local_net
+    dash._raop_local_net = lambda: "1.2.3"    # 模拟"在家里" (设备同网段)
     try:
         # 过滤: 只留音箱 (电视/电脑/手机剔除, 缺 ip/id 剔除)
         assert dash._raop_ok({"ip": "1.2.3.4", "id": "x", "name": "起居室HOMEPOD"})
@@ -890,10 +978,31 @@ def test_radio_out():
         assert not dash._raop_ok({"ip": "1.2.3.4", "id": "x", "name": "iPhone"})
         assert not dash._raop_ok({"ip": "1.2.3.4", "name": "音箱"})   # 无 id
         assert not dash._raop_ok({"id": "x", "name": "音箱"})         # 无 ip
+        # 网段过滤: 外地 (本机在 9.9.9.x) 时家里缓存音箱不可用 → 空表
+        dash._raop_local_net = lambda: "9.9.9"
+        appf = dash.App(FakeNet())
+        appf.raop = devs = [{"ip": "1.2.3.4", "port": 7000, "name": "A音箱",
+                             "id": "ida"}]
+        assert appf._raop_avail() == []
+        dash._raop_local_net = lambda: "1.2.3"
+        assert [d["id"] for d in appf._raop_avail()] == ["ida"]
+        assert appf._raop_avail() is not appf.raop   # 过滤副本不混用缓存对象表
 
-        # 缓存恢复: radio_out.json 按设备 id 对位 → radio_out=2; 未知 id → 0
+        # 缓存恢复: radio_out.json 按设备 id 对位 → radio_out=2; 未知 id → 0;
+        # 外地 (设备不在本网段) → 不恢复死路选择, 归位 0
         devs = [{"ip": "1.2.3.4", "port": 7000, "name": "A音箱", "id": "ida"},
-                {"ip": "5.6.7.8", "port": 7000, "name": "B音箱", "id": "idb"}]
+                {"ip": "1.2.3.8", "port": 7000, "name": "B音箱", "id": "idb"}]
+        netmod.save_json_file(dash.RAOP_CACHE, devs)
+        netmod.save_json_file(dash.RADIO_OUT_FILE, "idb")
+        app = dash.App(FakeNet())
+        assert app.radio_out == 2, app.radio_out
+        assert app.radio_out_name() == "AirPlay·B音箱"
+        netmod.save_json_file(dash.RADIO_OUT_FILE, "gone")
+        assert dash.App(FakeNet()).radio_out == 0
+        netmod.save_json_file(dash.RADIO_OUT_FILE, "idb")
+        dash._raop_local_net = lambda: "9.9.9"
+        assert dash.App(FakeNet()).radio_out == 0, "外地不应恢复死路输出"
+        dash._raop_local_net = lambda: "1.2.3"
         netmod.save_json_file(dash.RAOP_CACHE, devs)
         netmod.save_json_file(dash.RADIO_OUT_FILE, "idb")
         app = dash.App(FakeNet())
@@ -967,7 +1076,33 @@ def test_radio_out():
         app4.page = 2
         app4.raop = []
         app4.key(pygame.K_o)
-        assert app4.radio_out == 0 and app4.osd[0] == "无 AirPlay 设备"
+        assert app4.radio_out == 0 \
+            and app4.osd[0] == "无 AirPlay 设备 (本网段无音箱)", app4.osd
+
+        # 外地 (缓存音箱不在本网段): O 键不再循环进死路 — 归位本机 +
+        # 播放中的 AirPlay 僵会话立即回本机重放 (2026-11-19 外地卡死实证)
+        dash._raop_local_net = lambda: "9.9.9"
+        app4b = dash.App(FakeNet())
+        app4b.page = 2
+        app4b.raop = devs
+        app4b.radio_out = 1
+        stk = app4b.radio_list(1)[0]
+        app4b.playing_key = stk["key"]        # 模拟 AirPlay 会话中 (真台 key)
+        replayed = []
+        real_rplay = dash.App.radio_play
+        dash.App.radio_play = \
+            lambda self, st: replayed.append(st["key"])
+        try:
+            app4b.key(pygame.K_o)
+            assert app4b.radio_out == 0, app4b.radio_out
+            assert app4b.osd[0] == "无 AirPlay 设备 (本网段无音箱)"
+            assert replayed == [stk["key"]], replayed   # 僵会话回本机重放
+            app4b.playing_key = None
+            app4b.key(pygame.K_o)                # 未播放: 只提示不重放
+            assert app4b.radio_out == 0 and replayed == [stk["key"]]
+        finally:
+            dash.App.radio_play = real_rplay
+        dash._raop_local_net = lambda: "1.2.3"
 
         # RAOP 起播失败 → 回落本机 (radio_out 归零, 本机 Popen 也败 → 播放失败)
         class Boom:
@@ -1118,6 +1253,7 @@ def test_radio_out():
             "radio_stop 未杀掉忽略 SIGTERM 的进程 (futex 僵尸复现)"
         print("radio out OK (filter/restore/cycle/fallback/keys/vol/kill)")
     finally:
+        dash._raop_local_net = real_net
         _sh.rmtree(tmp, ignore_errors=True)
 
 

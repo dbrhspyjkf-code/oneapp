@@ -174,6 +174,20 @@ def _raop_ok(d):
                 and not _RAOP_SKIP.search(d.get("name") or ""))
 
 
+def _raop_local_net():
+    """本机当前网段 ("192.168.1" 形态); 拿不到 → "" (调用方不过滤, 保守).
+    UDP connect 不实际发包, 只取默认路由源地址; 无路由时放行不过滤."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("223.5.5.5", 80))
+            return s.getsockname()[0].rsplit(".", 1)[0]
+        finally:
+            s.close()
+    except Exception:
+        return ""
+
+
 # 子进程入口统一走 -c 包装: pyatv CLI 用 asyncio.get_event_loop(), py3.14
 # 已移除隐式建环 (Mac 模拟 3.14 崩, 设备 3.13 也统一走这条, 一份代码两端跑)。
 _ATVR_SCAN = r'''
@@ -1361,9 +1375,10 @@ class App:
                      if isinstance(d, dict) and _raop_ok(d)]
         self.radio_out = 0
         _oid = netmod.load_json_file(RADIO_OUT_FILE, "")
-        if _oid:
-            self.radio_out = next(
-                (i + 1 for i, d in enumerate(self.raop) if d.get("id") == _oid), 0)
+        if _oid:                              # 恢复只认本网段可用设备 (外地
+            self.radio_out = next(            # 不把死路音箱当当前输出恢复)
+                (i + 1 for i, d in enumerate(self._raop_avail())
+                 if d.get("id") == _oid), 0)
         self._raop_scanned = bool(self.raop)  # 空缓存: 进电台页后台补扫一次
         self.vu = [3.0] * 12                  # VU 条 (car-dash vuTick 同款)
         self.vu_pk = [3.0] * 12
@@ -1446,10 +1461,13 @@ class App:
         self.mu_out = 0
         _mo = netmod.load_json_file(MU_OUT_CACHE, {})
         _moid = _mo.get("id") if isinstance(_mo, dict) else ""
-        if _moid:
-            self.mu_out = next(
-                (i + 1 for i, d in enumerate(self.raop) if d.get("id") == _moid), 0)
+        if _moid:                             # 恢复只认本网段可用设备 (外地
+            self.mu_out = next(               # 不把死路音箱当当前输出恢复)
+                (i + 1 for i, d in enumerate(self._raop_avail())
+                 if d.get("id") == _moid), 0)
         self.mu_prod_dead_at = None           # AirPlay 产端死而消费端未退的起始
+        self.mu_is_raop = False               # 当前会话是 AirPlay (连接超时
+        self.mu_raop_t0 = None                #   看门狗 16s 无声 → 回本机)
         self.news_src_i = 0                   # 新闻源索引
         self.news_sel = 0
         self.news_scroll = 0
@@ -2346,32 +2364,54 @@ class App:
         return next((s for s in radio_stations.STATIONS
                      if s["key"] == key), None)
 
+    def _raop_avail(self):
+        """当前网段可用的音箱: 缓存里的家里音箱在外地 (不同网段) 根本连不
+        上, 输出循环不提供死路 (按 O/5 一路跳进不可达音箱 = 卡死无声音的
+        根因, 2026-11-19); 网段拿不到 (无路由) 时放行不过滤."""
+        net = _raop_local_net()
+        if not net:
+            return self.raop
+        return [d for d in self.raop
+                if (d.get("ip") or "").rsplit(".", 1)[0] == net]
+
     def radio_out_name(self):
-        """输出名: 本机 / AirPlay·<设备名>."""
-        if self.radio_out == 0 or not self.raop:
+        """输出名: 本机 / AirPlay·<设备名> (只按可用设备表取名)."""
+        raop = self._raop_avail()
+        if self.radio_out == 0 or not raop:
             return "本机"
-        d = self.raop[min(self.radio_out - 1, len(self.raop) - 1)]
+        d = raop[min(self.radio_out - 1, len(raop) - 1)]
         return "AirPlay·%s" % d.get("name", "?")
 
     def _raop_dev(self):
-        """当前输出对应的 RAOP 设备 (越界回落 None=本机)."""
-        if self.radio_out >= 1 and self.raop:
-            return self.raop[min(self.radio_out - 1, len(self.raop) - 1)]
+        """当前输出对应的 RAOP 设备 (越界/不在本网段 → None=本机)."""
+        raop = self._raop_avail()
+        if self.radio_out >= 1 and raop:
+            return raop[min(self.radio_out - 1, len(raop) - 1)]
         return None
 
     def radio_out_cycle(self):
         """O 键: 输出 本机→AirPlay 设备循环; 播放中换输出 = 旧输出停 +
-        新输出续播同台 (dash 电台 o 键同款). 无设备时提示并保持本机."""
-        if not self.raop:
+        新输出续播同台 (dash 电台 o 键同款). 本网段无可用设备时归位本机
+        (外地/换网: 不再循环进不可达的死路音箱)."""
+        raop = self._raop_avail()
+        if not raop:
             self._raop_scan_lazy()            # 首按 O 顺带触发一次后台补扫
-            self.osd = ("无 AirPlay 设备", time.monotonic() + 1.5)
+            self.radio_out = 0                # 死路选择归位本机
+            netmod.save_json_file(RADIO_OUT_FILE, "")
+            self.osd = ("无 AirPlay 设备 (本网段无音箱)",
+                        time.monotonic() + 1.5)
+            if self.playing_key:              # AirPlay 僵会话 → 回本机重放
+                st = self.radio_st_by_key(self.playing_key)
+                self.radio_stop()
+                if st:
+                    self.radio_play(st)
             return
         prev = self.playing_key
         if prev:
             self.radio_stop()                 # 先停旧输出 (必须在改 radio_out 前)
-        self.radio_out = (self.radio_out + 1) % (len(self.raop) + 1)
+        self.radio_out = (self.radio_out + 1) % (len(raop) + 1)
         netmod.save_json_file(RADIO_OUT_FILE,
-                              self.raop[self.radio_out - 1].get("id", "")
+                              raop[self.radio_out - 1].get("id", "")
                               if self.radio_out >= 1 else "")
         self.osd = ("输出: %s" % self.radio_out_name(),
                     time.monotonic() + 1.5)
@@ -2678,16 +2718,21 @@ class App:
         dur = f.get("dur") or 0
         if not dur and target and not target.startswith("http"):
             dur = mu_probe_dur(target)        # 起播前探: 无 ffplay 抢 CPU
+            if dur > 0:
+                f["dur"] = dur                # 记回条目: 之后播放/续播/seek/
+                                              # 切输出不再在 UI 线程跑 ffprobe
         if f.get("preview"):
             dur = min(dur, 30) or 30          # TRY 试听: 进度条按 30s 计
         if self.mu_out >= 1:
-            dev = self.raop[min(self.mu_out - 1, len(self.raop) - 1)] \
-                if self.raop else None
+            raop = self._raop_avail()
+            dev = raop[min(self.mu_out - 1, len(raop) - 1)] \
+                if raop else None
             if dev and self._mu_play_raop(idx, f, target, pos, dur, dev):
                 return
             self.mu_out = 0                   # 无设备/起播失败 → 回落本机
             if dev is None:
-                self.osd = ("无 AirPlay 设备, 已切本机", time.monotonic() + 2.0)
+                self.osd = ("无可用 AirPlay 音箱, 已切本机",
+                            time.monotonic() + 2.0)
         cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-vn"]
         if target.startswith("http"):
             cmd += ["-infbuf", "-reconnect", "1", "-reconnect_streamed", "1",
@@ -2705,6 +2750,8 @@ class App:
             return
         self.mu_ff = None                     # 本机路径 (锚点交给 VU 首响)
         self.mu_proc_at = time.monotonic()    # 出声锚点交给 VU 首响
+        self.mu_is_raop = False               # 连接超时看门狗只管 AirPlay 会话
+        self.mu_raop_t0 = None
         self.lvl.start_parec()                # pulse monitor 采电平
         self._mu_common(idx, f, pos, dur)
 
@@ -2786,6 +2833,8 @@ class App:
                 pass
         self.mu_ff = cons
         sess = self.mu_sess
+        self.mu_is_raop = True                # 连接超时看门狗生效 (16s 无声→回本机)
+        self.mu_raop_t0 = time.monotonic()
         threading.Thread(target=self._mu_raop_watch, args=(cons, sess),
                          daemon=True).start()
         self.lvl.start_fifo(vufifo)           # 读端 NONBLOCK 开, 不与写端互等
@@ -3011,6 +3060,8 @@ class App:
         self.mu_ff = None
         self._vol_fifo_close()                # 音量命令通道随会话关
         self.mu_prod_dead_at = None
+        self.mu_raop_t0 = None                # 连接超时看门狗随会话重置
+        self.mu_is_raop = False
 
     def mu_stop(self):
         """x 键/切换曲目/退出连播末尾: 全停 (状态清空, 回列表)."""
@@ -3085,29 +3136,46 @@ class App:
 
     def mu_out_name(self):
         """音乐输出名: 本机 / AirPlay·<设备名> (电台共用设备表, 选择独立)."""
-        if self.mu_out == 0 or not self.raop:
+        raop = self._raop_avail()
+        if self.mu_out == 0 or not raop:
             return "本机"
-        d = self.raop[min(self.mu_out - 1, len(self.raop) - 1)]
+        d = raop[min(self.mu_out - 1, len(raop) - 1)]
         return "AirPlay·%s" % d.get("name", "?")
 
     def _mu_out_save(self):
         """输出选择持久化 (按设备 id; 重启恢复上次输出)."""
         try:
-            did = (self.raop[self.mu_out - 1].get("id")
-                   if 1 <= self.mu_out <= len(self.raop) else "")
+            raop = self._raop_avail()
+            did = (raop[self.mu_out - 1].get("id")
+                   if 1 <= self.mu_out <= len(raop) else "")
             netmod.save_json_file(MU_OUT_CACHE, {"id": did})
         except Exception:
             pass
 
     def mu_out_cycle(self):
-        """7 键: 本机 → 各 AirPlay 设备 → 本机 循环; 播放中换输出 = 停旧
-        进程 + 同曲同位续播 (暂停中只切路由, 恢复时才起新进程)."""
-        if not self.raop:
-            self._raop_scan_lazy()            # 空表: 触发一次后台补扫
+        """5/7 键: 本机 → 各 AirPlay 设备 → 本机 循环 (只循环本网段可用
+        音箱); 播放中换输出 = 停旧进程 + 同曲同位续播 (暂停中只切路由,
+        恢复时才起新进程). 外地/换网时缓存音箱不可达 → 归位本机不中断."""
+        raop = self._raop_avail()
+        if not raop:
+            if self.mu_out:
+                self.mu_out = 0               # 死路选择归位本机
+                self._mu_out_save()
+            if self.raop:                     # 有缓存但不在本网段 (外地)
+                self.osd = ("无可用 AirPlay 音箱 (本网段)",
+                            time.monotonic() + 2.0)
+                if (self.mu_playing and not self.mu_paused
+                        and self.mu_proc is not None
+                        and self.mu_ff is not None):
+                    pos = self.mu_wall_pos()  # AirPlay 僵会话 → 回本机续播
+                    self.mu_kill()
+                    self.mu_play(self.mu_play_idx, pos)
+                return
+            self._raop_scan_lazy()            # 真没扫到过: 触发一次后台补扫
             self.osd = ("无 AirPlay 设备 (扫描中…, 稍后再按)",
                         time.monotonic() + 2.0)
             return
-        self.mu_out = (self.mu_out + 1) % (len(self.raop) + 1)
+        self.mu_out = (self.mu_out + 1) % (len(raop) + 1)
         self._mu_out_save()
         if self.mu_playing is None:
             self.osd = ("输出: %s" % self.mu_out_name(),
@@ -3117,7 +3185,11 @@ class App:
             self.osd = ("输出: %s (恢复时生效)" % self.mu_out_name(),
                         time.monotonic() + 1.5)
             return                           # 暂停/无进程: 状态原样
-        self.osd = ("AirPlay 连接中… (~15s)", time.monotonic() + 3.0)
+        if self.mu_out == 0:                 # 切回本机: 秒切, 别再说"连接中"
+            self.osd = ("输出: 本机", time.monotonic() + 1.5)
+        else:
+            self.osd = ("%s 连接中… (~15s)" % self.mu_out_name(),
+                        time.monotonic() + 3.0)
         pos = self.mu_wall_pos()
         self.mu_kill()
         self.mu_play(self.mu_play_idx, pos)
@@ -3141,6 +3213,21 @@ class App:
                     r = self.mu_retries           # 重试重生不刷新额度 (防无限)
                     self.mu_play(self.mu_play_idx, self.mu_pos0)
                     self.mu_retries = r
+            return
+        # AirPlay 连接超时看门狗: RAOP-UP 16s 未到 (音箱不可达/掉线/外地死
+        # 路) → 消费端每 3s 重试永远"活着", 产端活着喂管道 = 僵会话永不出
+        # 声也不报错 (2026-11-19 用户外地实证) → 回本机同位续播. 每次起播
+        # 重置 t0, 家里正常连接 ~10s 内不会误伤.
+        if (self.mu_is_raop and self.mu_aud_up is None and self.mu_raop_t0
+                and time.monotonic() - self.mu_raop_t0 > 16.0):
+            self.mu_is_raop = False
+            self.mu_raop_t0 = None
+            pos = self.mu_pos0                    # 墙钟冻结着, 直接用起点位
+            self.mu_out = 0
+            self._mu_out_save()
+            self.osd = ("音箱连不上, 已切本机", time.monotonic() + 2.5)
+            self.mu_kill()
+            self.mu_play(self.mu_play_idx, pos)
             return
         is_raop = self.mu_ff is not None
         if is_raop and self.mu_proc.poll() is not None \
