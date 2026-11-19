@@ -7681,8 +7681,8 @@ class App:
             pygame.draw.rect(surf, acc if sel else border, rect,
                              2 if sel else 1, border_radius=5)
             text(surf, str((i + 1) % 10), 10, acc, (x + 5, y + 3))
-            textc(surf, name, 13, hi if sel else soft, x + cw // 2,
-                  y + (ch - 13) // 2)
+            textc(surf, name, 15, hi if sel else soft, x + cw // 2,
+                  y + (ch - 15) // 2)
 
     # ── 工具·万年历 (原工具页月视图收编) ──
     def draw_cal_app(self, surf):
