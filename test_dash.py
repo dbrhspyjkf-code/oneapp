@@ -2138,9 +2138,11 @@ def test_kv_sync():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     fr = os.path.join(tmp, "radio_fav.json")
     fw = os.path.join(tmp, "watch.json")
-    dash.KV_FILES.update({"radio_fav": fr, "watch": fw})
+    ftv = os.path.join(tmp, "tv_fav.json")
+    dash.KV_FILES.update({"radio_fav": fr, "watch": fw, "tv_fav": ftv})
     dash.RADIO_FAV_CACHE = fr
     dash.WATCH_FILE = fw
+    dash.TV_FAV_CACHE = ftv
     json.dump({"cloud_tok": "t" * 24, "cloud_user": "u"},
               open(dash.SETTINGS_FILE, "w"))
     orig_raw = netmod.http_raw
@@ -2214,16 +2216,55 @@ def test_kv_sync():
         d = app.net.last_job("kvalign:tv_fav")()
         app.on_net("data", "kvalign:tv_fav", d)
         assert app.kv_queue == []          # 队列走完
-        # 未登录: 不入队不推
+        # 网络失败 (st=0): 不裁决不首推 (开机 WiFi 未就绪时, 旧码会把陈旧
+        # 本地推上去盖掉云端别的端的新收藏); None 结果不落缓存 → 可重试
+        netmod.http_raw = lambda url, **k: (0, b"")
+        assert app.net.last_job("kvsync:radio_fav")() is None
+        n_puts = len([t for t, _ in app.net.jobs if t.startswith("kvput:")])
+        app.on_net("error", "kvsync:radio_fav", None)   # worker 对 None 真实投递
+        assert len([t for t, _ in app.net.jobs
+                    if t.startswith("kvput:")]) == n_puts
+        # 404 (云端真没存过) + 本地非空 → 仍首推 (kv 首推缺口修复不回退)
+        netmod.http_raw = lambda url, **k: (404, b'{"err": "no such key"}')
+        app.on_net("data", "kvsync:watch",
+                   app.net.last_job("kvsync:watch")())
+        assert app.net.last_job("kvput:watch") is not None
+        # 进页兜底拉取 kv_pull: 登录态入队
+        n_jobs = len(app.net.jobs)
+        app.kv_pull("radio_fav")
+        assert app.net.jobs[-1][0] == "kvsync:radio_fav"
+        assert len(app.net.jobs) == n_jobs + 1
+        # kv_apply 光标钳回: 收藏组开着时云端列表变短 → rsel/tv_sel 收缩
+        import radio_stations
+        import tv_channels
+        ks = [s["key"] for s in radio_stations.STATIONS][:2]
+        ns = [c[0] for c in tv_channels.CHANNELS][:2]
+        app.radio_grp = 0
+        app.rsel = 5
+        app.tv_grp = 0
+        app.tv_sel = 4
+        os.utime(fr, (now - 100, now - 100))   # 本地明显旧 → 云端裁决胜出
+        app.on_net("data", "kvsync:radio_fav",
+                   {"ok": 1, "st": 200, "v": ks, "updated": now})
+        assert app.radio_fav == ks
+        assert app.rsel <= 1, app.rsel
+        app.on_net("data", "kvsync:tv_fav",
+                   {"ok": 1, "st": 200, "v": ns, "updated": now})
+        assert app.tv_sel <= 1, app.tv_sel
+        # 未登录: 不入队不推 (kv_pull 同)
         app2 = dash.App(FakeNet())
         app2.cfg["cloud_tok"] = ""
+        n2 = len(app2.net.jobs)
+        app2.kv_pull("radio_fav")
+        assert len(app2.net.jobs) == n2     # 静默跳过
         app2.radio_fav_save()
         assert app2.net.last_job("kvput:radio_fav") is None
     finally:
         netmod.http_raw = orig_raw
     print("kv_sync OK (boot-pull/lww-apply/lww-push/change-push/"
           "align-confirm/modal-swallow/enter-upload/esc-overwrite/"
-          "no-push-on-apply/not-logged-in)")
+          "no-push-on-apply/not-logged-in/netfail-no-push/404-first-push/"
+          "page-pull/clamp)")
 
 
 

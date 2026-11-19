@@ -1809,10 +1809,12 @@ class App:
                         self.kv_apply(k, b.get("v"))   # 云端更新 → 覆盖
                     elif lm > cu + 2:
                         self.kv_push(k)                # 本地更新 → 补推
-                else:                          # 云端没存过: 本地非空即首推
+                elif b.get("st") == 404:       # 云端没存过: 本地非空即首推
                     local = netmod.load_json_file(KV_FILES[k], None)
                     if local:
                         self.kv_push(k)
+                # (st==0 网络失败: 不裁决不首推 — 首推会把陈旧本地盖掉
+                #  云端别的端的新收藏, 开机 WiFi 未就绪时必踩)
             elif a == "schedget" and isinstance(b, dict) \
                     and not b.get("skip"):
                 if b.get("ok"):
@@ -1902,6 +1904,8 @@ class App:
                 self.net.pub(wx_url(self.wx_loc), "wx", 600, direct=True)
             if self.page == 2:
                 self._raop_scan_lazy()        # 空缓存时进电台页后台补扫一次
+                self.kv_pull("radio_fav")     # 电台收藏云端拉取 (开机拉取
+                                              #   失败/跨端变更的兜底, TTL 节流)
             if self.page == 3:
                 self.net.job("ipo", fetchers.ipo_fetch, 1800)   # 顶部跑马灯
                 self.net.pub_text(QT_BASE + ",".join(
@@ -2297,6 +2301,8 @@ class App:
                                    timeout=8,
                                    headers={"Authorization":
                                             "Bearer " + tok})
+        if st == 0:                       # 网络不可达: 返回 None → 结果不落
+            return None                   #   job 缓存 (可重试) 且不进裁决
         try:
             j = json.loads(body.decode("utf-8", "replace"))
         except Exception:
@@ -2311,6 +2317,14 @@ class App:
             self.net.invalidate(("job", "kvsync:" + k))
             self.net.job("kvsync:" + k, lambda k=k: self._kv_get_fn(k),
                          ttl=10)
+
+    def kv_pull(self, k, ttl=60):
+        """页面级静默拉取 (开机 LWW 的兜底): 开机拉取撞上 WiFi 未就绪
+        或别的端刚改过 → 进页补拉. TTL 节流; 失败结果不落缓存 →
+        每秒 poll 自动重试到成功为止. 裁决同 kvsync LWW."""
+        if self.cfg.get("cloud_tok"):
+            self.net.job("kvsync:" + k, lambda k=k: self._kv_get_fn(k),
+                         ttl=ttl)
 
     def kv_align_trigger(self):
         """登录成功后: 逐服务本地 vs 云端对齐; 本地有记录→确认框."""
@@ -2358,6 +2372,13 @@ class App:
             val = [x for x in (v or []) if isinstance(x, str)]
             setattr(self, k, val)
             netmod.save_json_file(KV_FILES[k], val)
+            if k == "radio_fav" and self.radio_grp == 0:
+                # 页面正开着收藏组: 列表可能变短, 光标钳回 (缺台被剔再缩一截)
+                self.rsel = min(self.rsel,
+                                max(0, len(self.radio_list()) - 1))
+            elif k == "tv_fav" and self.tv_grp == 0:
+                self.tv_sel = min(self.tv_sel,
+                                  max(0, len(self.tv_list()) - 1))
 
     def radio_st_by_key(self, key):
         import radio_stations
@@ -5394,6 +5415,7 @@ class App:
             self.mu_view = "play"             # 主页=播放页 (空态显示无标题, 9 选源)
         if tid == "tv":
             self.tv_restore()                 # 恢复上次分组/光标
+            self.kv_pull("tv_fav")            # 电视收藏云端拉取 (电台同款兜底)
         if tid == "sched":
             self.sched_refresh(False)         # 进卡拉取 (TTL 300s 节流)
 
