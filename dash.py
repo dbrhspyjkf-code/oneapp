@@ -535,17 +535,6 @@ def _cloud_id():
     return "".join(random.choice("0123456789abcdef") for _ in range(12))
 
 
-def _kfmt(n):
-    """配额余量缩写: 980→'980', 10604→'10.6k', 57956→'58k', 缺→'?'."""
-    if n is None:
-        return "?"
-    n = int(n)
-    if n < 1000:
-        return str(n)
-    s = "%.1fk" % (n / 1000.0)
-    return s[:-3] + "k" if s.endswith(".0k") else s
-
-
 def clip_text(s, size, maxw):
     """截断到 maxw 像素宽, 超出加省略号.
     邮件 preview 是 800 字符全文, 逐字符回退测宽是 O(n²) 渲染
@@ -7211,9 +7200,12 @@ class App:
                         else "失败 " + udat.get("err", "")[:14]
                     text(surf, utxt, BODY, soft, (cx + 8, vy3))
                 elif ulab == "GLM":
-                    # 两行: 5h/周 余量 + 5h 窗重置时刻 (用户定版: 显余不显用)
-                    text(surf, "GLM 余 %s / %s" % (_kfmt(udat.get("r5")),
-                                                   _kfmt(udat.get("rw"))),
+                    # 两行: 5H/7D 用量% + 5h 窗重置时刻 (用户定版 2026-11-19)
+                    text(surf, "GLM 5H %s%% / 7D %s%%" % (
+                            udat.get("p5") if udat.get("p5") is not None
+                            else "?",
+                            udat.get("pw") if udat.get("pw") is not None
+                            else "?"),
                          BODY, soft, (cx + 8, topu + 16))
                     t5 = udat.get("t5")
                     if t5:
