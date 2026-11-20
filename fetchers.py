@@ -327,17 +327,74 @@ _SSQ_OCR_PROMPT = (
 
 def ssq_capture_photo(out_path, timeout=12):
     """摄像头单拍 (rpicam-jpeg one-shot). 成功返回文件大小, 失败 None.
-    IMX219 CSI (2026-11-19 实测: 1280x720 q70 ~89KB 数秒出片)."""
+    IMX219 CSI (2026-11-19 实测: 1280x720 q70 ~89KB 数秒出片).
+    --rotation 180: ZERO 摄像头 180° 倒装 (2026-11-20 用户实测照片倒置)."""
     import subprocess
     try:
         subprocess.run(
             ["rpicam-jpeg", "-o", out_path, "--width", "1280", "--height",
-             "720", "--quality", "70", "--nopreview"],
+             "720", "--quality", "70", "--nopreview", "--rotation", "180"],
             timeout=timeout,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return os.path.getsize(out_path)
     except Exception:
         return None
+
+
+_prev_proc = None
+
+
+def ssq_preview_iter(w=320, h=240, fps=8):
+    """实时取景流: rpicam-vid mjpeg → 逐帧 yield JPEG bytes (碎块剔除).
+    消费侧 break/异常即 terminate 进程 (生成器 finally 兜底)."""
+    import subprocess
+    global _prev_proc
+    cmd = ["rpicam-vid", "--nopreview", "--width", str(w), "--height",
+           str(h), "--framerate", str(fps), "--rotation", "180",
+           "--codec", "mjpeg", "--timeout", "0", "-o", "-"]
+    try:
+        _prev_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=0)                       # 无缓冲: read 即返回可用字节
+    except Exception:
+        _prev_proc = None
+        return
+    buf = b""
+    try:
+        while True:
+            chunk = _prev_proc.stdout.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                e = buf.find(b"\xff\xd9", 2)          # EOI
+                if e < 0:
+                    break
+                s = buf.rfind(b"\xff\xd8", 0, e)      # 最近 SOI
+                if s < 0:
+                    buf = buf[e + 2:]
+                    continue
+                frame = buf[s:e + 2]
+                buf = buf[e + 2:]
+                if len(frame) > 2000:                 # 碎块/非帧跳过
+                    yield frame
+    finally:
+        try:
+            _prev_proc.terminate()
+        except Exception:
+            pass
+        _prev_proc = None
+
+
+def ssq_preview_stop():
+    """外部强停取景流 (进程被 read 阻塞时 terminate 直接打断)."""
+    global _prev_proc
+    p, _prev_proc = _prev_proc, None
+    if p is not None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
 
 
 def _ssq_bet_ok(b):

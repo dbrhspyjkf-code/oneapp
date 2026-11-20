@@ -1420,6 +1420,8 @@ class App:
         self.sq_shot = None
         self.sq_res = None
         self.sq_scroll = 0
+        self.sq_prev_frame = None             # 实时取景最新帧 (rgb,w,h)
+        self.sq_prev_stop = True
         try:
             self.ssq_last = netmod.load_json_file(SSQ_SCAN_CACHE, None)
         except Exception:
@@ -1833,6 +1835,7 @@ class App:
                     self.sq_cam = "shot"       # 冻结预览: Enter 识别 / Esc 重拍
                 else:
                     self.sq_cam = "aim"
+                    self._sq_prev_start()      # 回取景继续对准
                     self.osd = ("拍摄失败, 请重试", time.monotonic() + 2.5)
             elif a == "ssqocr" and isinstance(b, dict):
                 if b.get("ok"):
@@ -6541,9 +6544,38 @@ class App:
         self.sq_cam = "aim"
         self.sq_shot = None
         self.sq_res = None
+        self._sq_prev_start()
         return True
 
+    def _sq_prev_start(self):
+        """实时取景线程: 预览流最新帧解码成 RGB bytes (draw 用 frombuffer)."""
+        self.sq_prev_frame = None             # (rgb bytes, w, h)
+        self.sq_prev_stop = False
+        app = self
+
+        def run():
+            try:
+                for jpeg in fetchers.ssq_preview_iter():
+                    if app.sq_prev_stop:
+                        break
+                    try:
+                        s = pygame.image.load(io.BytesIO(jpeg)).convert()
+                        app.sq_prev_frame = (pygame.image.tostring(
+                            s, "RGB"), s.get_width(), s.get_height())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        threading.Thread(target=run, daemon=True).start()
+
+    def _sq_prev_stop(self):
+        self.sq_prev_stop = True
+        self.sq_prev_frame = None
+        fetchers.ssq_preview_stop()
+
     def _sq_cam_close(self):
+        if self.sq_cam == "aim":
+            self._sq_prev_stop()              # 取景进程随状态机关闭
         self.sq_cam = None
         self.sq_shot = None
         self.sq_res = None
@@ -6558,9 +6590,11 @@ class App:
             if st == "shot" or st == "up":
                 self.sq_cam = "aim"      # 重拍 / 取消识别
                 self.sq_shot = None
+                self._sq_prev_start()
                 return True
             return self._sq_cam_close()  # aim / OCR 中也允许放弃
         if st == "aim" and k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self._sq_prev_stop()             # 快门前先停取景 (释放摄像头)
             self.sq_cam = "cap"
             self.net.job("ssqcap", lambda: self._sq_cap_fn(), ttl=10)
             return True
@@ -6578,7 +6612,8 @@ class App:
         return True                        # cap/up 期间吞全部键
 
     def _sq_cap_fn(self):
-        """拍摄 worker: rpicam-jpeg 单拍 → 临时文件."""
+        """拍摄 worker: rpicam-jpeg 单拍 → 临时文件. 先让取景进程释放传感器."""
+        time.sleep(0.8)
         p = os.path.join(tempfile.gettempdir(), "oneapp_sq_shot.jpg")
         n = fetchers.ssq_capture_photo(p)
         return {"ok": n is not None, "path": p if n else None}
@@ -7946,14 +7981,16 @@ class App:
         st = self.sq_cam
         self.tool_head(surf, "双色球 · 拍照兑奖", "Esc 返回", hfs=10)
         if st == "aim":
-            r = pygame.Rect(40, 30, W - 80, 100)
-            pygame.draw.rect(surf, self.card(0), r, border_radius=8)
-            pygame.draw.rect(surf, acc, r, 2, border_radius=8)
-            textc(surf, "对准彩票票面", 17, hi, W // 2, 44)
-            textc(surf, "单拍一张 · 自动识别号码并判奖", 11, soft,
-                  W // 2, 68)
-            textc(surf, "GLM 视觉识别 · 需联网约 10 秒", 10, dim, W // 2, 86)
-            textc(surf, "Enter 拍摄 · Esc 返回", 12, acc, W // 2, 108)
+            fr = self.sq_prev_frame
+            if fr:
+                img = pygame.image.frombuffer(fr[0], (fr[1], fr[2]), "RGB")
+                surf.blit(img, (0, 20))          # 320×240 取景, 底部溢出裁掉
+            else:
+                textc(surf, "取景启动中…", 12, dim, W // 2, 60)
+            bar = pygame.Rect(0, H - 30, W, 30)
+            pygame.draw.rect(surf, (10, 10, 12), bar)   # 取景上压操作条
+            textc(surf, "对准票面 · Enter 拍摄 · Esc 返回", 12,
+                  acc, W // 2, H - 24)
         elif st == "cap":
             textc(surf, "拍摄中… 保持对准", 14, hi, W // 2, 76)
         elif st == "shot":
