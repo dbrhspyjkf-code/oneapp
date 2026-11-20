@@ -1684,7 +1684,7 @@ def test_settings_app():
     # 主题页签: ←→ 切到 主题 → 选 纯黑 (theme:6) → theme_idx 应用
     app.key(pygame.K_LEFT)                    # ← 左页签 (主题在左? 方向循环)
     app.key(pygame.K_RIGHT)
-    app.set_tab = 1                           # 直接定位主题页签
+    app.set_tab = 2                           # 直接定位主题页签 (卡片/账户/主题)
     app.set_sel = 6                           # theme:6 = 纯黑
     app.key(pygame.K_RETURN)
     assert app.theme_idx == 6, app.theme_idx
@@ -1709,7 +1709,9 @@ def test_cloud():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
+    app.set_tab = 1                           # 账户页签 (key:cloud 所在)
     assert [r[0] for r in app._set_rows()].count("key:cloud") == 1
+    app.set_tab = 0                           # 回卡片页签 (开关行)
     # ≤3 归一: 4 张全开 (含 sched 缺省 True) → 只保留前 3, 其余显式 False
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
     app._card_norm()
@@ -1884,6 +1886,7 @@ def test_reg():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
+    app.set_tab = 1                           # 账户页签 (reg 行所在)
     assert "reg" in [r[0] for r in app._set_rows()]
     # rid=reg 行 (sel=3, glm/ds 行移除后前移) → Enter 开表单
     app.tool = "set"
@@ -2053,6 +2056,7 @@ def test_login():
     tmp = tempfile.mkdtemp(prefix="oneapp")
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     app = dash.App(FakeNet())
+    app.set_tab = 1                           # 账户页签 (登录/扫码/注册行所在)
     rows = [r[0] for r in app._set_rows()]
     assert rows.index("login") == 1 and rows.index("qrlogin") == 2 \
         and rows.index("reg") == 3
@@ -2130,35 +2134,9 @@ def test_login():
     assert ("login", "登录") in app._set_rows()
     app.key(pygame.K_RETURN)               # 未登录再按 logout
     assert app.osd and "未登录" in app.osd[0]
-    # 生成注册码 (管理员): 未配 admin → 提示; 配了 → job → 结果覆盖层
-    idx = [r[0] for r in app._set_rows()].index("minv")
-    app.set_sel = idx
-    app.key(pygame.K_RETURN)
-    assert app.osd and "管理员TOKEN" in app.osd[0]
-    app.cfg["cloud_admin"] = "at" * 8
-    app.key(pygame.K_RETURN)
-    assert app.net.last_job("cloudinvite") is not None
-    orig_raw = netmod.http_raw
-    netmod.http_raw = lambda url, **k: (200, json.dumps(
-        {"ok": 1, "code": "abcd1234", "uses": 1}).encode())
-    d = app.net.last_job("cloudinvite")()
-    assert d["ok"] == 1 and d["code"] == "abcd1234"
-    app.on_net("data", "cloudinvite", d)
-    assert app.inv_show == ("abcd1234", 1)
-    app.draw(canvas)                       # 结果层渲染冒烟
-    app.key(pygame.K_RETURN)               # 任意键关
-    assert app.inv_show is None
-    # admin token 错 → 401 OSD
-    netmod.http_raw = lambda url, **k: (401, json.dumps(
-        {"err": "admin token required"}).encode())
-    app.key(pygame.K_RETURN)
-    d = app.net.last_job("cloudinvite")()
-    assert d["ok"] == 0 and "admin" in d["err"]
-    app.on_net("data", "cloudinvite", d)
-    assert app.osd and "生成失败" in app.osd[0]
-    netmod.http_raw = orig_raw
+    # (管理员TOKEN/生成注册码行已移除 — 管理操作下放 web 管理后台 /admin)
     print("login OK (form/fxzc/ping verify/persist/fail-retain/esc/"
-          "switch+csync reset/logout/admin-invite)")
+          "switch+csync reset/logout)")
 
 
 def test_qrlogin():
@@ -2173,8 +2151,9 @@ def test_qrlogin():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
+    app.set_tab = 1                        # 账户页签 (扫码登录行所在)
     rows = [r[0] for r in app._set_rows()]
-    assert rows.index("qrlogin") == 2      # glm/ds 行移除后前移 (与 test_login 一致)
+    assert rows.index("qrlogin") == 2      # 与 test_login 一致
     app.tool = "set"
     # segno 桩 (Mac 无 segno; 设备真机已装)
     fake_segno = types.SimpleNamespace(make=lambda u, error="m":

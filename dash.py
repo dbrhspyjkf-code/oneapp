@@ -1529,7 +1529,6 @@ class App:
         self.qr_poll_at = 0.0                  # 扫码轮询节流
         self.kv_confirm = None                 # kv 云同步确认框 {k,n,cn,v}
         self.kv_queue = []                     # 登录对齐待处理服务队列
-        self.inv_show = None                   # 注册码结果态 (code, uses)
         self.set_buf = ""
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
         # + 音频同进程 — 播放方案移植官方 cardputer-zero-iptv 的 panel.py)
@@ -1724,14 +1723,6 @@ class App:
                                            if b.get("st") else "出码失败")
                     self.osd = ("注册失败 %s" % err,
                                 time.monotonic() + 2.5)
-            elif a == "cloudinvite" and isinstance(b, dict):
-                if b.get("ok"):
-                    self.inv_show = (b["code"], b.get("uses") or 1)
-                else:
-                    err = b.get("err") or ("HTTP %s" % b.get("st")
-                                           if b.get("st") else "网络异常")
-                    self.osd = ("生成失败 %s" % err,
-                                time.monotonic() + 2.5)
             elif a == "cloudlogin" and isinstance(b, dict):
                 self.login_busy = False
                 if b.get("ok"):
@@ -1876,8 +1867,6 @@ class App:
                 self.kv_align_next()
             elif a.startswith("kvsync:") or a.startswith("kvput:"):
                 pass
-            elif a == "cloudinvite":
-                self.osd = ("生成失败 网络异常", time.monotonic() + 2.5)
             elif a == "schedget":
                 if self.tool == "sched":
                     self.osd = ("日程获取失败 · 网络异常",
@@ -4443,10 +4432,6 @@ class App:
                 self.dialog = None
             return True
 
-        if self.inv_show is not None:          # 注册码结果态: 任意键关
-            self.inv_show = None
-            return True
-
         if self.page == 3 and self.fin_sync:
             # 东财 API-KEY 输入 (默认英文; Enter=保存并同步)
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
@@ -4838,7 +4823,7 @@ class App:
             pass
 
     # ── 工具·设置: TAB 页签 (卡片 = API KEY + 卡片开关; 主题 = 主题选择) ──
-    SET_TABS = ("卡片", "主题")
+    SET_TABS = ("卡片", "账户", "主题")
 
     def _card_on(self, ck):
         """卡片有效开关态 (缺省全开) — 计数/开关/绘制同源."""
@@ -4856,17 +4841,19 @@ class App:
             self.cfg_save()
 
     def _set_rows(self):
-        """选中页签的行: 卡片 = KEY + 开关; 主题 = 全部主题."""
-        if self.SET_TABS[self.set_tab] == "主题":
+        """选中页签的行: 卡片 = 卡片开关; 账户 = Oneapp 账户全套;
+        主题 = 全部主题. (管理员 TOKEN/生成注册码 已下放 web 管理后台)"""
+        tab = self.SET_TABS[self.set_tab]
+        if tab == "主题":
             return [("theme:%d" % i, t["name"])
                     for i, t in enumerate(THEMES)]
-        return [("key:cloud", "账户服务器"),
-                ("login", "更换账户" if self.cfg.get("cloud_tok")
-                 else "登录"),
-                ("qrlogin", "扫码登录 (免输token)"),
-                ("reg", "注册新账号"), ("logout", "退出登录"),
-                ("key:admin", "管理员 TOKEN"), ("minv", "生成注册码"),
-                ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
+        if tab == "账户":
+            return [("key:cloud", "账户服务器"),
+                    ("login", "更换账户" if self.cfg.get("cloud_tok")
+                     else "登录"),
+                    ("qrlogin", "扫码登录 (免输token)"),
+                    ("reg", "注册新账号"), ("logout", "退出登录")]
+        return [("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
                 ("sw:fin", "自选股"),
                 ("sw:sched", "提醒/行程卡")]
 
@@ -4874,8 +4861,7 @@ class App:
         netmod.save_json_file(SETTINGS_FILE, self.cfg)
 
     SET_CFGKEYS = {
-                   "cloud": "cloud_url", "tok": "cloud_tok",
-                   "admin": "cloud_admin"}
+                   "cloud": "cloud_url", "tok": "cloud_tok"}
 
     def set_key(self, k, ch):
         if self.kv_confirm is not None:        # kv 同步确认框 (模态)
@@ -4899,9 +4885,6 @@ class App:
             if k in (pygame.K_ESCAPE, pygame.K_q):
                 self.qrlogin = None
                 self.qr_poll_at = 0.0
-            return True
-        if self.inv_show is not None:          # 注册码结果态: 任意键关
-            self.inv_show = None
             return True
         if self.login is not None:             # 登录表单态: TOKEN 单字段
             return self._login_key(k, ch)
@@ -4977,36 +4960,7 @@ class App:
                                 time.monotonic() + 2.5)
                 else:
                     self.osd = ("未登录", time.monotonic() + 1.5)
-            elif rid == "minv":                # 生成注册码 (管理员)
-                if not self.cfg.get("cloud_admin"):
-                    self.osd = ("先在 管理员TOKEN 填入 admin token",
-                                time.monotonic() + 2.5)
-                else:
-                    self.net.invalidate(("job", "cloudinvite"))
-                    self.net.job("cloudinvite", self._cloud_invite_fn,
-                                 ttl=10)
-                    self.osd = ("生成中…", time.monotonic() + 5)
         return True
-
-    def _cloud_invite_fn(self):
-        """worker: POST /v1/invite (管理员) → {ok,code,uses}."""
-        at = (self.cfg.get("cloud_admin") or "").strip()
-        url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
-        st, body = netmod.http_raw(url + "/v1/invite", method="POST",
-                                   body=json.dumps({"uses": 1}).encode(),
-                                   timeout=8,
-                                   headers={"Content-Type":
-                                            "application/json",
-                                            "Authorization": "Bearer " + at})
-        try:
-            j = json.loads(body.decode("utf-8", "replace"))
-        except ValueError:
-            j = {}
-        if st == 200 and j.get("code"):
-            return {"ok": 1, "code": j["code"], "uses": j.get("uses") or 1}
-        return {"ok": 0, "st": st,
-                "err": "admin token 无效" if st == 401 else
-                       ("HTTP %s" % st if st else "网络异常")}
 
     def _login_key(self, k, ch):
         """登录表单键流: 已有用户名+TOKEN 的用户 — 填 TOKEN → ping 验证."""
@@ -5251,8 +5205,7 @@ class App:
                     v = self.cfg.get("cloud_url", "")
                 else:
                     v = self.cfg.get(
-                        {"key:tok": "cloud_tok",
-                         "key:admin": "cloud_admin"}.get(rid, "cloud_url"), "")
+                        {"key:tok": "cloud_tok"}.get(rid, "cloud_url"), "")
                 text(surf, clip_text((self._set_mask(v) if rid != "key:cloud"
                                       else v) or "未设置", 12, 110),
                      12, hi if v else dim, (W - 14, y), right=True)
@@ -5386,20 +5339,6 @@ class App:
                   box.bottom - 22)
             text(surf, "Esc 取消", 10, dim,
                  (box.right - 12, box.bottom - 12), right=True)
-        # ── 注册码结果 (覆盖): 任意键关闭 ──
-        if self.inv_show is not None:
-            code, uses = self.inv_show
-            box = pygame.Rect(24, 50, W - 48, 84)
-            pygame.draw.rect(surf, self.card(0), box, border_radius=6)
-            pygame.draw.rect(surf, acc, box, 2, border_radius=6)
-            text(surf, "新注册码 (%d 次)" % uses, 12, dim,
-                 (box.x + 12, box.y + 10))
-            code_c = W // 2
-            textc(surf, code, 22, acc, code_c, box.y + 30)
-            text(surf, "转给对方 · 设置·注册新账号 使用", 10, dim,
-                 (box.x + 12, box.y + 60))
-            text(surf, "任意键关闭", 10, dim,
-                 (box.right - 12, box.y + 61), right=True)
 
     def tool_open(self, tid):
         self.tool = tid
