@@ -385,6 +385,14 @@ def ssq_ocr_scan(jpeg_bytes, key, timeout=40):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             j = json.loads(r.read(4 * 1024 * 1024).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:                           # bigmodel 错误体带真实原因
+            #   (套餐到期/欠费/限流), 透传 message 比裸状态码有用
+            em = json.loads(e.read(4096).decode("utf-8", "replace"))
+            return {"ok": False, "err": (em.get("error") or {}).get(
+                "message") or ("HTTP %d" % e.code)}
+        except Exception:
+            return {"ok": False, "err": "HTTP %d" % e.code}
     except Exception as e:
         return {"ok": False, "err": str(e)[:60]}
     try:
