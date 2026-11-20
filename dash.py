@@ -2040,21 +2040,6 @@ class App:
             self.osd = ("已删除 " + (code or ""), time.monotonic() + 1.2)
             self._em_push(code, False)     # 开同步 → 云端账户同步删
 
-    def fin_items(self):
-        """自选股: 本地 watchlist + 实时 quotes 覆盖."""
-        items = [dict(it) for it in self.watch.get("items", [])
-                 if it.get("code")][:16]
-        qt = parse_qt_text(self.data.get("quotes") or "")
-        for it in items:
-            f = qt.get(qt_code(it["code"]))
-            if qt_ok(f):
-                it["price"] = qt_num(f, 3)
-                it["chg"] = qt_num(f, 31)
-                it["pchg"] = qt_num(f, 32)
-                if not it.get("name") and len(f) > 1:
-                    it["name"] = f[1]
-        return items
-
     def open_detail(self, code, name, view="min"):
         self.fdetail = {"code": code, "name": name, "view": view, "zoom": 1.0}
 
@@ -7247,7 +7232,9 @@ class App:
         return "%.2f" % v
 
     def fin_items(self):
-        """自选股: 本地 watchlist + 实时 quotes 覆盖."""
+        """自选股: 本地 watchlist + 实时 quotes 覆盖, 按涨跌幅高→低.
+
+        (旧版本定义曾重复存两份 — 2026-11-20 去重只留此份)"""
         items = [dict(it) for it in self.watch.get("items", [])
                  if it.get("code")][:16]
         qt = parse_qt_text(self.data.get("quotes") or "")
@@ -7259,6 +7246,11 @@ class App:
                 it["pchg"] = qt_num(f, 32)
                 if not it.get("name") and len(f) > 1:
                     it["name"] = f[1]
+        # 涨跌幅高→低 (用户定版 2026-11-20); 无行情 (-inf) 排末尾;
+        # 稳定排序 → 同涨幅/无行情保持 watch 原顺序
+        items.sort(key=lambda it: it.get("pchg")
+                   if isinstance(it.get("pchg"), (int, float))
+                   else float("-inf"), reverse=True)
         return items
 
     def idx_cards(self):

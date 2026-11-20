@@ -328,7 +328,12 @@ def test_render():
     # 设备上可能有真实 watch.json (用户手动加过股) — 测试强制种子态
     app.watch = {"items": [dict(x) for x in dash.WATCH_SEED["items"]]}
     its = app.fin_items()
-    assert its and its[0]["code"] == "sh600519", its
+    # 涨跌幅高→低排序: demo 行情 平安银行 +0.61 > 茅台 -0.53 > 无行情种子
+    # (保持 watch 顺序); watch 原序首=茅台 → 排序后首位必是平安银行
+    assert its and its[0]["code"] == "sz000001", its
+    assert [i["code"] for i in its] == [
+        "sz000001", "sh600519", "sh601318", "sz300750", "sh688981"], its
+    assert its[0]["pchg"] == 0.61 and its[1]["pchg"] == -0.53, its
     # 自选股: qt_code 幂等 (行情没显示的根因) + n 添加 / d 删除 (本地 json)
     assert dash.qt_code("sh600519") == "sh600519"
     assert dash.qt_code("600519") == "sh600519"
@@ -396,7 +401,10 @@ def test_render():
     assert ("job", "empush:add:sh601318") in app.net.got, app.net.got[-3:]
     app.on_net("data", "empush:add:sh601318", {"ok": True})
     assert "云端已加" in app.osd[0], app.osd
-    app.key(pygame.K_d)                              # d 删当前行 → dialog
+    # d 删当前行 → dialog (显示序=涨跌幅序: 平安+0.61 > 茅台-0.53 > 无行情,
+    # 光标显式指到茅台那行, 不受排序影响)
+    app.fsel = [i["code"] for i in app.fin_items()].index("sh600519")
+    app.key(pygame.K_d)
     assert app.dialog and app.dialog[0] == "delwatch"
     app.key(pygame.K_RETURN)                         # Enter 确认
     assert [i["code"] for i in app.watch["items"]] == \
