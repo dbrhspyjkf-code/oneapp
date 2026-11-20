@@ -2397,6 +2397,47 @@ def test_kv_sync():
         app.on_net("data", "kvsync:watch",
                    app.net.last_job("kvsync:watch")())
         assert app.net.last_job("kvput:watch") is not None
+        # ── 换号隔离 (2026-11-21): 对齐静默跟随新号, 404/失败清空, 零回推
+        app.cfg["cloud_user"] = "bob"
+        app.cfg["kv_owner"] = "alice"          # 文件还归 A 号 (对齐未跑)
+        app.kv_switch = True
+        app.kv_queue = ["radio_fav", "watch", "tv_fav"]
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": ["bcloud1"], "updated": now + 300}).encode())
+        app.on_net("data", "kvalign:radio_fav",
+                   app.net.last_job("kvalign:radio_fav")())
+        assert app.kv_confirm is None and app.radio_fav == ["bcloud1"]
+        assert app.cfg["kv_owner"] == "bob"    # 落位 → 归新号
+        netmod.http_raw = lambda url, **k: (404, b'{"err": "no such key"}')
+        app.on_net("data", "kvalign:watch",
+                   app.net.last_job("kvalign:watch")())
+        assert app.watch == {"items": []}      # 404 → 清空 (旧数据归旧号)
+        app.on_net("error", "kvalign:tv_fav", None)
+        assert app.tv_fav == []                # 网络失败也清
+        assert app.kv_switch is False          # 队列排空复位
+        # 残留保护: 归属≠当前号 (对齐没跑完/重启窗口) → 404/补推都不克隆
+        app.cfg["kv_owner"] = "alice"
+        n_puts = len([t for t, _ in app.net.jobs if t.startswith("kvput:")])
+        json.dump(["staleA"], open(fr, "w"))
+        os.utime(fr, (now + 400, now + 400))
+        netmod.http_raw = lambda url, **k: (404, b'{"err": "no such key"}')
+        app.on_net("data", "kvsync:radio_fav",
+                   app.net.last_job("kvsync:radio_fav")())
+        assert len([t for t, _ in app.net.jobs
+                    if t.startswith("kvput:")]) == n_puts    # 404 不首推
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": ["bobradio"], "updated": now}).encode())
+        app.on_net("data", "kvsync:radio_fav",
+                   app.net.last_job("kvsync:radio_fav")())
+        assert app.radio_fav == ["bobradio"]   # 本地"更新"也不补推, 跟随云端
+        # 重启窗口: 归属≠当前号 → 开机补对齐 (kvalign 而非 kvsync)
+        json.dump({"cloud_tok": "t" * 24, "cloud_user": "bob",
+                   "kv_owner": "alice"}, open(dash.SETTINGS_FILE, "w"))
+        app2 = dash.App(FakeNet())
+        assert [t for t, _ in app2.net.jobs
+                if t.startswith("kvalign:")] == ["kvalign:radio_fav"]
+        assert not [t for t, _ in app2.net.jobs
+                    if t.startswith("kvsync:")]   # 补对齐而非 LWW 拉取
         # 本地空列表 mtime 较新 + 云端非空 → 不补推 (陈旧空列表盖云端 =
         # 2026-11-20 收藏清零事故), 跟随云端救回
         json.dump([], open(fr, "w"))
@@ -2440,6 +2481,7 @@ def test_kv_sync():
         app.tv_grp = 0
         app.tv_sel = 4
         os.utime(fr, (now - 100, now - 100))   # 本地明显旧 → 云端裁决胜出
+        os.utime(ftv, (now - 100, now - 100))  # (换号块写过 ftv, mtime 拨回)
         app.on_net("data", "kvsync:radio_fav",
                    {"ok": 1, "st": 200, "v": ks, "updated": now})
         assert app.radio_fav == ks

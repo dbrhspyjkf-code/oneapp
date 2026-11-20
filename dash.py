@@ -1529,6 +1529,7 @@ class App:
         self.qr_poll_at = 0.0                  # 扫码轮询节流
         self.kv_confirm = None                 # kv 云同步确认框 {k,n,cn,v}
         self.kv_queue = []                     # 登录对齐待处理服务队列
+        self.kv_switch = False                 # 换号对齐中 (旧 kv 是别人的)
         self.set_buf = ""
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
         # + 音频同进程 — 播放方案移植官方 cardputer-zero-iptv 的 panel.py)
@@ -1562,7 +1563,11 @@ class App:
         self.ime_assoc = None                  # 联想词 (上次提交后, None=无)
         self.ime_page = 0                      # 候选页 (每页 8)
         if self.cfg.get("cloud_tok"):
-            self.kv_start_pull()               # Oneapp 账户 kv 开机静默 LWW
+            if self.cfg.get("kv_owner") \
+                    and self.cfg["kv_owner"] != self.cfg.get("cloud_user"):
+                self.kv_align_trigger()        # 上次换号未完成对齐 → 补做
+            else:
+                self.kv_start_pull()           # Oneapp 账户 kv 开机静默 LWW
         # 链路探测由 net 层启动时自发
 
     def th(self, key):
@@ -1726,11 +1731,15 @@ class App:
             elif a == "cloudlogin" and isinstance(b, dict):
                 self.login_busy = False
                 if b.get("ok"):
+                    prev_user = self.cfg.get("cloud_user") or ""
+                    new_user = b.get("user") or ""
                     self.cfg["cloud_tok"] = b["tok"]
                     if not self.cfg.get("cloud_url"):
                         self.cfg["cloud_url"] = b.get("url") \
                             or CLOUD_URL_DEFAULT
-                    self.cfg["cloud_user"] = b.get("user") or ""
+                    self.cfg["cloud_user"] = new_user
+                    if prev_user and prev_user != new_user:
+                        self.kv_switch = True    # 换号: 本地 kv 是旧号残留
                     self.cfg_save()
                     self.login = None          # 成功: 关表单 + ping 复核
                     if b.get("now"):           # 换号: csync 重置 (本地
@@ -1773,10 +1782,14 @@ class App:
                 isreg = (self.qrlogin or {}).get("mode") == "reg"
                 iswx = (self.qrlogin or {}).get("mode") == "wxbind"
                 if stt == "approved" and b.get("token"):
+                    prev_user = self.cfg.get("cloud_user") or ""
+                    new_user = b.get("user") or ""
                     if not self.cfg.get("cloud_url"):
                         self.cfg["cloud_url"] = CLOUD_URL_DEFAULT
                     self.cfg["cloud_tok"] = b["token"]
-                    self.cfg["cloud_user"] = b.get("user") or ""
+                    self.cfg["cloud_user"] = new_user
+                    if prev_user and prev_user != new_user:
+                        self.kv_switch = True    # 换号: 本地 kv 是旧号残留
                     self.cfg_save()
                     self.qrlogin = None        # 成功: 关扫码页
                     self.qr_poll_at = 0.0
@@ -1826,10 +1839,13 @@ class App:
                         lm = 0.0
                     cu = b.get("updated") or 0
                     local = netmod.load_json_file(KV_FILES[k], None)
+                    _own = self.cfg.get("kv_owner") in (
+                        None, "", self.cfg.get("cloud_user")) \
+                        and not self.kv_switch      # 归属本账号才可推
                     if cu > lm + 2:
                         self.kv_apply(k, b.get("v"))   # 云端更新 → 覆盖
                     elif lm > cu + 2:
-                        if self._kv_nonempty(local):
+                        if self._kv_nonempty(local) and _own:
                             self.kv_push(k)            # 本地更新 → 补推
                         elif self._kv_nonempty(b.get("v")):
                             # 本地空且更新 → 不补推 (陈旧空列表盖云端 =
@@ -1837,7 +1853,11 @@ class App:
                             self.kv_apply(k, b.get("v"))
                 elif b.get("st") == 404:       # 云端没存过: 本地非空即首推
                     local = netmod.load_json_file(KV_FILES[k], None)
-                    if local:
+                    if local and self.cfg.get("kv_owner") in (
+                            None, "", self.cfg.get("cloud_user")) \
+                            and not self.kv_switch:
+                        # 只首推归属本账号 (或从未登录) 的本地数据 —
+                        # 换号残留不克隆进新号 (2026-11-21 换号隔离)
                         self.kv_push(k)
                 # (st==0 网络失败: 不裁决不首推 — 首推会把陈旧本地盖掉
                 #  云端别的端的新收藏, 开机 WiFi 未就绪时必踩)
@@ -1888,7 +1908,14 @@ class App:
             elif a == "cloudqrpoll":
                 self.qr_poll_at = 0.0          # 网络异常: 下帧重试 poll
             elif a.startswith("kvalign:"):
-                if self.kv_queue:
+                if self.kv_switch:             # 换号对齐: 失败也清 (归旧号)
+                    k2 = a.split(":", 1)[1]
+                    if self.kv_queue and self.kv_queue[0] == k2:
+                        self.kv_queue.pop(0)
+                    self.kv_apply(k2, None)
+                    self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""
+                    self.cfg_save()
+                elif self.kv_queue:
                     self.kv_queue.pop(0)
                 self.kv_align_next()
             elif a.startswith("kvsync:") or a.startswith("kvput:"):
@@ -2326,6 +2353,7 @@ class App:
     def kv_align_next(self):
         if not self.kv_queue or not self.cfg.get("cloud_tok"):
             self.kv_queue = []
+            self.kv_switch = False             # 队列排空/中止 → 复位
             return
         k = self.kv_queue[0]
         self.net.invalidate(("job", "kvalign:" + k))
@@ -2333,9 +2361,16 @@ class App:
 
     def _kv_align_step(self, k, b):
         """拉取结果裁决: 双空/失败跳过; 本地空→直接跟随云端;
-        本地有→确认框 (Enter 上传 / Esc 云端覆盖)."""
+        本地有→确认框 (Enter 上传 / Esc 云端覆盖).
+        换号 (kv_switch): 本地是旧号残留 — 静默跟随新号云端,
+        404/失败清空本地 (旧数据已在旧号云端, 清本地无损)."""
         if self.kv_queue and self.kv_queue[0] == k:
             self.kv_queue.pop(0)
+        if self.kv_switch:
+            self.kv_apply(k, b.get("v") if b.get("ok") else None)
+            self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""
+            self.cfg_save()                    # 该文件已归新号
+            return self.kv_align_next()
         if not b.get("ok"):
             return self.kv_align_next()
         local = netmod.load_json_file(KV_FILES[k], None)
