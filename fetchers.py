@@ -314,6 +314,132 @@ def ssq_fetch():
     return out or _snap_read("ssq.json")
 
 
+# ── 双色球拍照兑奖 (ZERO 单机: 摄像头 rpicam-jpeg + GLM-4V-Flash 直连 OCR +
+#    客户端判奖; 参考 hermes _ssq.py judge_bets / TAB5 app_lottery 同源) ─────
+SSQ_OCR_MODEL = "glm-4v-flash"          # 免费视觉模型 (下线可换 glm-4v-plus)
+_SSQ_OCR_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+_SSQ_OCR_PROMPT = (
+    "这是双色球彩票票面照片。识别: 1) 开奖期号(20开头的7位数字, 无则空串); "
+    "2) 每一注的单式号码(6个红球1-33 + 1个蓝球1-16)。复式票按每一行单式拆出。"
+    "只输出 JSON, 不要解释: {\"issue\":\"...\",\"bets\":[{\"reds\":[1,2,3,4,5,6],"
+    "\"blue\":8}]}")
+
+
+def ssq_capture_photo(out_path, timeout=12):
+    """摄像头单拍 (rpicam-jpeg one-shot). 成功返回文件大小, 失败 None.
+    IMX219 CSI (2026-11-19 实测: 1280x720 q70 ~89KB 数秒出片)."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["rpicam-jpeg", "-o", out_path, "--width", "1280", "--height",
+             "720", "--quality", "70", "--nopreview"],
+            timeout=timeout,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return os.path.getsize(out_path)
+    except Exception:
+        return None
+
+
+def _ssq_bet_ok(b):
+    """单式注形状校验: reds 去重后正好 6 个且全在 1-33, blue 1-16."""
+    if not isinstance(b, dict):
+        return None
+    reds = b.get("reds") or []
+    blue = b.get("blue")
+    if not isinstance(reds, list) or not isinstance(blue, int):
+        if isinstance(blue, str) and blue.strip().isdigit():
+            blue = int(blue)
+        else:
+            return None
+    clean = []
+    for r in reds:
+        try:
+            r = int(r)
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= r <= 33 or r in clean:
+            return None
+        clean.append(r)
+    if len(clean) != 6 or not 1 <= blue <= 16:
+        return None
+    return sorted(clean), blue
+
+
+def ssq_ocr_scan(jpeg_bytes, key, timeout=40):
+    """票面照片 → GLM-4V-Flash → 校验后的注单.
+    → {ok, issue, bets:[{reds,blue}], invalid} / {ok:False, err}."""
+    import base64
+    body = json.dumps({
+        "model": SSQ_OCR_MODEL,
+        "temperature": 0.1,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url":
+             "data:image/jpeg;base64," + base64.b64encode(jpeg_bytes)
+             .decode("ascii")}},
+            {"type": "text", "text": _SSQ_OCR_PROMPT}]}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        _SSQ_OCR_URL, data=body,
+        headers={"Authorization": "Bearer " + key,
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            j = json.loads(r.read(4 * 1024 * 1024).decode("utf-8", "replace"))
+    except Exception as e:
+        return {"ok": False, "err": str(e)[:60]}
+    try:
+        txt = (j["choices"][0]["message"]["content"] or "").strip()
+        i, k2 = txt.find("{"), txt.rfind("}")
+        txt = txt[i:k2 + 1] if 0 <= i < k2 else ""
+        o = json.loads(txt)
+    except Exception:
+        return {"ok": False, "err": "响应解析失败"}
+    bets, invalid = [], 0
+    for b in o.get("bets") or []:
+        pb = _ssq_bet_ok(b)
+        if pb:
+            bets.append({"reds": pb[0], "blue": pb[1]})
+        else:
+            invalid += 1
+    issue = str(o.get("issue") or "").strip()
+    if not (issue.isdigit() and len(issue) == 7):
+        issue = ""
+    return {"ok": True, "issue": issue, "bets": bets, "invalid": invalid}
+
+
+def ssq_judge(bets, issue):
+    """识别注单 vs 开奖期 → 逐注判奖 (hermes _ssq.py judge_bets 同源).
+    只判形状完整的单式注; prize=None=未中/形状不齐不判. 奖金取 issue
+    grades[level-1].money (一二等奖单注奖金每期浮动)."""
+    grades = {g.get("level"): g.get("money") or 0
+              for g in issue.get("grades") or []}
+    wr = set(issue.get("reds") or [])
+    wb = issue.get("blue")
+    out = []
+    for b in bets or []:
+        reds, blue = b.get("reds") or [], b.get("blue")
+        if len(reds) != 6 or not isinstance(blue, int):
+            out.append({"reds": reds, "blue": blue, "prize": None,
+                        "red_hit": 0, "blue_hit": 0, "money": 0})
+            continue
+        rh = len(wr & set(reds))
+        bh = 1 if blue == wb else 0
+        if rh == 6:
+            level = 1 if bh else 2
+        elif rh == 5:
+            level = 3 if bh else 4
+        elif rh == 4:
+            level = 4 if bh else 5
+        elif rh == 3:
+            level = 5 if bh else 0
+        else:
+            level = 6 if bh else 0
+        out.append({"reds": sorted(reds), "blue": blue, "red_hit": rh,
+                    "blue_hit": bh, "prize": "%d等奖" % level if level else None,
+                    "money": grades.get(level, 0) if level else 0})
+    return out
+
+
 # ── 新股申购 (东方财富 RPTA_APP_IPOAPPLY, 只留申购日 ≥ 今日, 按日升序) ──────
 _IPO_URL = ("https://datacenter-web.eastmoney.com/api/data/v1/get"
             "?reportName=RPTA_APP_IPOAPPLY"

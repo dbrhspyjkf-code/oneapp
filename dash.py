@@ -27,6 +27,7 @@ import signal
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import sys
 import time
@@ -163,6 +164,7 @@ WX_LOC_FILE = os.path.join(STATE_DIR, "wx_loc.json")   # IP 归属地快照
 RAOP_CACHE = os.path.join(STATE_DIR, "raop_devs.json")
 RADIO_OUT_FILE = os.path.join(STATE_DIR, "radio_out.json")
 RADIO_FAV_CACHE = os.path.join(STATE_DIR, "radio_fav.json")   # 电台收藏 (key 表)
+SSQ_SCAN_CACHE = os.path.join(STATE_DIR, "ssq_scan.json")   # 双色球拍照兑奖留档 (最近一次)
 RAOP_VOL_FILE = os.path.join(STATE_DIR, "raop_vol.json")   # AirPlay 会话音量记忆
 _RAOP_SKIP = re.compile(r"电视|tv|macbook|ipad|iphone", re.I)
 
@@ -1412,6 +1414,16 @@ class App:
         # 双色球 / 计时器
         self.ssq_scroll = 0                   # 选中期索引 (顶部卡片跟随)
         self.ssq_view = 0                     # 历史列表窗口起点
+        # 拍照兑奖状态机: None=closed; aim(取景)→cap(拍摄中)→shot(冻结预览)
+        # →ocr(识别中)→done(结果页); sq_shot=jpg 路径 sq_res=判定结果 dict
+        self.sq_cam = None
+        self.sq_shot = None
+        self.sq_res = None
+        self.sq_scroll = 0
+        try:
+            self.ssq_last = netmod.load_json_file(SSQ_SCAN_CACHE, None)
+        except Exception:
+            self.ssq_last = None
         self.tm_dur = 300                     # 秒
         self.tm_left = 300.0
         self.tm_run = False
@@ -1815,6 +1827,22 @@ class App:
                         self.kv_push(k)
                 # (st==0 网络失败: 不裁决不首推 — 首推会把陈旧本地盖掉
                 #  云端别的端的新收藏, 开机 WiFi 未就绪时必踩)
+            elif a == "ssqcap" and isinstance(b, dict):
+                if b.get("ok"):
+                    self.sq_shot = b.get("path")
+                    self.sq_cam = "shot"       # 冻结预览: Enter 识别 / Esc 重拍
+                else:
+                    self.sq_cam = "aim"
+                    self.osd = ("拍摄失败, 请重试", time.monotonic() + 2.5)
+            elif a == "ssqocr" and isinstance(b, dict):
+                if b.get("ok"):
+                    self.sq_res = b
+                    self.sq_cam = "done"       # 结果页 (rows 已判/未开奖)
+                    self.sq_scroll = 0
+                else:
+                    self.sq_cam = "shot"
+                    self.osd = ("识别失败: " + (b.get("err") or "未知")
+                                [:20], time.monotonic() + 3.0)
             elif a == "schedget" and isinstance(b, dict) \
                     and not b.get("skip"):
                 if b.get("ok"):
@@ -4571,6 +4599,9 @@ class App:
                     self.qrlogin = None
                     self.qr_poll_at = 0.0
                     return True
+                if self.tool == "ssq" and self.sq_cam:
+                    self._sq_cam_key(k)        # 拍照兑奖模态: Esc 逐层退
+                    return True
                 if self.tool == "tv" and self.tv_playing:
                     self.tv_stop()             # 播放态 Esc → 回列表 (不退 app)
                 elif self.tool == "music" and self.mu_input:
@@ -6483,11 +6514,103 @@ class App:
     SSQ_RED, SSQ_BLUE = (224, 32, 32), (42, 107, 224)
 
     def ssq_key(self, k):
+        # 拍照兑奖状态机吞键 (模态); Esc 逐层退 (done→shot→aim→关闭)
+        if self.sq_cam:
+            return self._sq_cam_key(k)
+        if k == pygame.K_5:
+            return self._sq_cam_open()
+        if k == pygame.K_6:
+            if self.ssq_last:
+                self.sq_res = self.ssq_last
+                self.sq_cam = "done"
+                self.sq_scroll = 0
+                return True
+            self.osd = ("还没有兑奖记录", time.monotonic() + 1.5)
+            return True
         if k in (pygame.K_UP, pygame.K_DOWN):
             n = len((self.data.get("ssq") or {}).get("issues") or [])
             d = -1 if k == pygame.K_UP else 1
             self.ssq_scroll = max(0, min(n - 1, self.ssq_scroll + d))
         return True
+
+    # ── 双色球拍照兑奖 (单机: rpicam-jpeg + GLM-4V-Flash + 客户端判奖) ──
+    def _sq_cam_open(self):
+        if not self.cfg.get("glm_key"):
+            self.osd = ("需要 GLM KEY · 设置里填", time.monotonic() + 2.5)
+            return True
+        self.sq_cam = "aim"
+        self.sq_shot = None
+        self.sq_res = None
+        return True
+
+    def _sq_cam_close(self):
+        self.sq_cam = None
+        self.sq_shot = None
+        self.sq_res = None
+        return True
+
+    def _sq_cam_key(self, k):
+        st = self.sq_cam
+        if k == pygame.K_ESCAPE:
+            if st == "done":
+                self.sq_cam = None       # 复看模式 (6 键进来): 直接回列表
+                return True
+            if st == "shot" or st == "up":
+                self.sq_cam = "aim"      # 重拍 / 取消识别
+                self.sq_shot = None
+                return True
+            return self._sq_cam_close()  # aim / OCR 中也允许放弃
+        if st == "aim" and k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.sq_cam = "cap"
+            self.net.job("ssqcap", lambda: self._sq_cap_fn(), ttl=10)
+            return True
+        if st == "shot" and k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.sq_cam = "up"
+            self.net.job("ssqocr", lambda: self._sq_ocr_fn(), ttl=60)
+            return True
+        if st == "done":
+            if k in (pygame.K_UP, pygame.K_DOWN):
+                n = len((self.sq_res or {}).get("rows") or [])
+                d = -1 if k == pygame.K_UP else 1
+                self.sq_scroll = max(0, min(n - 1, self.sq_scroll + d))
+                return True
+            return True                    # 其余键吞掉 (防误触底层)
+        return True                        # cap/up 期间吞全部键
+
+    def _sq_cap_fn(self):
+        """拍摄 worker: rpicam-jpeg 单拍 → 临时文件."""
+        p = os.path.join(tempfile.gettempdir(), "oneapp_sq_shot.jpg")
+        n = fetchers.ssq_capture_photo(p)
+        return {"ok": n is not None, "path": p if n else None}
+
+    def _sq_ocr_fn(self):
+        """识别 worker: 读 jpg → GLM-4V-Flash → 形状校验注单."""
+        key = (self.cfg.get("glm_key") or "").strip()
+        try:
+            data = open(self.sq_shot, "rb").read()
+        except Exception:
+            return {"ok": False, "err": "照片文件丢失"}
+        o = fetchers.ssq_ocr_scan(data, key)
+        if not o.get("ok"):
+            return o
+        issue = None                      # 期号裁决 → 判奖
+        issues = (self.data.get("ssq") or {}).get("issues") or []
+        code = o.get("issue") or ""
+        for it in issues:                 # 票面期号在历史里才判; 无期号按最新期
+            if it.get("code") == code:
+                issue = it
+                break
+        found = issue is not None
+        if issue is None and issues and not code:
+            issue = issues[0]
+        rows = fetchers.ssq_judge(o.get("bets") or [], issue) if issue else []
+        res = {"ok": True, "issue": code, "found": found, "codes": [it.get("code")
+               for it in issues], "bets": o.get("bets") or [],
+               "invalid": o.get("invalid") or 0, "rows": rows,
+               "at": time.strftime("%Y-%m-%d %H:%M")}
+        netmod.save_json_file(SSQ_SCAN_CACHE, res)   # 本地留档 (不含照片)
+        self.ssq_last = res
+        return res
 
     def timer_key(self, k):
         if self.tm_run:
@@ -7818,10 +7941,93 @@ class App:
         return "{:,}".format(float("%.6g" % v))
 
     # ── 工具·双色球 ──
+    def draw_sqcam(self, surf, acc, hi, soft, dim):
+        """拍照兑奖流程页 (sq_cam 状态机): aim/cap/shot/up/done."""
+        st = self.sq_cam
+        self.tool_head(surf, "双色球 · 拍照兑奖", "Esc 返回", hfs=10)
+        if st == "aim":
+            r = pygame.Rect(40, 30, W - 80, 100)
+            pygame.draw.rect(surf, self.card(0), r, border_radius=8)
+            pygame.draw.rect(surf, acc, r, 2, border_radius=8)
+            textc(surf, "对准彩票票面", 17, hi, W // 2, 44)
+            textc(surf, "单拍一张 · 自动识别号码并判奖", 11, soft,
+                  W // 2, 68)
+            textc(surf, "GLM 视觉识别 · 需联网约 10 秒", 10, dim, W // 2, 86)
+            textc(surf, "Enter 拍摄 · Esc 返回", 12, acc, W // 2, 108)
+        elif st == "cap":
+            textc(surf, "拍摄中… 保持对准", 14, hi, W // 2, 76)
+        elif st == "shot":
+            try:
+                ph = pygame.image.load(self.sq_shot)
+                ph = pygame.transform.smoothscale(
+                    ph.convert(), (240, 135))
+                surf.blit(ph, ((W - 240) // 2, 18))
+            except Exception:
+                textc(surf, "(照片无法显示)", 11, dim, W // 2, 70)
+            textc(surf, "Enter 识别 · Esc 重拍", 12, acc, W // 2, 156)
+        elif st == "up":
+            textc(surf, "识别中…", 15, hi, W // 2, 64)
+            textc(surf, "GLM 视觉 · 约 10 秒", 11, soft, W // 2, 88)
+        elif st == "done":
+            res = self.sq_res or {}
+            rows = res.get("rows") or []
+            code = res.get("issue") or "?"
+            when = (res.get("at") or "")[5:16]
+            if res.get("found") is False and res.get("issue"):
+                head = "第 %s 期 · 该期未开奖 (仅识号不判奖)" % code
+            elif res.get("issue"):
+                head = "第 %s 期 · %s 判定" % (code, when)
+            else:
+                head = "未识出期号 · 按最新期判定 · %s" % when
+            textc(surf, clip_text(head, 11, W - 16), 11,
+                  hi if res.get("found") else dim, W // 2, 20)
+            if not rows and not res.get("bets"):
+                textc(surf, "未识别到注单", 13, dim, W // 2, 70)
+            else:
+                rows_n = len(rows)
+                if rows_n:
+                    vis = 5
+                    self.sq_scroll = max(0, min(self.sq_scroll,
+                                                rows_n - 1))
+                    for vi in range(vis):
+                        ri = self.sq_scroll + vi
+                        if ri >= rows_n:
+                            break
+                        row = rows[ri]
+                        y = 38 + vi * 18
+                        sel = ri == self.sq_scroll
+                        if sel:
+                            pygame.draw.rect(surf, self.th("track"),
+                                             (6, y - 2, W - 12, 16),
+                                             border_radius=3)
+                        self._ssq_balls(surf, row.get("reds") or [],
+                                        row.get("blue") or 0, 10, y, 6)
+                        pz = row.get("prize")
+                        lab = pz if pz else "未中"
+                        col = acc if pz else dim
+                        if pz:
+                            m = row.get("money") or 0
+                            lab += " · " + (("%.2f 万" % (m / 1e4))
+                                            if m >= 1e4 else "%d 元" % m)
+                        text(surf, clip_text(lab, 11, 120), 11, col,
+                             (W - 8 - textw(clip_text(lab, 11, 120), 11),
+                              y + 1), right=True)
+                    if rows_n > vis:
+                        textc(surf, "↑↓ %d/%d" % (self.sq_scroll + 1,
+                                                  rows_n), 10, dim,
+                              W // 2, 130)
+                iv = res.get("invalid") or 0
+                if iv:
+                    textc(surf, "%d 注形状异常已剔除" % iv, 10, dim,
+                          W // 2, 140 if rows_n > 5 else 130)
+            textc(surf, "Esc 返回", 11, soft, W // 2, 156)
+
     def draw_ssq(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
-        self.tool_head(surf, "双色球", "↑↓ 选期")
+        if self.sq_cam:
+            return self.draw_sqcam(surf, acc, hi, soft, dim)
+        self.tool_head(surf, "双色球", "↑↓ 选期 · 5 拍照 · 6 上次")
         j = self.data.get("ssq") or {}
         issues = (j.get("issues") or []) if j.get("ok") else []
         if not issues:

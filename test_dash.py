@@ -2272,6 +2272,153 @@ def test_kv_sync():
           "page-pull/clamp)")
 
 
+def test_ssq_scan():
+    """双色球拍照兑奖: 判奖规则表/OCR 解析校验/键位状态机/留档 roundtrip."""
+    import dash
+    import fetchers
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    scan_p = os.path.join(tmp, "ssq_scan.json")
+    dash.SSQ_SCAN_CACHE = scan_p
+    json.dump({"glm_key": "k" * 24}, open(dash.SETTINGS_FILE, "w"))
+    app = dash.App(FakeNet())
+    app.tool = "ssq"
+    app.data["ssq"] = {"ok": True, "issues": [
+        {"code": "2025132", "date": "2025-11-18", "week": "二",
+         "reds": [1, 2, 3, 4, 5, 6], "blue": 8, "grades": [
+             {"level": i, "money": i * 100, "num": 1} for i in range(1, 7)]},
+        {"code": "2025131", "date": "2025-11-16", "week": "日",
+         "reds": [9, 10, 11, 12, 13, 14], "blue": 9, "grades": []}]}
+    try:
+        # ── 判奖规则表 (对齐 hermes judge_bets 全 10 形状) ──
+        it = app.data["ssq"]["issues"][0]
+        J = fetchers.ssq_judge
+        cases = [(([1,2,3,4,5,6],8),"1等奖"), (([1,2,3,4,5,6],9),"2等奖"),
+                 (([1,2,3,4,5,7],8),"3等奖"), (([1,2,3,4,5,7],9),"4等奖"),
+                 (([1,2,3,4,10,11],8),"4等奖"), (([1,2,3,4,10,11],9),"5等奖"),
+                 (([1,2,3,10,11,12],8),"5等奖"), (([1,2,3,10,11,12],9),None),
+                 (([10,11,12,13,14,15],8),"6等奖"), (([10,11,12,13,14,15],9),None)]
+        for (reds, blue), want in cases:
+            got = J([{"reds": reds, "blue": blue}], it)[0]
+            assert got["prize"] == want, (reds, blue, got)
+        assert J([{"reds":[1,2,3,4,5,6],"blue":8}], it)[0]["money"] == 100
+        assert J([{"reds":[1,2],"blue":8}], it)[0]["prize"] is None
+        # ── OCR 解析: 正常/越界/重复/非 JSON/前后杂语 ──
+        orig_urlopen = dash_mod_urlopen = fetchers.urllib.request.urlopen
+        def fake_urlopen(req, timeout=30):
+            txt = getattr(test_ssq_scan, "_ocr_txt", "")
+            import io
+            body = json.dumps({"choices": [{"message": {"content": txt}}]
+                               }).encode()
+            return io.BytesIO(body)     # 读接口足够 (r.status 未用? 用 .read)
+        fetchers.urllib.request.urlopen = fake_urlopen
+        try:
+            test_ssq_scan._ocr_txt = json.dumps({
+                "issue": "2025132", "bets": [
+                    {"reds": [3,1,5,4,2,6], "blue": 8},      # 乱序 → sorted
+                    {"reds": [1,1,2,3,4,5], "blue": 8},      # 重复红 → 剔
+                    {"reds": [1,2,3,4,5,34], "blue": 8},     # 越界 → 剔
+                    {"reds": [1,2,3,4,5], "blue": 8}]})      # 5红 → 剔
+            o = fetchers.ssq_ocr_scan(b"jpeg", "k")
+            assert o["ok"] and o["issue"] == "2025132" and o["invalid"] == 3
+            assert o["bets"] == [{"reds": [1,2,3,4,5,6], "blue": 8}]
+            test_ssq_scan._ocr_txt = '垃圾前缀 {"issue":"x","bets":[]} 后缀'
+            o = fetchers.ssq_ocr_scan(b"j", "k")
+            assert o["ok"] and o["issue"] == "" and o["bets"] == []
+            test_ssq_scan._ocr_txt = "not json at all"
+            assert fetchers.ssq_ocr_scan(b"j", "k")["ok"] is False
+            test_ssq_scan._ocr_txt = ""
+            assert fetchers.ssq_ocr_scan(b"j", "k")["ok"] is False
+        finally:
+            fetchers.urllib.request.urlopen = orig_urlopen
+        # ── 键位状态机: 5→aim→cap→shot→ocr→done, Esc 逐层 ──
+        app.sq_cam = None
+        app.ssq_key(pygame.K_5)
+        assert app.sq_cam == "aim"          # 有 glm_key → 直接进 aim
+        app.ssq_key(pygame.K_ESCAPE)
+        assert app.sq_cam is None
+        app.cfg["glm_key"] = ""
+        app.ssq_key(pygame.K_5)              # 无 key → OSD 拦截不进
+        assert app.sq_cam is None
+        app.cfg["glm_key"] = "k" * 24
+        app.ssq_key(pygame.K_5)
+        assert app.sq_cam == "aim"
+        app.ssq_key(pygame.K_RETURN)         # Enter → cap (job 入队)
+        assert app.sq_cam == "cap"
+        fn = app.net.last_job("ssqcap")
+        assert fn is not None
+        # worker: rpicam-jpeg 不在 Mac → 拍摄失败回执
+        d = fn()
+        app.on_net("data", "ssqcap", d)
+        assert app.sq_cam == "aim"          # 失败回 aim
+        # 假拍摄成功 (直接给回执): → shot 冻结预览
+        shot_p = os.path.join(tmp, "shot.jpg")
+        json.dump({}, open(shot_p, "w"))    # 任意文件占位 (draw 会降级)
+        app.on_net("data", "ssqcap", {"ok": True, "path": shot_p})
+        assert app.sq_cam == "shot" and app.sq_shot == shot_p
+        app.draw(canvas)                    # shot 渲染 (照片加载失败降级文字)
+        app.ssq_key(pygame.K_RETURN)         # Enter → ocr (job 入队)
+        assert app.sq_cam == "up"
+        assert app.net.last_job("ssqocr") is not None
+        # worker: monkeypatch fetchers.ssq_ocr_scan → 期号命中 → 判奖落盘
+        orig_scan = fetchers.ssq_ocr_scan
+        fetchers.ssq_ocr_scan = lambda data, key, timeout=40: {
+            "ok": True, "issue": "2025132",
+            "bets": [{"reds": [1,2,3,4,5,6], "blue": 8}], "invalid": 0}
+        try:
+            d = app._sq_ocr_fn()            # 直接调 worker (读 sq_shot)
+        finally:
+            fetchers.ssq_ocr_scan = orig_scan
+        assert d["found"] and d["rows"][0]["prize"] == "1等奖"
+        app.on_net("data", "ssqocr", d)
+        assert app.sq_cam == "done" and app.sq_scroll == 0
+        app.draw(canvas)                    # done 渲染冒烟
+        # 留档 roundtrip + 6 键复看
+        saved = json.load(open(scan_p))
+        assert saved["rows"][0]["prize"] == "1等奖" and "bets" in saved
+        assert app.ssq_last == saved
+        app.sq_cam = None
+        app.ssq_key(pygame.K_6)              # 6 = 查看上次
+        assert app.sq_cam == "done"
+        app.ssq_key(pygame.K_UP)
+        assert app.sq_scroll == 0           # 1 行列表 ↑ 不动
+        app.ssq_key(pygame.K_ESCAPE)
+        assert app.sq_cam is None           # 复看 Esc → 直接回列表
+        # 未开奖: 期号不在历史 → found=False rows=[] 不误判
+        app.on_net("data", "ssqcap", {"ok": True, "path": shot_p})
+        app.sq_cam = "shot"
+        app.ssq_key(pygame.K_RETURN)
+        fetchers.ssq_ocr_scan = lambda data, key, timeout=40: {
+            "ok": True, "issue": "2099999",
+            "bets": [{"reds": [1,2,3,4,5,6], "blue": 8}], "invalid": 0}
+        try:
+            d = app._sq_ocr_fn()
+        finally:
+            fetchers.ssq_ocr_scan = orig_scan
+        assert d["found"] is False and d["rows"] == []
+        assert json.load(open(scan_p))["found"] is False
+        # 无期号 → 按最新期 (2025132) 判
+        fetchers.ssq_ocr_scan = lambda data, key, timeout=40: {
+            "ok": True, "issue": "",
+            "bets": [{"reds": [1,2,3,4,5,6], "blue": 8}], "invalid": 0}
+        try:
+            d = app._sq_ocr_fn()
+        finally:
+            fetchers.ssq_ocr_scan = orig_scan
+        assert d["issue"] == "" and d["found"] is False
+        assert d["rows"][0]["prize"] == "1等奖"    # 按 issues[0] 判
+        # 工具态 Esc 拦截: sq_cam 模态时 Esc 走状态机不关工具
+        app.sq_cam = "aim"
+        app.key(pygame.K_ESCAPE, "")
+        assert app.sq_cam is None and app.tool == "ssq"   # 状态机关了, 工具没关
+    finally:
+        pass
+    print("ssq_scan OK (judge-table/ocr-parse/keys-flow/file-roundtrip/"
+          "not-drawn/latest-fallback/esc-modal)")
+
 
 def test_mail_keys():
     """邮件 app 键流: 网格直开 → 登录表单 → 文件夹 → 列表 → 详情 → 逐层 Esc."""
