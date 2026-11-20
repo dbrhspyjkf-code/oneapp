@@ -164,7 +164,6 @@ WX_LOC_FILE = os.path.join(STATE_DIR, "wx_loc.json")   # IP 归属地快照
 RAOP_CACHE = os.path.join(STATE_DIR, "raop_devs.json")
 RADIO_OUT_FILE = os.path.join(STATE_DIR, "radio_out.json")
 RADIO_FAV_CACHE = os.path.join(STATE_DIR, "radio_fav.json")   # 电台收藏 (key 表)
-SSQ_SCAN_CACHE = os.path.join(STATE_DIR, "ssq_scan.json")   # 双色球拍照兑奖留档 (最近一次)
 RAOP_VOL_FILE = os.path.join(STATE_DIR, "raop_vol.json")   # AirPlay 会话音量记忆
 _RAOP_SKIP = re.compile(r"电视|tv|macbook|ipad|iphone", re.I)
 
@@ -790,7 +789,7 @@ def daily_sentence():
     en, cn = _SENTENCES[datetime.date.today().toordinal() % len(_SENTENCES)]
     return {"ok": True, "text": cn, "from": en}
 # 主页右列卡片键 (与 draw_home vis 元组同序; 设置页开关/≤3 计数共用)
-CARD_KEYS = ("sched", "hitokoto", "news", "usage", "fin")
+CARD_KEYS = ("sched", "hitokoto", "news", "fin")
 # 主页卡缓存标签: 进 app 秒显上次数据, 后台刷新后再覆盖 (用户要求免"获取中")
 HOME_CACHE_TAGS = ("wx", "news", "ipo", "quotes")
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")        # 自选股 (本地)
@@ -1414,18 +1413,6 @@ class App:
         # 双色球 / 计时器
         self.ssq_scroll = 0                   # 选中期索引 (顶部卡片跟随)
         self.ssq_view = 0                     # 历史列表窗口起点
-        # 拍照兑奖状态机: None=closed; aim(取景)→cap(拍摄中)→shot(冻结预览)
-        # →ocr(识别中)→done(结果页); sq_shot=jpg 路径 sq_res=判定结果 dict
-        self.sq_cam = None
-        self.sq_shot = None
-        self.sq_res = None
-        self.sq_scroll = 0
-        self.sq_prev_frame = None             # 实时取景最新帧 (rgb,w,h)
-        self.sq_prev_stop = True
-        try:
-            self.ssq_last = netmod.load_json_file(SSQ_SCAN_CACHE, None)
-        except Exception:
-            self.ssq_last = None
         self.tm_dur = 300                     # 秒
         self.tm_left = 300.0
         self.tm_run = False
@@ -1528,8 +1515,6 @@ class App:
         self.cfg = netmod.load_json_file(SETTINGS_FILE, {}) or {}
         if not isinstance(self.cfg, dict):
             self.cfg = {}
-        self.cfg.setdefault("glm_key", "")
-        self.cfg.setdefault("ds_key", "")
         self.cfg.setdefault("cards", {})
         self._card_norm()                     # >3 张显式关掉排序靠后的
         self.set_tab = 0                       # 设置页签 (0=卡片 1=主题)
@@ -1545,7 +1530,6 @@ class App:
         self.kv_queue = []                     # 登录对齐待处理服务队列
         self.inv_show = None                   # 注册码结果态 (code, uses)
         self.set_buf = ""
-        self._usage_at = 0.0
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
         # + 音频同进程 — 播放方案移植官方 cardputer-zero-iptv 的 panel.py)
         self.tv_grp = 0                        # 分组索引 (0=收藏, 1+=GROUPS)
@@ -1586,7 +1570,7 @@ class App:
 
     def card(self, i):
         cards = THEMES[self.theme_idx]["cards"]
-        return hex2rgb(cards[i % len(cards)])   # 第 4 卡 (USAGE) 循环取色
+        return hex2rgb(cards[i % len(cards)])   # 第 4 卡循环取色
 
     def _load_home_cache(self):
         """主页卡数据磁盘缓存 → self.data (天气/新闻/新股); 每日一句内置."""
@@ -1835,23 +1819,6 @@ class App:
                         self.kv_push(k)
                 # (st==0 网络失败: 不裁决不首推 — 首推会把陈旧本地盖掉
                 #  云端别的端的新收藏, 开机 WiFi 未就绪时必踩)
-            elif a == "ssqcap" and isinstance(b, dict):
-                if b.get("ok"):
-                    self.sq_shot = b.get("path")
-                    self.sq_cam = "shot"       # 冻结预览: Enter 识别 / Esc 重拍
-                else:
-                    self.sq_cam = "aim"
-                    self._sq_prev_start()      # 回取景继续对准
-                    self.osd = ("拍摄失败, 请重试", time.monotonic() + 2.5)
-            elif a == "ssqocr" and isinstance(b, dict):
-                if b.get("ok"):
-                    self.sq_res = b
-                    self.sq_cam = "done"       # 结果页 (rows 已判/未开奖)
-                    self.sq_scroll = 0
-                else:
-                    self.sq_cam = "shot"
-                    self.osd = ("识别失败: " + (b.get("err") or "未知")
-                                [:20], time.monotonic() + 3.0)
             elif a == "schedget" and isinstance(b, dict) \
                     and not b.get("skip"):
                 if b.get("ok"):
@@ -1925,10 +1892,6 @@ class App:
 
     # ── 每秒请求 (worker 按 TTL 去重) ──
     def poll(self):
-        if self.page == 0 and not self.tool:
-            self.poll_usage()
-        if self.page == 0 and not self.tool:
-            self.poll_usage()
         """按页取数: 只拉当前页所需, 页面切换即时响应不排队."""
         self.mu_tick()                        # 音乐连播: 任意页/离线都要走 (本地曲库)
         if self.net.mode == "online":
@@ -1977,26 +1940,6 @@ class App:
                         and time.monotonic() - self.play_at > 50:
                     self.radio_stop()          # RAOP 预读+连接 50s 没到 = 挂死
                     self.osd = ("AirPlay 未连上", time.monotonic() + 2.0)
-
-    def poll_usage(self):
-        """主页 USAGE 卡: 每 300s 拉一次 GLM/DeepSeek (有 KEY 才拉)."""
-        nowm = time.monotonic()
-        if nowm - self._usage_at <= 300:
-            return
-        self._usage_at = nowm
-        if self.cfg.get("glm_key"):
-            self.net.job("usage:glm", self._usage_fn("glm"), 300)
-        if self.cfg.get("ds_key"):
-            self.net.job("usage:ds", self._usage_fn("ds"), 300)
-
-    def _usage_fn(self, which):
-        key = self.cfg.get("glm_key" if which == "glm" else "ds_key", "")
-
-        def f():
-            if which == "glm":
-                return fetchers.glm_usage(key)
-            return fetchers.ds_balance(key)
-        return f
 
     def poll_tool(self):
         """工具子应用按需取数 (poll 每秒调; TTL 层去重)."""
@@ -4644,9 +4587,6 @@ class App:
                     self.qrlogin = None
                     self.qr_poll_at = 0.0
                     return True
-                if self.tool == "ssq" and self.sq_cam:
-                    self._sq_cam_key(k)        # 拍照兑奖模态: Esc 逐层退
-                    return True
                 if self.tool == "tv" and self.tv_playing:
                     self.tv_stop()             # 播放态 Esc → 回列表 (不退 app)
                 elif self.tool == "music" and self.mu_input:
@@ -4905,8 +4845,8 @@ class App:
     SET_TABS = ("卡片", "主题")
 
     def _card_on(self, ck):
-        """卡片有效开关态 (缺省: usage 关, 其余开) — 计数/开关/绘制同源."""
-        return self.cfg["cards"].get(ck, ck != "usage")
+        """卡片有效开关态 (缺省全开) — 计数/开关/绘制同源."""
+        return self.cfg["cards"].get(ck, True)
 
     def _card_on_n(self):
         return sum(1 for ck in CARD_KEYS if self._card_on(ck))
@@ -4924,22 +4864,20 @@ class App:
         if self.SET_TABS[self.set_tab] == "主题":
             return [("theme:%d" % i, t["name"])
                     for i, t in enumerate(THEMES)]
-        return [("key:glm", "GLM KEY"), ("key:ds", "DS KEY"),
-                ("key:cloud", "账户服务器"),
+        return [("key:cloud", "账户服务器"),
                 ("login", "更换账户" if self.cfg.get("cloud_tok")
                  else "登录"),
                 ("qrlogin", "扫码登录 (免输token)"),
                 ("reg", "注册新账号"), ("logout", "退出登录"),
                 ("key:admin", "管理员 TOKEN"), ("minv", "生成注册码"),
                 ("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
-                ("sw:fin", "自选股"), ("sw:usage", "USAGE 卡"),
+                ("sw:fin", "自选股"),
                 ("sw:sched", "提醒/行程卡")]
 
     def cfg_save(self):
         netmod.save_json_file(SETTINGS_FILE, self.cfg)
-        self._usage_at = 0.0                   # KEY 变更 → 下轮 poll 重取 usage
 
-    SET_CFGKEYS = {"glm": "glm_key", "ds": "ds_key",
+    SET_CFGKEYS = {
                    "cloud": "cloud_url", "tok": "cloud_tok",
                    "admin": "cloud_admin"}
 
@@ -4976,7 +4914,7 @@ class App:
         if self.set_edit is not None:          # KEY 弹窗编辑态: ASCII 直输
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.cfg[self.SET_CFGKEYS.get(self.set_edit,
-                                              "glm_key")] = \
+                                              "cloud_url")] = \
                     self.set_buf.strip()
                 self.cfg_save()
                 self.set_edit = None
@@ -5006,13 +4944,7 @@ class App:
         if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
             rows = self._set_rows()
             rid = rows[min(self.set_sel, len(rows) - 1)][0]
-            if rid == "key:glm":
-                self.set_edit = "glm"
-                self.set_buf = ""              # 清空重输 (防拼接污染)
-            elif rid == "key:ds":
-                self.set_edit = "ds"
-                self.set_buf = ""
-            elif rid.startswith("sw:"):
+            if rid.startswith("sw:"):
                 ck = rid.split(":", 1)[1]
                 cur = self._card_on(ck)
                 if cur:                          # ON → OFF 随意
@@ -5314,9 +5246,8 @@ class App:
                     v = self.cfg.get("cloud_url", "")
                 else:
                     v = self.cfg.get(
-                        {"key:glm": "glm_key", "key:ds": "ds_key",
-                         "key:tok": "cloud_tok",
-                         "key:admin": "cloud_admin"}.get(rid, "glm_key"), "")
+                        {"key:tok": "cloud_tok",
+                         "key:admin": "cloud_admin"}.get(rid, "cloud_url"), "")
                 text(surf, clip_text((self._set_mask(v) if rid != "key:cloud"
                                       else v) or "未设置", 12, 110),
                      12, hi if v else dim, (W - 14, y), right=True)
@@ -5347,9 +5278,8 @@ class App:
                     text(surf, "✓", 12, hi, (W - 16, y), right=True)
         # ── KEY 输入弹窗 (覆盖) ──
         if self.set_edit is not None:
-            lab = {"glm": "输入 GLM KEY", "ds": "输入 DS KEY",
-                   "cloud": "输入云地址 URL", "tok": "输入云 TOKEN"}.get(
-                       self.set_edit, "输入")
+            lab = {"cloud": "输入云地址 URL",
+                   "tok": "输入云 TOKEN"}.get(self.set_edit, "输入")
             box = pygame.Rect(30, 50, W - 60, 64)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
@@ -6559,135 +6489,11 @@ class App:
     SSQ_RED, SSQ_BLUE = (224, 32, 32), (42, 107, 224)
 
     def ssq_key(self, k):
-        # 拍照兑奖状态机吞键 (模态); Esc 逐层退 (done→shot→aim→关闭)
-        if self.sq_cam:
-            return self._sq_cam_key(k)
-        if k == pygame.K_5:
-            return self._sq_cam_open()
-        if k == pygame.K_6:
-            if self.ssq_last:
-                self.sq_res = self.ssq_last
-                self.sq_cam = "done"
-                self.sq_scroll = 0
-                return True
-            self.osd = ("还没有兑奖记录", time.monotonic() + 1.5)
-            return True
         if k in (pygame.K_UP, pygame.K_DOWN):
             n = len((self.data.get("ssq") or {}).get("issues") or [])
             d = -1 if k == pygame.K_UP else 1
             self.ssq_scroll = max(0, min(n - 1, self.ssq_scroll + d))
         return True
-
-    # ── 双色球拍照兑奖 (单机: rpicam-jpeg + GLM-4V-Flash + 客户端判奖) ──
-    def _sq_cam_open(self):
-        if not self.cfg.get("glm_key"):
-            self.osd = ("需要 GLM KEY · 设置里填", time.monotonic() + 2.5)
-            return True
-        self.sq_cam = "aim"
-        self.sq_shot = None
-        self.sq_res = None
-        self._sq_prev_start()
-        return True
-
-    def _sq_prev_start(self):
-        """实时取景线程: 预览流最新帧解码成 RGB bytes (draw 用 frombuffer)."""
-        self.sq_prev_frame = None             # (rgb bytes, w, h)
-        self.sq_prev_stop = False
-        app = self
-
-        def run():
-            try:
-                for jpeg in fetchers.ssq_preview_iter():
-                    if app.sq_prev_stop:
-                        break
-                    try:
-                        s = pygame.image.load(io.BytesIO(jpeg)).convert()
-                        app.sq_prev_frame = (pygame.image.tostring(
-                            s, "RGB"), s.get_width(), s.get_height())
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        threading.Thread(target=run, daemon=True).start()
-
-    def _sq_prev_stop(self):
-        self.sq_prev_stop = True
-        self.sq_prev_frame = None
-        fetchers.ssq_preview_stop()
-
-    def _sq_cam_close(self):
-        if self.sq_cam == "aim":
-            self._sq_prev_stop()              # 取景进程随状态机关闭
-        self.sq_cam = None
-        self.sq_shot = None
-        self.sq_res = None
-        return True
-
-    def _sq_cam_key(self, k):
-        st = self.sq_cam
-        if k == pygame.K_ESCAPE:
-            if st == "done":
-                self.sq_cam = None       # 复看模式 (6 键进来): 直接回列表
-                return True
-            if st == "shot" or st == "up":
-                self.sq_cam = "aim"      # 重拍 / 取消识别
-                self.sq_shot = None
-                self._sq_prev_start()
-                return True
-            return self._sq_cam_close()  # aim / OCR 中也允许放弃
-        if st == "aim" and k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            self._sq_prev_stop()             # 快门前先停取景 (释放摄像头)
-            self.sq_cam = "cap"
-            self.net.job("ssqcap", lambda: self._sq_cap_fn(), ttl=10)
-            return True
-        if st == "shot" and k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            self.sq_cam = "up"
-            self.net.job("ssqocr", lambda: self._sq_ocr_fn(), ttl=60)
-            return True
-        if st == "done":
-            if k in (pygame.K_UP, pygame.K_DOWN):
-                n = len((self.sq_res or {}).get("rows") or [])
-                d = -1 if k == pygame.K_UP else 1
-                self.sq_scroll = max(0, min(n - 1, self.sq_scroll + d))
-                return True
-            return True                    # 其余键吞掉 (防误触底层)
-        return True                        # cap/up 期间吞全部键
-
-    def _sq_cap_fn(self):
-        """拍摄 worker: rpicam-jpeg 单拍 → 临时文件. 先让取景进程释放传感器."""
-        time.sleep(0.8)
-        p = os.path.join(tempfile.gettempdir(), "oneapp_sq_shot.jpg")
-        n = fetchers.ssq_capture_photo(p)
-        return {"ok": n is not None, "path": p if n else None}
-
-    def _sq_ocr_fn(self):
-        """识别 worker: 读 jpg → GLM-4V-Flash → 形状校验注单."""
-        key = (self.cfg.get("glm_key") or "").strip()
-        try:
-            data = open(self.sq_shot, "rb").read()
-        except Exception:
-            return {"ok": False, "err": "照片文件丢失"}
-        o = fetchers.ssq_ocr_scan(data, key)
-        if not o.get("ok"):
-            return o
-        issue = None                      # 期号裁决 → 判奖
-        issues = (self.data.get("ssq") or {}).get("issues") or []
-        code = o.get("issue") or ""
-        for it in issues:                 # 票面期号在历史里才判; 无期号按最新期
-            if it.get("code") == code:
-                issue = it
-                break
-        found = issue is not None
-        if issue is None and issues and not code:
-            issue = issues[0]
-        rows = fetchers.ssq_judge(o.get("bets") or [], issue) if issue else []
-        res = {"ok": True, "issue": code, "found": found, "codes": [it.get("code")
-               for it in issues], "bets": o.get("bets") or [],
-               "invalid": o.get("invalid") or 0, "rows": rows,
-               "at": time.strftime("%Y-%m-%d %H:%M")}
-        netmod.save_json_file(SSQ_SCAN_CACHE, res)   # 本地留档 (不含照片)
-        self.ssq_last = res
-        return res
 
     def timer_key(self, k):
         if self.tm_run:
@@ -7282,13 +7088,13 @@ class App:
                     (ix + iw // 2 + 3, iy + ih // 2 + 1),
                     (ix + iw // 2, iy + ih // 2 + 1)])
 
-        # ── 右列卡片: 按设置显隐 (每日一句/新闻/自选股/USAGE) 动态堆叠 ──
+        # ── 右列卡片: 按设置显隐 (提醒行程/每日一句/新闻/自选股) 动态堆叠 ──
         cx = M + LW + M                            # 124
         cw2 = W - cx - M                           # 192
         ck = self.cfg.get("cards", {})
         vis = [(lab, key) for lab, key in
                (("提醒/行程", "sched"), ("每日一句", "hitokoto"),
-                ("新闻", "news"), ("USAGE", "usage"), ("自选股", "fin"))
+                ("新闻", "news"), ("自选股", "fin"))
                if self._card_on(key)][:3]      # 右列最多 3 卡 (用户定版)
         nc = max(1, len(vis))
         gap = M
@@ -7378,47 +7184,6 @@ class App:
                      BODY, dim, (cx + 8, top2 + 13 + (chh - 13 - BODY) // 2))
     
     # ── 行情页: 自选/指数/商品 三子页 ──
-        # USAGE 卡: GLM / DeepSeek 轮播 (4s 切换, 无跑马灯)
-        topu = tops.get("USAGE")
-        if topu is not None:
-            g = self.data.get("usage:glm") or {}
-            d = self.data.get("usage:ds") or {}
-            has_g = bool(self.cfg.get("glm_key"))
-            has_d = bool(self.cfg.get("ds_key"))
-            opts = []
-            if has_g:
-                opts.append(("GLM", g))
-            if has_d:
-                opts.append(("DS", d))
-            vy3 = topu + 13 + (chh - 13 - BODY) // 2
-            if not opts:
-                text(surf, "设置里填 API KEY", BODY, dim, (cx + 8, vy3))
-            else:
-                ulab, udat = opts[int(now // 4) % len(opts)]
-                if not udat.get("ok"):
-                    utxt = "获取中…" if not udat.get("err") \
-                        else "失败 " + udat.get("err", "")[:14]
-                    text(surf, utxt, BODY, soft, (cx + 8, vy3))
-                elif ulab == "GLM":
-                    # 两行: 5H/7D 用量% + 5h 窗重置时刻 (用户定版 2026-11-19)
-                    text(surf, "GLM 5H %s%% / 7D %s%%" % (
-                            udat.get("p5") if udat.get("p5") is not None
-                            else "?",
-                            udat.get("pw") if udat.get("pw") is not None
-                            else "?"),
-                         BODY, soft, (cx + 8, topu + 16))
-                    t5 = udat.get("t5")
-                    if t5:
-                        lt5 = time.localtime(t5 / 1000.0)
-                        if lt5[:3] == time.localtime()[:3]:   # 今天 → 只显时刻
-                            rt = "%02d:%02d" % (lt5.tm_hour, lt5.tm_min)
-                        else:
-                            rt = "%02d-%02d %02d:%02d" % (lt5.tm_mon,
-                                 lt5.tm_mday, lt5.tm_hour, lt5.tm_min)
-                        text(surf, "重置 %s" % rt, 10, dim, (cx + 8, topu + 31))
-                else:
-                    text(surf, "DS 余额 ¥%s" % (udat.get("cny") or "?"),
-                         BODY, soft, (cx + 8, vy3))
         # 提醒/行程卡: 最近条目单行居中, 3s 轮播 (300s 节流后台拉新)
         tops_s = tops.get("提醒/行程")
         if tops_s is not None:
@@ -8018,95 +7783,10 @@ class App:
         return "{:,}".format(float("%.6g" % v))
 
     # ── 工具·双色球 ──
-    def draw_sqcam(self, surf, acc, hi, soft, dim):
-        """拍照兑奖流程页 (sq_cam 状态机): aim/cap/shot/up/done."""
-        st = self.sq_cam
-        self.tool_head(surf, "双色球 · 拍照兑奖", "Esc 返回", hfs=10)
-        if st == "aim":
-            fr = self.sq_prev_frame
-            if fr:
-                img = pygame.image.frombuffer(fr[0], (fr[1], fr[2]), "RGB")
-                surf.blit(img, (0, 20))          # 320×240 取景, 底部溢出裁掉
-            else:
-                textc(surf, "取景启动中…", 12, dim, W // 2, 60)
-            bar = pygame.Rect(0, H - 30, W, 30)
-            pygame.draw.rect(surf, (10, 10, 12), bar)   # 取景上压操作条
-            textc(surf, "对准票面 · Enter 拍摄 · Esc 返回", 12,
-                  acc, W // 2, H - 24)
-        elif st == "cap":
-            textc(surf, "拍摄中… 保持对准", 14, hi, W // 2, 76)
-        elif st == "shot":
-            try:
-                ph = pygame.image.load(self.sq_shot)
-                ph = pygame.transform.smoothscale(
-                    ph.convert(), (240, 135))
-                surf.blit(ph, ((W - 240) // 2, 18))
-            except Exception:
-                textc(surf, "(照片无法显示)", 11, dim, W // 2, 70)
-            textc(surf, "Enter 识别 · Esc 重拍", 12, acc, W // 2, 156)
-        elif st == "up":
-            textc(surf, "识别中…", 15, hi, W // 2, 64)
-            textc(surf, "GLM 视觉 · 约 10 秒", 11, soft, W // 2, 88)
-        elif st == "done":
-            res = self.sq_res or {}
-            rows = res.get("rows") or []
-            code = res.get("issue") or "?"
-            when = (res.get("at") or "")[5:16]
-            if res.get("found") is False and res.get("issue"):
-                head = "第 %s 期 · 该期未开奖 (仅识号不判奖)" % code
-            elif res.get("issue"):
-                head = "第 %s 期 · %s 判定" % (code, when)
-            else:
-                head = "未识出期号 · 按最新期判定 · %s" % when
-            textc(surf, clip_text(head, 11, W - 16), 11,
-                  hi if res.get("found") else dim, W // 2, 20)
-            if not rows and not res.get("bets"):
-                textc(surf, "未识别到注单", 13, dim, W // 2, 70)
-            else:
-                rows_n = len(rows)
-                if rows_n:
-                    vis = 5
-                    self.sq_scroll = max(0, min(self.sq_scroll,
-                                                rows_n - 1))
-                    for vi in range(vis):
-                        ri = self.sq_scroll + vi
-                        if ri >= rows_n:
-                            break
-                        row = rows[ri]
-                        y = 38 + vi * 18
-                        sel = ri == self.sq_scroll
-                        if sel:
-                            pygame.draw.rect(surf, self.th("track"),
-                                             (6, y - 2, W - 12, 16),
-                                             border_radius=3)
-                        self._ssq_balls(surf, row.get("reds") or [],
-                                        row.get("blue") or 0, 10, y, 6)
-                        pz = row.get("prize")
-                        lab = pz if pz else "未中"
-                        col = acc if pz else dim
-                        if pz:
-                            m = row.get("money") or 0
-                            lab += " · " + (("%.2f 万" % (m / 1e4))
-                                            if m >= 1e4 else "%d 元" % m)
-                        text(surf, clip_text(lab, 11, 120), 11, col,
-                             (W - 8 - textw(clip_text(lab, 11, 120), 11),
-                              y + 1), right=True)
-                    if rows_n > vis:
-                        textc(surf, "↑↓ %d/%d" % (self.sq_scroll + 1,
-                                                  rows_n), 10, dim,
-                              W // 2, 130)
-                iv = res.get("invalid") or 0
-                if iv:
-                    textc(surf, "%d 注形状异常已剔除" % iv, 10, dim,
-                          W // 2, 140 if rows_n > 5 else 130)
-            textc(surf, "Esc 返回", 11, soft, W // 2, 156)
-
     def draw_ssq(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
-        if self.sq_cam:
-            return self.draw_sqcam(surf, acc, hi, soft, dim)
-        self.tool_head(surf, "双色球", "↑↓ 选期 · 5 拍照 · 6 上次")
+        self.tool_head(surf, "双色球", "↑↓ 选期")
         j = self.data.get("ssq") or {}
         issues = (j.get("issues") or []) if j.get("ok") else []
         if not issues:

@@ -1617,37 +1617,23 @@ def test_settings_app():
     app = dash.App(FakeNet())
     app.tool = "set"                          # 卡片页签 (默认)
     assert app.set_tab == 0
-    # 卡片页签: sel=0 = GLM KEY → Enter 弹窗 → 输入 → Enter 保存
-    app.key(pygame.K_RETURN)
-    assert app.set_edit == "glm"
-    # 弹窗内 Esc → 关弹窗保持设置页 (用户定版: 不退出设置)
-    app.key(pygame.K_ESCAPE)
-    assert app.set_edit is None and app.tool == "set"
-    # 重新进弹窗 → 输入 → 保存
-    app.key(pygame.K_RETURN)
-    assert app.set_edit == "glm"
-    for c in "abc123":
-        app.key(0, c)
-    app.key(pygame.K_RETURN)                  # 保存
-    assert app.set_edit is None
-    assert app.cfg["glm_key"] == "abc123"
     import stat as stat_mod
     assert stat_mod.S_IMODE(os.stat(dash.SETTINGS_FILE).st_mode) == 0o600
-    # sw:usage 行 (sel=12, qrlogin 插入后移; sched 行在 13) → 有效 4 张被拒
-    app.cfg["cards"].update(hitokoto=True, news=True, fin=True, usage=False)
-    assert app._set_rows()[12][0] == "sw:usage"
-    assert app._set_rows()[13][0] == "sw:sched"    # 提醒/行程卡 = 末行
-    assert app._card_on_n() == 4
-    app.set_sel = 12
-    app.key(pygame.K_RETURN)
-    assert app.cfg["cards"].get("usage") is not True   # 被拒, 保持未开
+    # 卡片开关 (USAGE 卡已移除, 4 张: sched/hitokoto/news/fin 缺省全开):
+    # 4 张有效 → 关 fin (随意) → 再开 fin 被拒 (>3) → 关新闻 → fin 可开
+    rows = app._set_rows()
+    sw_fin = [i for i, r in enumerate(rows) if r[0] == "sw:fin"][0]
+    app.set_sel = sw_fin
+    app.key(pygame.K_RETURN)                  # ON → OFF 随意
+    assert app.cfg["cards"].get("fin") is False
+    assert app._card_on_n() == 3
+    app.key(pygame.K_RETURN)                  # OFF → ON 到 4 → 被拒
+    assert app.cfg["cards"].get("fin") is not True
     assert app.osd and "先关" in app.osd[0], app.osd
-    # 关掉自选股+新闻 → 有效 2 张 → usage 可开 (开完 3 张满员)
-    app.cfg["cards"]["fin"] = False
-    app.cfg["cards"]["news"] = False
+    app.cfg["cards"]["news"] = False          # 关新闻 → 有效 2 → fin 可开
     assert app._card_on_n() == 2
     app.key(pygame.K_RETURN)
-    assert app.cfg["cards"].get("usage") is True
+    assert app.cfg["cards"].get("fin") is True
     assert app._card_on_n() == 3
     app.draw(canvas)                          # 设置页渲染冒烟 (KEY 掩码/开关)
     # 主题页签: ←→ 切到 主题 → 选 纯黑 (theme:6) → theme_idx 应用
@@ -1659,18 +1645,11 @@ def test_settings_app():
     assert app.theme_idx == 6, app.theme_idx
     import json as json_mod
     assert json_mod.load(open(dash.THEME_FILE)).get("idx") == 6
-    # 主页: USAGE 卡渲染 (真实轮播数据; GLM=5H/7D 用量+重置 两行, DS=余额)
+    # 主页渲染冒烟 (USAGE 卡已移除, 右列只剩 提醒行程/每日一句/新闻/自选股)
     app.tool = None
     app.page = 0
-    app.data["usage:glm"] = {"ok": True, "p5": 12, "pw": 34,
-                             "r5": 10604, "rw": 57956,
-                             "t5": _time.time() * 1000 + 3600_000}
-    app.data["usage:ds"] = {"ok": True, "cny": "110.00"}
-    app.draw(canvas)                       # GLM 帧
-    app.data["usage:glm"] = {"ok": True, "p5": None, "pw": None, "t5": None}
-    app.draw(canvas)                       # GLM 缺字段帧 (百分比→? 无重置行)
-    app.draw(canvas)                       # DS 帧 (4s 轮播另一态)
-    print("settings app OK (tabs/key popup 0600/toggle/remind/theme apply/usage)")
+    app.draw(canvas)
+    print("settings app OK (tabs/key popup 0600/toggle/remind/theme apply)")
 
 
 
@@ -1686,15 +1665,15 @@ def test_cloud():
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
     assert [r[0] for r in app._set_rows()].count("key:cloud") == 1
-    # ≤3 归一: 5 张全开 (含 sched 缺省 True) → 只保留前 3, 其余显式 False
-    app.cfg["cards"].update(hitokoto=True, news=True, fin=True, usage=True)
+    # ≤3 归一: 4 张全开 (含 sched 缺省 True) → 只保留前 3, 其余显式 False
+    app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
     app._card_norm()
     assert app._card_on_n() == 3
     assert [ck for ck in dash.CARD_KEYS if app._card_on(ck)] ==         list(dash.CARD_KEYS[:3])
-    # 计数含缺省键: sched 缺省 True + 显式 3 张 = 有效 4 → 开第 5 张被拒
-    app.cfg["cards"] = {"hitokoto": True, "news": True, "usage": True,
+    # 计数含缺省键: sched 缺省 True + 显式 2 张 = 有效 3 → 开 fin 被拒
+    app.cfg["cards"] = {"hitokoto": True, "news": True,
                         "fin": False}
-    assert app._card_on_n() == 4
+    assert app._card_on_n() == 3
     rows = app._set_rows()
     app.tool = "set"
     app.set_tab = 0
@@ -1857,10 +1836,10 @@ def test_reg():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     app = dash.App(FakeNet())
     assert "reg" in [r[0] for r in app._set_rows()]
-    # rid=reg 行 (sel=5, qrlogin 插入后移) → Enter 开表单
+    # rid=reg 行 (sel=3, glm/ds 行移除后前移) → Enter 开表单
     app.tool = "set"
-    assert app._set_rows()[5][0] == "reg"
-    app.set_sel = 5
+    assert app._set_rows()[3][0] == "reg"
+    app.set_sel = 3
     app.key(pygame.K_RETURN)
     assert app.reg == {"name": "", "invite": "", "field": 0}
     # F/X/Z/C 真实键值 = 字母 (丝印方向让位, _silk_input_active 含 reg 表单;
@@ -1928,9 +1907,9 @@ def test_login():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     app = dash.App(FakeNet())
     rows = [r[0] for r in app._set_rows()]
-    assert rows.index("login") == 3 and rows.index("qrlogin") == 4 \
-        and rows.index("reg") == 5
-    assert rows[2] == ("key:cloud")
+    assert rows.index("login") == 1 and rows.index("qrlogin") == 2 \
+        and rows.index("reg") == 3
+    assert rows[0] == ("key:cloud")
     app.tool = "set"
     app.draw(canvas)                       # 未登录: login 行右侧 "未登录"
     app.set_sel = rows.index("login")
@@ -2306,154 +2285,6 @@ def test_kv_sync():
           "align-confirm/modal-swallow/enter-upload/esc-overwrite/"
           "no-push-on-apply/not-logged-in/netfail-no-push/404-first-push/"
           "page-pull/clamp)")
-
-
-def test_ssq_scan():
-    """双色球拍照兑奖: 判奖规则表/OCR 解析校验/键位状态机/留档 roundtrip."""
-    import dash
-    import fetchers
-    pygame.init()
-    pygame.display.set_mode((1, 1))
-    canvas = pygame.Surface((dash.W, dash.H))
-    tmp = tempfile.mkdtemp(prefix="oneapp")
-    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
-    scan_p = os.path.join(tmp, "ssq_scan.json")
-    dash.SSQ_SCAN_CACHE = scan_p
-    json.dump({"glm_key": "k" * 24}, open(dash.SETTINGS_FILE, "w"))
-    app = dash.App(FakeNet())
-    app.tool = "ssq"
-    app.data["ssq"] = {"ok": True, "issues": [
-        {"code": "2025132", "date": "2025-11-18", "week": "二",
-         "reds": [1, 2, 3, 4, 5, 6], "blue": 8, "grades": [
-             {"level": i, "money": i * 100, "num": 1} for i in range(1, 7)]},
-        {"code": "2025131", "date": "2025-11-16", "week": "日",
-         "reds": [9, 10, 11, 12, 13, 14], "blue": 9, "grades": []}]}
-    try:
-        # ── 判奖规则表 (对齐 hermes judge_bets 全 10 形状) ──
-        it = app.data["ssq"]["issues"][0]
-        J = fetchers.ssq_judge
-        cases = [(([1,2,3,4,5,6],8),"1等奖"), (([1,2,3,4,5,6],9),"2等奖"),
-                 (([1,2,3,4,5,7],8),"3等奖"), (([1,2,3,4,5,7],9),"4等奖"),
-                 (([1,2,3,4,10,11],8),"4等奖"), (([1,2,3,4,10,11],9),"5等奖"),
-                 (([1,2,3,10,11,12],8),"5等奖"), (([1,2,3,10,11,12],9),None),
-                 (([10,11,12,13,14,15],8),"6等奖"), (([10,11,12,13,14,15],9),None)]
-        for (reds, blue), want in cases:
-            got = J([{"reds": reds, "blue": blue}], it)[0]
-            assert got["prize"] == want, (reds, blue, got)
-        assert J([{"reds":[1,2,3,4,5,6],"blue":8}], it)[0]["money"] == 100
-        assert J([{"reds":[1,2],"blue":8}], it)[0]["prize"] is None
-        # ── OCR 解析: 正常/越界/重复/非 JSON/前后杂语 ──
-        orig_urlopen = dash_mod_urlopen = fetchers.urllib.request.urlopen
-        def fake_urlopen(req, timeout=30):
-            txt = getattr(test_ssq_scan, "_ocr_txt", "")
-            import io
-            body = json.dumps({"choices": [{"message": {"content": txt}}]
-                               }).encode()
-            return io.BytesIO(body)     # 读接口足够 (r.status 未用? 用 .read)
-        fetchers.urllib.request.urlopen = fake_urlopen
-        try:
-            test_ssq_scan._ocr_txt = json.dumps({
-                "issue": "2025132", "bets": [
-                    {"reds": [3,1,5,4,2,6], "blue": 8},      # 乱序 → sorted
-                    {"reds": [1,1,2,3,4,5], "blue": 8},      # 重复红 → 剔
-                    {"reds": [1,2,3,4,5,34], "blue": 8},     # 越界 → 剔
-                    {"reds": [1,2,3,4,5], "blue": 8}]})      # 5红 → 剔
-            o = fetchers.ssq_ocr_scan(b"jpeg", "k")
-            assert o["ok"] and o["issue"] == "2025132" and o["invalid"] == 3
-            assert o["bets"] == [{"reds": [1,2,3,4,5,6], "blue": 8}]
-            test_ssq_scan._ocr_txt = '垃圾前缀 {"issue":"x","bets":[]} 后缀'
-            o = fetchers.ssq_ocr_scan(b"j", "k")
-            assert o["ok"] and o["issue"] == "" and o["bets"] == []
-            test_ssq_scan._ocr_txt = "not json at all"
-            assert fetchers.ssq_ocr_scan(b"j", "k")["ok"] is False
-            test_ssq_scan._ocr_txt = ""
-            assert fetchers.ssq_ocr_scan(b"j", "k")["ok"] is False
-        finally:
-            fetchers.urllib.request.urlopen = orig_urlopen
-        # ── 键位状态机: 5→aim→cap→shot→ocr→done, Esc 逐层 ──
-        app.sq_cam = None
-        app.ssq_key(pygame.K_5)
-        assert app.sq_cam == "aim"          # 有 glm_key → 直接进 aim
-        app.ssq_key(pygame.K_ESCAPE)
-        assert app.sq_cam is None
-        app.cfg["glm_key"] = ""
-        app.ssq_key(pygame.K_5)              # 无 key → OSD 拦截不进
-        assert app.sq_cam is None
-        app.cfg["glm_key"] = "k" * 24
-        app.ssq_key(pygame.K_5)
-        assert app.sq_cam == "aim"
-        app.ssq_key(pygame.K_RETURN)         # Enter → cap (job 入队)
-        assert app.sq_cam == "cap"
-        fn = app.net.last_job("ssqcap")
-        assert fn is not None
-        # worker: rpicam-jpeg 不在 Mac → 拍摄失败回执
-        d = fn()
-        app.on_net("data", "ssqcap", d)
-        assert app.sq_cam == "aim"          # 失败回 aim
-        # 假拍摄成功 (直接给回执): → shot 冻结预览
-        shot_p = os.path.join(tmp, "shot.jpg")
-        json.dump({}, open(shot_p, "w"))    # 任意文件占位 (draw 会降级)
-        app.on_net("data", "ssqcap", {"ok": True, "path": shot_p})
-        assert app.sq_cam == "shot" and app.sq_shot == shot_p
-        app.draw(canvas)                    # shot 渲染 (照片加载失败降级文字)
-        app.ssq_key(pygame.K_RETURN)         # Enter → ocr (job 入队)
-        assert app.sq_cam == "up"
-        assert app.net.last_job("ssqocr") is not None
-        # worker: monkeypatch fetchers.ssq_ocr_scan → 期号命中 → 判奖落盘
-        orig_scan = fetchers.ssq_ocr_scan
-        fetchers.ssq_ocr_scan = lambda data, key, timeout=40: {
-            "ok": True, "issue": "2025132",
-            "bets": [{"reds": [1,2,3,4,5,6], "blue": 8}], "invalid": 0}
-        try:
-            d = app._sq_ocr_fn()            # 直接调 worker (读 sq_shot)
-        finally:
-            fetchers.ssq_ocr_scan = orig_scan
-        assert d["found"] and d["rows"][0]["prize"] == "1等奖"
-        app.on_net("data", "ssqocr", d)
-        assert app.sq_cam == "done" and app.sq_scroll == 0
-        app.draw(canvas)                    # done 渲染冒烟
-        # 留档 roundtrip + 6 键复看
-        saved = json.load(open(scan_p))
-        assert saved["rows"][0]["prize"] == "1等奖" and "bets" in saved
-        assert app.ssq_last == saved
-        app.sq_cam = None
-        app.ssq_key(pygame.K_6)              # 6 = 查看上次
-        assert app.sq_cam == "done"
-        app.ssq_key(pygame.K_UP)
-        assert app.sq_scroll == 0           # 1 行列表 ↑ 不动
-        app.ssq_key(pygame.K_ESCAPE)
-        assert app.sq_cam is None           # 复看 Esc → 直接回列表
-        # 未开奖: 期号不在历史 → found=False rows=[] 不误判
-        app.on_net("data", "ssqcap", {"ok": True, "path": shot_p})
-        app.sq_cam = "shot"
-        app.ssq_key(pygame.K_RETURN)
-        fetchers.ssq_ocr_scan = lambda data, key, timeout=40: {
-            "ok": True, "issue": "2099999",
-            "bets": [{"reds": [1,2,3,4,5,6], "blue": 8}], "invalid": 0}
-        try:
-            d = app._sq_ocr_fn()
-        finally:
-            fetchers.ssq_ocr_scan = orig_scan
-        assert d["found"] is False and d["rows"] == []
-        assert json.load(open(scan_p))["found"] is False
-        # 无期号 → 按最新期 (2025132) 判
-        fetchers.ssq_ocr_scan = lambda data, key, timeout=40: {
-            "ok": True, "issue": "",
-            "bets": [{"reds": [1,2,3,4,5,6], "blue": 8}], "invalid": 0}
-        try:
-            d = app._sq_ocr_fn()
-        finally:
-            fetchers.ssq_ocr_scan = orig_scan
-        assert d["issue"] == "" and d["found"] is False
-        assert d["rows"][0]["prize"] == "1等奖"    # 按 issues[0] 判
-        # 工具态 Esc 拦截: sq_cam 模态时 Esc 走状态机不关工具
-        app.sq_cam = "aim"
-        app.key(pygame.K_ESCAPE, "")
-        assert app.sq_cam is None and app.tool == "ssq"   # 状态机关了, 工具没关
-    finally:
-        pass
-    print("ssq_scan OK (judge-table/ocr-parse/keys-flow/file-roundtrip/"
-          "not-drawn/latest-fallback/esc-modal)")
 
 
 def test_mail_keys():
@@ -3519,6 +3350,7 @@ if __name__ == "__main__":
     test_mail_accounts()
     test_settings_app()
     test_cloud()
+    test_kv_sync()
     test_sched()
     test_reg()
     test_login()
