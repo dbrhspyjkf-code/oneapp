@@ -1819,10 +1819,16 @@ class App:
                     except OSError:
                         lm = 0.0
                     cu = b.get("updated") or 0
+                    local = netmod.load_json_file(KV_FILES[k], None)
                     if cu > lm + 2:
                         self.kv_apply(k, b.get("v"))   # 云端更新 → 覆盖
                     elif lm > cu + 2:
-                        self.kv_push(k)                # 本地更新 → 补推
+                        if self._kv_nonempty(local):
+                            self.kv_push(k)            # 本地更新 → 补推
+                        elif self._kv_nonempty(b.get("v")):
+                            # 本地空且更新 → 不补推 (陈旧空列表盖云端 =
+                            # 2026-11-20 收藏清零事故), 跟随云端救回
+                            self.kv_apply(k, b.get("v"))
                 elif b.get("st") == 404:       # 云端没存过: 本地非空即首推
                     local = netmod.load_json_file(KV_FILES[k], None)
                     if local:
@@ -2328,6 +2334,15 @@ class App:
             self.net.invalidate(("job", "kvsync:" + k))
             self.net.job("kvsync:" + k, lambda k=k: self._kv_get_fn(k),
                          ttl=10)
+
+    @staticmethod
+    def _kv_nonempty(v):
+        """kv 值非空判定 (列表类/字典类通用): 收藏清零防护用."""
+        if isinstance(v, list):
+            return len(v) > 0
+        if isinstance(v, dict):
+            return len(v.get("items", []) or []) > 0
+        return False
 
     def kv_pull(self, k, ttl=60):
         """页面级静默拉取 (开机 LWW 的兜底): 开机拉取撞上 WiFi 未就绪

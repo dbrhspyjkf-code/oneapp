@@ -2234,6 +2234,34 @@ def test_kv_sync():
         app.on_net("data", "kvsync:watch",
                    app.net.last_job("kvsync:watch")())
         assert app.net.last_job("kvput:watch") is not None
+        # 本地空列表 mtime 较新 + 云端非空 → 不补推 (陈旧空列表盖云端 =
+        # 2026-11-20 收藏清零事故), 跟随云端救回
+        json.dump([], open(fr, "w"))
+        os.utime(fr, (now + 200, now + 200))    # 本地明显"更新"
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": ["cloud1", "cloud2"], "updated": now}).encode())
+        n_puts = len([t for t, _ in app.net.jobs if t.startswith("kvput:")])
+        app.on_net("data", "kvsync:radio_fav",
+                   app.net.last_job("kvsync:radio_fav")())
+        assert len([t for t, _ in app.net.jobs
+                    if t.startswith("kvput:")]) == n_puts    # 没有补推
+        assert app.radio_fav == ["cloud1", "cloud2"]         # 跟随云端
+        # watch 同规则 (字典类): 本地 items 空 + 云端非空 → 跟随云端
+        json.dump({"items": []}, open(fw, "w"))
+        os.utime(fw, (now + 200, now + 200))
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": {"items": [{"code": "sh600519"}]},
+             "updated": now}).encode())
+        n_puts = len([t for t, _ in app.net.jobs if t.startswith("kvput:")])
+        app.on_net("data", "kvsync:watch",
+                   app.net.last_job("kvsync:watch")())
+        assert len([t for t, _ in app.net.jobs
+                    if t.startswith("kvput:")]) == n_puts
+        assert app.watch["items"][0]["code"] == "sh600519"
+        assert dash.App._kv_nonempty([]) is False
+        assert dash.App._kv_nonempty(["x"]) is True
+        assert dash.App._kv_nonempty({"items": []}) is False
+        assert dash.App._kv_nonempty({"items": [{"code": "x"}]}) is True
         # 进页兜底拉取 kv_pull: 登录态入队
         n_jobs = len(app.net.jobs)
         app.kv_pull("radio_fav")
