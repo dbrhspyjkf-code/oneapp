@@ -7099,7 +7099,7 @@ class App:
             rr = pygame.Rect(cx, tops[lab], cw2, chh)
             pygame.draw.rect(surf, self.card(i + 1), rr, border_radius=6)
             pygame.draw.rect(surf, border, rr, 1, border_radius=6)
-            text(surf, lab, 13, dim, (rr.x + 8, rr.y + 2))   # 与农历同字号
+            text(surf, lab, 12, dim, (rr.x + 8, rr.y + 2))   # 标题 12 < 正文 13 (2026-11-20 用户: 标题/正文字号互换)
         # 每日一句: 单行跑马灯 (溢出卡宽即滚动, 同新闻卡)
         top0 = tops.get("每日一句")
         if tops.get("每日一句") is not None:
@@ -7188,14 +7188,14 @@ class App:
                 si = int(time.monotonic() // 3) % len(its)   # 3s 轮播一条
                 it2 = its[si]
                 lt2 = time.localtime(it2["t"] or time.time())
-                vy = tops_s + 13 + (chh - 13 - BODY) // 2    # 标签下垂直居中
+                vy = tops_s + 12 + (chh - 12 - BODY) // 2    # 标签(12px)下垂直居中
                 text(surf, "%02d-%02d %02d:%02d"
                      % (lt2.tm_mon, lt2.tm_mday, lt2.tm_hour, lt2.tm_min),
-                     12, soft, (cx + 8, vy))
+                     BODY, soft, (cx + 8, vy))                # 13px 下宽 82
                 text(surf, "行" if it2["kind"] == "trip" else "提",
-                     12, soft, (cx + 86, vy))
-                text(surf, clip_text(it2["text"], 12, cw2 - 110), 12,
-                     soft, (cx + 102, vy))
+                     BODY, soft, (cx + 96, vy))
+                text(surf, clip_text(it2["text"], BODY, cw2 - 123), BODY,
+                     soft, (cx + 115, vy))
             else:
                 text(surf, "暂无 · iPhone 同步后按4刷新", BODY, dim,
                      (cx + 8, tops_s + 13 + (chh - 13 - BODY) // 2))
