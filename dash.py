@@ -1753,10 +1753,25 @@ class App:
                 else:
                     self.qrlogin.update(st="fail",
                                         err=b.get("err") or "出码失败")
+            elif a == "cloudwxbind" and isinstance(b, dict):
+                if b.get("ok") and b.get("dc"):
+                    self.qrlogin = {"st": "qr", "dc": b["dc"],
+                                    "url": b["url"], "mat": b.get("mat"),
+                                    "mode": "wxbind"}
+                    self.qr_poll_at = 0.0
+                elif self.qrlogin is not None:  # 重出码失败 → 弹层报错
+                    self.qrlogin.update(st="fail",
+                                        err=b.get("err") or "出码失败")
+                else:
+                    err = b.get("err") or ("HTTP %s" % b.get("st")
+                                           if b.get("st") else "出码失败")
+                    self.osd = ("绑定失败 %s" % err,
+                                time.monotonic() + 2.5)
             elif a == "cloudqrpoll" and isinstance(b, dict) \
                     and self.qrlogin is not None:
                 stt = b.get("st")
                 isreg = (self.qrlogin or {}).get("mode") == "reg"
+                iswx = (self.qrlogin or {}).get("mode") == "wxbind"
                 if stt == "approved" and b.get("token"):
                     if not self.cfg.get("cloud_url"):
                         self.cfg["cloud_url"] = CLOUD_URL_DEFAULT
@@ -1773,12 +1788,21 @@ class App:
                     self.osd = (("注册成功 已绑定微信 %s" if isreg
                                  else "扫码登录 ✓ %s") % b.get("user"),
                                 time.monotonic() + 2.5)
+                elif stt == "bound":           # 设置·绑定微信 完成
+                    self.qrlogin = None
+                    self.qr_poll_at = 0.0
+                    self.osd = ("微信已绑定 ✓", time.monotonic() + 2.5)
                 elif stt == "none":            # 设备码过期 → 自动重出码
                     self.qr_poll_at = 0.0
                     if isreg:                  # reg: 表单已关, 存档重出
                         self.qrlogin.update(st="init")
                         self.net.invalidate(("job", "cloudregqr"))
                         self.net.job("cloudregqr", self._cloud_regqr_fn,
+                                     ttl=10)
+                    elif iswx:                 # wxbind: 直接重出绑定码
+                        self.qrlogin.update(st="init")
+                        self.net.invalidate(("job", "cloudwxbind"))
+                        self.net.job("cloudwxbind", self._cloud_wxbind_fn,
                                      ttl=10)
                     else:
                         self._cloud_qr_open()
@@ -1859,6 +1883,8 @@ class App:
             elif a == "cloudqrstart":
                 if self.qrlogin is not None:
                     self.qrlogin.update(st="fail", err="网络异常")
+            elif a == "cloudwxbind":
+                self.osd = ("绑定失败 网络异常", time.monotonic() + 2.5)
             elif a == "cloudqrpoll":
                 self.qr_poll_at = 0.0          # 网络异常: 下帧重试 poll
             elif a.startswith("kvalign:"):
@@ -4848,10 +4874,10 @@ class App:
             return [("theme:%d" % i, t["name"])
                     for i, t in enumerate(THEMES)]
         if tab == "账户":
-            return [("key:cloud", "账户服务器"),
-                    ("login", "更换账户" if self.cfg.get("cloud_tok")
+            return [("login", "更换账户" if self.cfg.get("cloud_tok")
                      else "登录"),
                     ("qrlogin", "扫码登录 (免输token)"),
+                    ("wxbind", "绑定微信"),
                     ("reg", "注册新账号"), ("logout", "退出登录")]
         return [("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
                 ("sw:fin", "自选股"),
@@ -4947,6 +4973,15 @@ class App:
                             "field": 0}
             elif rid == "qrlogin":             # 扫码登录: 出码+轮询
                 self._cloud_qr_open()
+            elif rid == "wxbind":              # 绑定微信 (当前登录账号)
+                if not self.cfg.get("cloud_tok"):
+                    self.osd = ("先登录 再绑定微信",
+                                time.monotonic() + 2.5)
+                else:
+                    self.net.invalidate(("job", "cloudwxbind"))
+                    self.net.job("cloudwxbind", self._cloud_wxbind_fn,
+                                 ttl=10)
+                    self.osd = ("出码中…", time.monotonic() + 5)
             elif rid == "login":               # 登录/更换账户 表单
                 self.login = {"tok": ""}
             elif rid == "logout":              # 退出登录 (本地数据不动)
@@ -5112,6 +5147,33 @@ class App:
         except Exception:
             return {"ok": 0, "err": "需 pip3 install segno"}
         return {"ok": 1, "dc": j["device_code"], "url": j["url"], "mat": mat}
+
+    def _cloud_wxbind_fn(self):
+        """worker: POST /v1/wx/bindqr/start (Bearer 用户 token) →
+        {ok,dc,url,mat}. 扫码后服务端把该微信绑到当前登录账号 (免密)."""
+        url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
+        st, rbody = netmod.http_raw(
+            url + "/v1/wx/bindqr/start", method="POST",
+            body=b'{"name":"zero"}', timeout=10,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer "
+                     + (self.cfg.get("cloud_tok") or "")})
+        try:
+            j = json.loads(rbody.decode("utf-8", "replace"))
+        except ValueError:
+            j = {}
+        if st != 200 or not j.get("device_code"):
+            return {"ok": 0, "st": st,
+                    "err": j.get("err") or
+                    ("HTTP %s" % st if st else "网络异常")}
+        try:
+            import segno
+            q = segno.make(j["url"], error="m")
+            mat = [[1 if v else 0 for v in r] for r in q.matrix]
+        except ImportError:
+            return {"ok": 0, "err": "需 pip3 install segno"}
+        return {"ok": 1, "dc": j["device_code"], "url": j["url"],
+                "mat": mat}
 
     def _cloud_qrpoll_fn(self):
         """worker: POST /v1/auth/device/poll → pending/approved/done/none."""
@@ -5310,11 +5372,13 @@ class App:
         if self.qrlogin is not None:
             stt = self.qrlogin.get("st")
             isreg = self.qrlogin.get("mode") == "reg"
+            iswx = self.qrlogin.get("mode") == "wxbind"
             box = pygame.Rect(78, 20, W - 156, H - 28)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
-            text(surf, "扫码注册·绑微信" if isreg else "扫码登录",
-                 13, hi, (box.x + 12, box.y + 6))
+            title = ("扫码绑微信" if iswx else
+                     "扫码注册·绑微信" if isreg else "扫码登录")
+            text(surf, title, 13, hi, (box.x + 12, box.y + 6))
             mat = self.qrlogin.get("mat")
             if mat:
                 n = len(mat)
@@ -5328,10 +5392,12 @@ class App:
                                              (ox + mx * px, oy + my * px,
                                               px, px))
             tip = {"init": "出码中…",
-                   "qr": "微信扫码 即注册并绑定本微信" if isreg
-                   else "手机扫码 → 网页登录即授权",
-                   "wait": "已扫码? 自动注册并绑定微信" if isreg
-                   else "已扫码? 网页确认后自动登录",
+                   "qr": ("微信扫码 绑定到当前账号" if iswx else
+                          "微信扫码 即注册并绑定本微信" if isreg else
+                          "手机扫码 → 网页登录即授权"),
+                   "wait": ("已扫码? 自动绑定微信" if iswx else
+                            "已扫码? 自动注册并绑定微信" if isreg else
+                            "已扫码? 网页确认后自动登录"),
                    "fail": "失败: %s" % self.qrlogin.get("err", "")[:20],
                    }.get(stt, "")
             textc(surf, clip_text(tip, 10, box.w - 20), 10,

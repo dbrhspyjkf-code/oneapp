@@ -1709,8 +1709,9 @@ def test_cloud():
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
-    app.set_tab = 1                           # 账户页签 (key:cloud 所在)
-    assert [r[0] for r in app._set_rows()].count("key:cloud") == 1
+    app.set_tab = 1                           # 账户页签
+    _arows = [r[0] for r in app._set_rows()]
+    assert "key:cloud" not in _arows and "wxbind" in _arows
     app.set_tab = 0                           # 回卡片页签 (开关行)
     # ≤3 归一: 4 张全开 (含 sched 缺省 True) → 只保留前 3, 其余显式 False
     app.cfg["cards"].update(hitokoto=True, news=True, fin=True)
@@ -1887,7 +1888,7 @@ def test_reg():
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
     app.set_tab = 1                           # 账户页签 (reg 行所在)
-    assert "reg" in [r[0] for r in app._set_rows()]
+    assert [r[0] for r in app._set_rows()].index("reg") == 3
     # rid=reg 行 (sel=3, glm/ds 行移除后前移) → Enter 开表单
     app.tool = "set"
     assert app._set_rows()[3][0] == "reg"
@@ -2056,11 +2057,11 @@ def test_login():
     tmp = tempfile.mkdtemp(prefix="oneapp")
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
     app = dash.App(FakeNet())
-    app.set_tab = 1                           # 账户页签 (登录/扫码/注册行所在)
+    app.set_tab = 1                           # 账户页签 (登录/扫码/绑定/注册/退出)
     rows = [r[0] for r in app._set_rows()]
-    assert rows.index("login") == 1 and rows.index("qrlogin") == 2 \
-        and rows.index("reg") == 3
-    assert rows[0] == ("key:cloud")
+    assert rows.index("login") == 0 and rows.index("qrlogin") == 1 \
+        and rows.index("wxbind") == 2 and rows.index("reg") == 3
+    assert rows[0] == "login" and "key:cloud" not in rows
     app.tool = "set"
     app.draw(canvas)                       # 未登录: login 行右侧 "未登录"
     app.set_sel = rows.index("login")
@@ -2124,6 +2125,50 @@ def test_login():
     assert app.ideas["csync"] == 777.0    # 换号 → csync 重置到新号钟
     assert json.load(open(dash.IDEAS_FILE))["csync"] == 777.0
     netmod.http_raw = orig_raw
+    # 绑定微信 (已登录): Enter → job → 出码弹层 mode=wxbind → poll bound
+    import types as types_mod
+    sys.modules["segno"] = types_mod.SimpleNamespace(
+        make=lambda u, error="m": types_mod.SimpleNamespace(
+            matrix=[[True, False], [False, True]]))
+    orig_raw = netmod.http_raw
+    try:
+        idx = [r[0] for r in app._set_rows()].index("wxbind")
+        app.set_sel = idx
+        app.key(pygame.K_RETURN)
+        assert app.net.last_job("cloudwxbind") is not None
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "device_code": "b" * 32,
+             "url": "https://notes.apisz.top/login#dc=" + "b" * 32,
+             "exp": 0}).encode())
+        d = app.net.last_job("cloudwxbind")()
+        assert d["ok"] == 1 and d["dc"] == "b" * 32
+        app.on_net("data", "cloudwxbind", d)
+        assert app.qrlogin["st"] == "qr" and app.qrlogin["mode"] == "wxbind"
+        app.draw(canvas)                   # wxbind 弹层渲染冒烟
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"status": "bound"}).encode())
+        app.qr_poll_at = 0.0
+        app._cloud_qr_tick()
+        d = app.net.last_job("cloudqrpoll")()
+        assert d["st"] == "bound"
+        app.on_net("data", "cloudqrpoll", d)
+        assert app.qrlogin is None
+        assert app.osd and "微信已绑定" in app.osd[0]
+        # 过期重出码: none → wxbind job 重入队
+        app.qrlogin = {"st": "qr", "dc": "b" * 32, "url": "u",
+                       "mat": [[1]], "mode": "wxbind"}
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"status": "none"}).encode())
+        app.qr_poll_at = 0.0
+        app._cloud_qr_tick()
+        d = app.net.last_job("cloudqrpoll")()
+        app.on_net("data", "cloudqrpoll", d)
+        assert app.qrlogin["st"] == "init"
+        assert app.net.last_job("cloudwxbind") is not None
+        app.qrlogin = None                 # 清态防吞后续按键
+    finally:
+        netmod.http_raw = orig_raw
+        sys.modules.pop("segno", None)
     # 退出登录: logout 行 → cfg 清空 + OSD; 未登录再按 → 提示; 标签复原
     assert ("login", "登录") not in app._set_rows()
     idx = [r[0] for r in app._set_rows()].index("logout")
@@ -2134,6 +2179,11 @@ def test_login():
     assert ("login", "登录") in app._set_rows()
     app.key(pygame.K_RETURN)               # 未登录再按 logout
     assert app.osd and "未登录" in app.osd[0]
+    # 绑定微信 (未登录) → 提示先登录
+    idx = [r[0] for r in app._set_rows()].index("wxbind")
+    app.set_sel = idx
+    app.key(pygame.K_RETURN)
+    assert app.osd and "先登录" in app.osd[0]
     # (管理员TOKEN/生成注册码行已移除 — 管理操作下放 web 管理后台 /admin)
     print("login OK (form/fxzc/ping verify/persist/fail-retain/esc/"
           "switch+csync reset/logout)")
@@ -2153,7 +2203,7 @@ def test_qrlogin():
     app = dash.App(FakeNet())
     app.set_tab = 1                        # 账户页签 (扫码登录行所在)
     rows = [r[0] for r in app._set_rows()]
-    assert rows.index("qrlogin") == 2      # 与 test_login 一致
+    assert rows.index("qrlogin") == 1      # 与 test_login 一致
     app.tool = "set"
     # segno 桩 (Mac 无 segno; 设备真机已装)
     fake_segno = types.SimpleNamespace(make=lambda u, error="m":
