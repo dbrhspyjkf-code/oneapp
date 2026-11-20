@@ -1960,6 +1960,9 @@ class App:
                                               #   失败/跨端变更的兜底, TTL 节流)
             if self.page == 3:
                 self.net.job("ipo", fetchers.ipo_fetch, 1800)   # 顶部跑马灯
+                self.kv_pull("watch")         # 自选股云端拉取 (跨端变更/开机
+                                              #   拉取失败的兜底, TTL 节流;
+                                              #   无东财账户的用户也走 Oneapp 云)
                 self.net.pub_text(QT_BASE + ",".join(
                     c for c in self._qt_codes()), "quotes", 12)
                 self.net.pub_text(QT_BASE + ",".join(c for _, c in IDX_LIST),
@@ -2060,7 +2063,9 @@ class App:
             return
         self.watch.setdefault("items", []).append({"code": code, "name": ""})
         self.watch_save()
-        self.osd = ("已添加 " + code, time.monotonic() + 1.5)
+        self.osd = ("已添加 " + code
+                    + (" · 已上云" if self.cfg.get("cloud_tok") else ""),
+                    time.monotonic() + 1.5)
         self._em_push(code, True)          # 开同步 → 云端账户同步加
 
     def fin_sync_commit(self):
@@ -2088,7 +2093,9 @@ class App:
             self.watch_save()
             self.fsel = max(0, min(self.fsel,
                                    len(self.watch["items"]) - 1))
-            self.osd = ("已删除 " + (code or ""), time.monotonic() + 1.2)
+            self.osd = ("已删除 " + (code or "")
+                        + (" · 已上云" if self.cfg.get("cloud_tok") else ""),
+                        time.monotonic() + 1.2)
             self._em_push(code, False)     # 开同步 → 云端账户同步删
 
     def open_detail(self, code, name, view="min"):
@@ -7372,6 +7379,9 @@ class App:
             text(surf, "行情", 14, hi, (6, 2))
             text(surf, "· " + self.FIN_TABS[view], 11, dim,
                  (6 + textw("行情", 14) + 6, 4))
+            stag = self._fin_sync_tag()
+            text(surf, stag, 10, acc if "云✓" in stag else dim,
+                 (W - 6, 4), right=True)   # 同步状态: 云✓ (东财✓) / 本地
             self._draw_fin_ticker(surf)   # 顶部标题: 自选股行情+新股 跑马灯
 
         if self.fdetail:
@@ -7458,6 +7468,16 @@ class App:
             if not self.ime_bar(surf, 146):
                 pass
 
+    def _fin_sync_tag(self):
+        """行情页右上同步状态: Oneapp 云 (登录即有, 与东财无关) + 东财
+        (可选镜像); 未登录显示 本地."""
+        t = []
+        if self.cfg.get("cloud_tok"):
+            t.append("云✓")
+        if self._em_key():
+            t.append("东财✓")
+        return " ".join(t) or "本地"
+
     def _draw_fin_ticker(self, surf):
         """顶部标题跑马灯: 仅新股申购信息 (个股行情在卡片列表里, 不重复)."""
         parts = []
@@ -7471,7 +7491,7 @@ class App:
         txt = " · ".join(parts)
         tab = "· " + self.FIN_TABS[self.fin_view]
         tx = 6 + textw("行情", 14) + 6 + textw(tab, 11) + 10
-        vw = W - 6 - tx
+        vw = W - 6 - tx - textw(self._fin_sync_tag(), 10) - 8  # 右侧让位状态
         if vw < 60:
             return
         dim = self.th("dim")

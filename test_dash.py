@@ -2311,6 +2311,7 @@ def test_kv_sync():
     dash.RADIO_FAV_CACHE = fr
     dash.WATCH_FILE = fw
     dash.TV_FAV_CACHE = ftv
+    dash.EM_KEY_FILE = os.path.join(tmp, "em_key.json")   # 隔离东财 key
     json.dump({"cloud_tok": "t" * 24, "cloud_user": "u"},
               open(dash.SETTINGS_FILE, "w"))
     orig_raw = netmod.http_raw
@@ -2471,6 +2472,9 @@ def test_kv_sync():
         app.kv_pull("radio_fav")
         assert app.net.jobs[-1][0] == "kvsync:radio_fav"
         assert len(app.net.jobs) == n_jobs + 1
+        app.kv_pull("watch")               # 行情页兜底拉取 (无东财也同步)
+        assert app.net.jobs[-1][0] == "kvsync:watch"
+        assert app._fin_sync_tag() == "云✓"    # 登录 + 无东财 key
         # kv_apply 光标钳回: 收藏组开着时云端列表变短 → rsel/tv_sel 收缩
         import radio_stations
         import tv_channels
