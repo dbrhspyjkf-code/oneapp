@@ -1871,14 +1871,18 @@ def test_cloud():
 
 
 def test_reg():
-    """注册表单: 设置行进入/两字段输入 (name 自动小写)/↑↓ 换行/空值提示/
-    提交 cloudreg → 成功自动配 token+关表单+ping / 失败保表单 OSD / Esc 关."""
+    """注册表单: 设置行进入/三字段输入 (name/invite 自动小写, 密码原样)/
+    ↑↓ 换行/空值+密码长度提示/提交出码 (device/start reg 会话) → 关表单+
+    QR 弹层 mode=reg / poll approved 存 token / poll failed → fail 态 /
+    过期重出码走 qrlogin 存档 / 出码失败保表单 / Esc 关."""
     import dash
+    import types
     pygame.init()
     pygame.display.set_mode((1, 1))
     canvas = pygame.Surface((dash.W, dash.H))
     tmp = tempfile.mkdtemp(prefix="oneapp")
     dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
     assert "reg" in [r[0] for r in app._set_rows()]
     # rid=reg 行 (sel=3, glm/ds 行移除后前移) → Enter 开表单
@@ -1886,7 +1890,7 @@ def test_reg():
     assert app._set_rows()[3][0] == "reg"
     app.set_sel = 3
     app.key(pygame.K_RETURN)
-    assert app.reg == {"name": "", "invite": "", "field": 0}
+    assert app.reg == {"name": "", "invite": "", "password": "", "field": 0}
     # F/X/Z/C 真实键值 = 字母 (丝印方向让位, _silk_input_active 含 reg 表单;
     # 若白名单缺失, k 会被换成 K_UP 且 ch 丢弃 → 断言炸)
     for kk, c2 in ((pygame.K_f, "f"), (pygame.K_x, "x"),
@@ -1896,7 +1900,7 @@ def test_reg():
     for _ in range(4):
         app.key(pygame.K_BACKSPACE)
     assert app.reg["name"] == ""
-    # 输入: name 字段自动小写; ↑↓ 换行; invite 字段
+    # 输入: name 自动小写; ↑↓ 换行; invite 自动小写; password 原样大小写
     for c in "AbC_01":
         app.key(0, c)
     assert app.reg["name"] == "abc_01"
@@ -1904,41 +1908,139 @@ def test_reg():
     for c in "DEADbeef01":
         app.key(0, c)
     assert app.reg["invite"] == "deadbeef01"
+    app.key(pygame.K_UP)                   # 第 3 行: 密码
+    for c in "Pw12":
+        app.key(0, c)
+    assert app.reg["password"] == "Pw12"   # 密码不强制小写
     app.draw(canvas)                       # 表单渲染冒烟
-    # 清空邀请码 → Enter 提示都要填
-    while app.reg["invite"]:
+    # 空用户名 → Enter 提示都要填 (先到先查)
+    app.key(pygame.K_UP)                   # 2 → 0 (name)
+    while app.reg["name"]:
         app.key(pygame.K_BACKSPACE)
     app.key(pygame.K_RETURN)
     assert app.osd and "都要填" in app.osd[0]
-    # 提交: http_raw 桩 200 → 自动配 token + 关表单 + ping 入队
-    app.reg["invite"] = "deadbeef01"       # 重填 (上面清空做过空值校验)
+    for c in "AbC_01":
+        app.key(0, c)
+    assert app.reg["name"] == "abc_01"
+    # 密码过短提示 (name/invite 已填, 轮到密码检查)
+    app.key(pygame.K_RETURN)
+    assert app.osd and "6-64" in app.osd[0]
+    app.key(pygame.K_UP)                   # 0 → 1? (前进循环) → 补密码
+    while app.reg["field"] != 2:
+        app.key(pygame.K_UP)
+    while app.reg["password"]:
+        app.key(pygame.K_BACKSPACE)
+    for c in "Pw123456":
+        app.key(0, c)
+    assert app.reg["password"] == "Pw123456"
+    # 提交: device/start 桩 200 → 关表单 + QR 弹层 mode=reg
+    app.qr_poll_at = 0.0
+    captured = {}
     orig_raw = netmod.http_raw
-    netmod.http_raw = lambda url, **k: (200, json.dumps(
-        {"ok": 1, "user": "abc_01", "token": "t" * 24}).encode())
-    app.key(pygame.K_RETURN)
-    d = app.net.last_job("cloudreg")()
-    assert d["ok"] == 1 and d["token"] == "t" * 24
-    app.on_net("data", "cloudreg", d)
-    assert app.reg is None and app.cfg["cloud_tok"] == "t" * 24
-    assert app.cfg["cloud_user"] == "abc_01"   # 注册成功存用户名
-    assert app.cfg["cloud_url"] == dash.CLOUD_URL_DEFAULT  # 空云地址自动配
-    assert app.net.last_job("cloudping") is not None
-    assert app.osd and "注册成功" in app.osd[0]
-    json.load(open(dash.SETTINGS_FILE))    # settings.json 落盘可解析
-    # 失败: 403 邀请码无效 → 表单保留 + OSD
-    netmod.http_raw = lambda url, **k: (403, json.dumps(
-        {"err": "邀请码无效"}).encode())
-    app.reg = {"name": "bob", "invite": "xx", "field": 0}
-    app.key(pygame.K_RETURN)
-    d = app.net.last_job("cloudreg")()
-    assert d["ok"] == 0 and d["err"] == "邀请码无效"
-    app.on_net("data", "cloudreg", d)
-    assert app.reg == {"name": "bob", "invite": "xx", "field": 0}
-    assert app.osd and "注册失败" in app.osd[0]
-    netmod.http_raw = orig_raw
-    app.key(pygame.K_ESCAPE)               # Esc 关表单, 留在设置页
-    assert app.reg is None and app.tool == "set"
-    print("reg OK (form/fields/submit/auto-config/fail-retain/esc)")
+    fake_segno = types.SimpleNamespace(make=lambda u, error="m":
+                                       types.SimpleNamespace(
+                                           matrix=[[True, False],
+                                                   [False, True]]))
+    sys.modules["segno"] = fake_segno      # Mac 无 segno (设备真机已装)
+    try:
+        def raw_start(url, **k):
+            captured["url"] = url
+            captured["body"] = json.loads(k["body"].decode())
+            return 200, json.dumps(
+                {"ok": 1, "device_code": "d" * 32,
+                 "url": "https://notes.apisz.top/login#dc=" + "d" * 32,
+                 "exp": 0}).encode()
+        netmod.http_raw = raw_start
+        app.key(pygame.K_RETURN)
+        d = app.net.last_job("cloudregqr")()
+        assert captured["url"].endswith("/v1/auth/device/start")
+        assert captured["body"] == {"name": "zero",
+                                    "reg": {"name": "abc_01",
+                                            "invite": "deadbeef01",
+                                            "password": "Pw123456"}}
+        assert d["ok"] == 1 and d["dc"] == "d" * 32 and d["mat"]
+        app.on_net("data", "cloudregqr", d)
+        assert app.reg is None             # 表单关, 出码弹层接管
+        assert app.qrlogin["st"] == "qr" and app.qrlogin["mode"] == "reg"
+        assert app.qrlogin["reg"]["name"] == "abc_01"   # 存档供重出码
+        app.draw(canvas)                   # QR 弹层渲染冒烟 (reg 标题)
+        # poll approved → 存 token + user + csync + reg 版 OSD
+        def raw_ok(url, **k):
+            if "/v1/auth/device/poll" in url:
+                return 200, json.dumps({"status": "approved",
+                                        "token": "q" * 48,
+                                        "user": "abc_01"}).encode()
+            if "/v1/tombstones" in url:
+                return 200, json.dumps({"ids": [], "now": 888.0}).encode()
+            return 404, b"{}"
+        netmod.http_raw = raw_ok
+        app._cloud_qr_tick()
+        d = app.net.last_job("cloudqrpoll")()
+        assert d["st"] == "approved" and d["token"] == "q" * 48
+        app.on_net("data", "cloudqrpoll", d)
+        assert app.qrlogin is None and app.cfg["cloud_tok"] == "q" * 48
+        assert app.cfg["cloud_user"] == "abc_01"
+        assert app.net.last_job("cloudping") is not None
+        assert app.osd and "注册成功 已绑定微信" in app.osd[0]
+        json.load(open(dash.SETTINGS_FILE))
+        # poll failed (扫码期重名) → fail 态 + 原因, 不再轮询
+        app.qrlogin = {"st": "qr", "dc": "e" * 32, "url": "u",
+                       "mat": [[1]], "mode": "reg",
+                       "reg": {"name": "abc_01", "invite": "xx"}}
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"status": "failed", "err": "用户名已存在"}).encode())
+        app.qr_poll_at = 0.0
+        app._cloud_qr_tick()
+        d = app.net.last_job("cloudqrpoll")()
+        assert d["st"] == "failed" and d.get("err") == "用户名已存在"
+        app.on_net("data", "cloudqrpoll", d)
+        assert app.qrlogin["st"] == "fail" and "用户名已存在" \
+            in app.qrlogin["err"]
+        app.draw(canvas)
+        # 过期 (none) → reg 走存档重出码 (cloudregqr, 非 cloudqrstart)
+        app.qrlogin = {"st": "qr", "dc": "e" * 32, "url": "u",
+                       "mat": [[1]], "mode": "reg",
+                       "reg": {"name": "abc_01", "invite": "deadbeef01"}}
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"status": "none"}).encode())
+        app.qr_poll_at = 0.0
+        app._cloud_qr_tick()
+        d = app.net.last_job("cloudqrpoll")()
+        assert d["st"] == "none"
+        app.on_net("data", "cloudqrpoll", d)
+        assert app.qrlogin["st"] == "init"
+        assert app.net.last_job("cloudregqr") is not None
+        netmod.http_raw = raw_start
+        d = app.net.last_job("cloudregqr")()   # 从 qrlogin 存档取资料
+        assert d["ok"] == 1 and captured["body"]["reg"]["invite"] \
+            == "deadbeef01"
+        app.on_net("data", "cloudregqr", d)
+        assert app.qrlogin["st"] == "qr" and app.qrlogin["dc"] == "d" * 32
+        app.key(pygame.K_ESCAPE)           # Esc 关弹层
+        assert app.qrlogin is None
+    finally:
+        netmod.http_raw = orig_raw
+        sys.modules.pop("segno", None)
+    # 出码失败 (409 重名) → 表单保留 + OSD (弹层未开)
+    orig_raw = netmod.http_raw
+    try:
+        netmod.http_raw = lambda url, **k: (409, json.dumps(
+            {"err": "用户名已存在"}).encode())
+        app.reg = {"name": "bob", "invite": "xx", "password": "", "field": 0}
+        app.key(pygame.K_RETURN)
+        d = app.net.last_job("cloudregqr")()
+        assert d["ok"] == 0 and d["err"] == "用户名已存在"
+        app.on_net("data", "cloudregqr", d)
+        assert app.reg is not None and app.qrlogin is None
+        assert app.osd and "注册失败" in app.osd[0]
+        app.on_net("error", "cloudregqr", None)    # 网络异常事件
+        assert app.osd and "网络异常" in app.osd[0]
+        app.key(pygame.K_ESCAPE)           # Esc 关表单, 留在设置页
+        assert app.reg is None and app.tool == "set"
+    finally:
+        netmod.http_raw = orig_raw
+    print("reg OK (form/fields/pw-raw/submit-qr/qr-overlay/approved/"
+          "failed/expire-rearchive/fail-retain/esc)")
 
 
 def test_login():
@@ -2072,7 +2174,7 @@ def test_qrlogin():
     dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
     app = dash.App(FakeNet())
     rows = [r[0] for r in app._set_rows()]
-    assert rows.index("qrlogin") == 4
+    assert rows.index("qrlogin") == 2      # glm/ds 行移除后前移 (与 test_login 一致)
     app.tool = "set"
     # segno 桩 (Mac 无 segno; 设备真机已装)
     fake_segno = types.SimpleNamespace(make=lambda u, error="m":

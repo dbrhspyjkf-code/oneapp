@@ -1707,26 +1707,21 @@ class App:
                 else:
                     self.osd = ("云连接 ✗ HTTP %s" % b.get("st"),
                                 time.monotonic() + 2.5)
-            elif a == "cloudreg" and isinstance(b, dict):
+            elif a == "cloudregqr" and isinstance(b, dict):
                 self.reg_busy = False
-                if b.get("ok") and b.get("token"):
-                    if not self.cfg.get("cloud_url"):
-                        self.cfg["cloud_url"] = b.get("url") \
-                            or CLOUD_URL_DEFAULT
-                    self.cfg["cloud_tok"] = b["token"]
-                    self.cfg["cloud_user"] = b.get("user") or ""
-                    self.cfg_save()
-                    self.reg = None            # 成功: 关表单 + ping 验证
-                    if b.get("now"):           # 新号: csync 取服务器钟
-                        self.ideas["csync"] = b["now"]
-                        netmod.save_json_file(IDEAS_FILE, self.ideas)
-                    self.cloud_ping_trigger()
-                    self.kv_align_trigger()    # Oneapp 账户: 登录即对齐
-                    self.osd = ("注册成功 已连接 %s" % b.get("user"),
-                                time.monotonic() + 2.5)
+                if b.get("ok") and b.get("dc"):
+                    self.reg = None            # 关表单 → 出码弹层接管
+                    self.qrlogin = {"st": "qr", "dc": b["dc"],
+                                    "url": b["url"], "mat": b.get("mat"),
+                                    "mode": "reg",
+                                    "reg": dict(b.get("reg") or {})}
+                    self.qr_poll_at = 0.0
+                elif self.qrlogin is not None:  # 过期重出码失败 → 弹层报错
+                    self.qrlogin.update(st="fail",
+                                        err=b.get("err") or "出码失败")
                 else:
                     err = b.get("err") or ("HTTP %s" % b.get("st")
-                                           if b.get("st") else "网络异常")
+                                           if b.get("st") else "出码失败")
                     self.osd = ("注册失败 %s" % err,
                                 time.monotonic() + 2.5)
             elif a == "cloudinvite" and isinstance(b, dict):
@@ -1770,6 +1765,7 @@ class App:
             elif a == "cloudqrpoll" and isinstance(b, dict) \
                     and self.qrlogin is not None:
                 stt = b.get("st")
+                isreg = (self.qrlogin or {}).get("mode") == "reg"
                 if stt == "approved" and b.get("token"):
                     if not self.cfg.get("cloud_url"):
                         self.cfg["cloud_url"] = CLOUD_URL_DEFAULT
@@ -1783,13 +1779,23 @@ class App:
                         netmod.save_json_file(IDEAS_FILE, self.ideas)
                     self.cloud_ping_trigger()
                     self.kv_align_trigger()    # Oneapp 账户: 登录即对齐
-                    self.osd = ("扫码登录 ✓ %s" % b.get("user"),
+                    self.osd = (("注册成功 已绑定微信 %s" if isreg
+                                 else "扫码登录 ✓ %s") % b.get("user"),
                                 time.monotonic() + 2.5)
                 elif stt == "none":            # 设备码过期 → 自动重出码
                     self.qr_poll_at = 0.0
-                    self._cloud_qr_open()
+                    if isreg:                  # reg: 表单已关, 存档重出
+                        self.qrlogin.update(st="init")
+                        self.net.invalidate(("job", "cloudregqr"))
+                        self.net.job("cloudregqr", self._cloud_regqr_fn,
+                                     ttl=10)
+                    else:
+                        self._cloud_qr_open()
                 elif stt == "done":            # token 被别的端领走(不该发生)
                     self.qrlogin.update(st="fail", err="授权已被领取, 重试")
+                elif stt == "failed":          # 扫码注册竞态失败 (重名等)
+                    self.qrlogin.update(st="fail",
+                                        err=b.get("err") or "注册失败")
                 elif stt == "pending":
                     self.qrlogin.update(st="wait")
             elif a.startswith("kvput:"):
@@ -1850,9 +1856,12 @@ class App:
                     self.osd = ("云同步失败", time.monotonic() + 2)
             elif a == "cloudping":
                 self.osd = ("云连接 ✗ 网络异常", time.monotonic() + 2)
-            elif a == "cloudreg":
+            elif a == "cloudregqr":
                 self.reg_busy = False
-                self.osd = ("注册失败 网络异常", time.monotonic() + 2.5)
+                if self.qrlogin is not None:    # 重出码网络异常 → 弹层报错
+                    self.qrlogin.update(st="fail", err="网络异常")
+                else:
+                    self.osd = ("注册失败 网络异常", time.monotonic() + 2.5)
             elif a == "cloudlogin":
                 self.login_busy = False
                 self.osd = ("登录失败 网络异常", time.monotonic() + 2.5)
@@ -4951,7 +4960,8 @@ class App:
                 self.osd = ("主题: " + THEMES[self.theme_idx]["name"],
                             time.monotonic() + 2)
             elif rid == "reg":                 # 注册表单 (用户名+邀请码)
-                self.reg = {"name": "", "invite": "", "field": 0}
+                self.reg = {"name": "", "invite": "", "password": "",
+                            "field": 0}
             elif rid == "qrlogin":             # 扫码登录: 出码+轮询
                 self._cloud_qr_open()
             elif rid == "login":               # 登录/更换账户 表单
@@ -5051,17 +5061,17 @@ class App:
                        ("HTTP %s" % st if st else "网络异常")}
 
     def _reg_key(self, k, ch):
-        """注册表单键流: ↑↓ 换字段 / ASCII 直输 (name 强制小写) /
-        Enter 提交 cloudreg / Esc 关表单."""
+        """注册表单键流: ↑↓ 换字段 / ASCII 直输 (name/invite 强制小写) /
+        Enter 出码注册 (扫码绑微信) / Esc 关表单."""
         f = self.reg
         if k == pygame.K_ESCAPE:
             self.reg = None
             return True
         if k in (pygame.K_UP, pygame.K_DOWN):
-            f["field"] = (f["field"] + 1) % 2
+            f["field"] = (f["field"] + 1) % 3
             return True
         if k == pygame.K_BACKSPACE:
-            key = ("name", "invite")[f["field"]]
+            key = ("name", "invite", "password")[f["field"]]
             f[key] = f[key][:-1]
             return True
         if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
@@ -5070,44 +5080,52 @@ class App:
             if not f["name"] or not f["invite"]:
                 self.osd = ("用户名和邀请码都要填", time.monotonic() + 2)
                 return True
+            if f["password"] and not (6 <= len(f["password"]) <= 64):
+                self.osd = ("密码 6-64 位 (可留空)", time.monotonic() + 2)
+                return True
             self.reg_busy = True
-            self.net.invalidate(("job", "cloudreg"))
-            self.net.job("cloudreg", self._cloud_reg_fn, ttl=10)
-            self.osd = ("注册中…", time.monotonic() + 5)
+            self.net.invalidate(("job", "cloudregqr"))
+            self.net.job("cloudregqr", self._cloud_regqr_fn, ttl=10)
+            self.osd = ("出码中…", time.monotonic() + 5)
             return True
         if ch and 0x20 <= ord(ch) < 0x7F:
-            key = ("name", "invite")[f["field"]]
-            cap = 16 if f["field"] == 0 else 24
-            f[key] = (f[key] + ch.lower())[:cap]   # 用户名/邀请码都小写
+            key = ("name", "invite", "password")[f["field"]]
+            cap = (16, 24, 64)[f["field"]]
+            if key != "password":
+                ch = ch.lower()                    # 用户名/邀请码都小写
+            f[key] = (f[key] + ch)[:cap]
         return True
 
-    def _cloud_reg_fn(self):
-        """worker: POST /v1/register (免鉴权端点) → {ok,st,err,token,user}."""
-        f = self.reg or {}
+    def _cloud_regqr_fn(self):
+        """worker: POST /v1/auth/device/start (reg 会话, 出码即预校验) →
+        {ok,dc,url,mat}. 扫码后服务端建号+绑微信+授权设备, 设备 poll 领
+        token. 资料取注册表单; 过期重出码时表单已关, 取 qrlogin 存档."""
+        f = (self.qrlogin or {}).get("reg") or (self.reg or {})
         url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
-        body = json.dumps({"name": f.get("name", ""),
-                           "invite": f.get("invite", "")}).encode()
-        st, rbody = netmod.http_raw(url + "/v1/register", method="POST",
-                                    body=body, timeout=10,
+        reg = {"name": f.get("name", ""), "invite": f.get("invite", "")}
+        if f.get("password"):
+            reg["password"] = f["password"]
+        body = json.dumps({"name": "zero", "reg": reg}).encode()
+        st, rbody = netmod.http_raw(url + "/v1/auth/device/start",
+                                    method="POST", body=body, timeout=10,
                                     headers={"Content-Type":
                                              "application/json"})
         try:
             j = json.loads(rbody.decode("utf-8", "replace"))
         except ValueError:
             j = {}
-        now = None                          # 新号 → csync 起点取服务器钟
-        if st == 200:
-            st2, b2 = netmod.http_raw(url + "/v1/tombstones?since=0",
-                                      timeout=8,
-                                      headers={"Authorization": "Bearer " + j.get("token") or ""})
-            if st2 == 200:
-                try:
-                    now = json.loads(b2.decode("utf-8", "replace")).get("now")
-                except ValueError:
-                    now = None
-        return {"ok": 1 if st == 200 else 0, "st": st, "err": j.get("err"),
-                "token": j.get("token"), "user": j.get("user"), "url": url,
-                "now": now}
+        if st != 200 or not j.get("device_code"):
+            return {"ok": 0, "st": st,
+                    "err": j.get("err") or
+                    ("HTTP %s" % st if st else "网络异常")}
+        try:
+            import segno
+            q = segno.make(j["url"], error="m")
+            mat = [[1 if v else 0 for v in r] for r in q.matrix]
+        except ImportError:
+            return {"ok": 0, "err": "需 pip3 install segno"}
+        return {"ok": 1, "dc": j["device_code"], "url": j["url"],
+                "mat": mat, "reg": reg}
 
     # ── 扫码登录 (通用账户设备码流程, noteserver /v1/auth/device/*) ──
     def _cloud_qr_open(self):
@@ -5157,7 +5175,7 @@ class App:
         except ValueError:
             j = {}
         out = {"st": j.get("status"), "token": j.get("token"),
-               "user": j.get("user")}
+               "user": j.get("user"), "err": j.get("err")}
         if out["st"] == "approved":
             st2, b2 = netmod.http_raw(url + "/v1/tombstones?since=0",
                                       timeout=8,
@@ -5275,29 +5293,30 @@ class App:
                  soft, (box.x + 12, box.y + 30))   # 尾窗 28 字符防溢出
             text(surf, "Enter 保存 · Esc 取消", 10, dim,
                  (box.x + 12, box.y + 46))
-        # ── 注册表单 (覆盖): 用户名 / 邀请码 两字段 ──
+        # ── 注册表单 (覆盖): 用户名 / 邀请码 / 密码(可空) 三字段 ──
         if self.reg is not None:
-            box = pygame.Rect(24, 44, W - 48, 94)
+            box = pygame.Rect(24, 44, W - 48, 112)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
             text(surf, "注册 Oneapp 账号", 13, hi, (box.x + 12, box.y + 8))
             for i, (lab2, key2) in enumerate((("用户名", "name"),
-                                              ("邀请码", "invite"))):
+                                              ("邀请码", "invite"),
+                                              ("密码(可空)", "password"))):
                 y2 = box.y + 30 + i * 18
                 cur = self.reg["field"] == i
                 text(surf, lab2, 12, acc if cur else dim, (box.x + 12, y2))
                 val = self.reg[key2]
-                shown = clip_text(val[-22:] + ("_" if cur else ""), 12, 150)
+                shown = clip_text(val[-20:] + ("_" if cur else ""), 12, 146)
                 text(surf, shown, 12, hi if val else dim,
-                     (box.x + 62, y2))
-            text(surf, "↑↓ 换行 · Enter 注册 · Esc 取消", 10, dim,
-                 (box.x + 12, box.y + 68))
+                     (box.x + 74, y2))
+            text(surf, "↑↓ 换行 · Enter 出码注册 · Esc 取消", 10, dim,
+                 (box.x + 12, box.y + 86))
             if self.reg_busy:
-                text(surf, "注册中…", 12, acc,
-                     (box.right - 12, box.y + 68), right=True)
+                text(surf, "出码中…", 12, acc,
+                     (box.right - 12, box.y + 86), right=True)
             elif self.osd and "失败" in self.osd[0]:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
-                     self.th("danger"), (box.right - 12, box.y + 69),
+                     self.th("danger"), (box.right - 12, box.y + 87),
                      right=True)
         # ── 登录表单 (覆盖): 已有用户名+TOKEN 的用户 / 换账户 ──
         if self.login is not None:
@@ -5334,13 +5353,15 @@ class App:
                  (box.x + 12, box.y + 54))
             text(surf, "Esc 用云端覆盖本地", 11, soft,
                  (box.x + 12, box.y + 70))
-        # ── 扫码登录 (覆盖): QR 直绘 + 状态行, Esc/q 取消 ──
+        # ── 扫码登录/注册 (覆盖): QR 直绘 + 状态行, Esc/q 取消 ──
         if self.qrlogin is not None:
             stt = self.qrlogin.get("st")
+            isreg = self.qrlogin.get("mode") == "reg"
             box = pygame.Rect(78, 20, W - 156, H - 28)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
-            text(surf, "扫码登录", 13, hi, (box.x + 12, box.y + 6))
+            text(surf, "扫码注册·绑微信" if isreg else "扫码登录",
+                 13, hi, (box.x + 12, box.y + 6))
             mat = self.qrlogin.get("mat")
             if mat:
                 n = len(mat)
@@ -5353,8 +5374,11 @@ class App:
                             pygame.draw.rect(surf, hi,
                                              (ox + mx * px, oy + my * px,
                                               px, px))
-            tip = {"init": "出码中…", "qr": "手机扫码 → 网页登录即授权",
-                   "wait": "已扫码? 网页确认后自动登录",
+            tip = {"init": "出码中…",
+                   "qr": "微信扫码 即注册并绑定本微信" if isreg
+                   else "手机扫码 → 网页登录即授权",
+                   "wait": "已扫码? 自动注册并绑定微信" if isreg
+                   else "已扫码? 网页确认后自动登录",
                    "fail": "失败: %s" % self.qrlogin.get("err", "")[:20],
                    }.get(stt, "")
             textc(surf, clip_text(tip, 10, box.w - 20), 10,
