@@ -1300,7 +1300,15 @@ def test_radio_groups():
         assert _os.path.exists(dash.RADIO_FAV_CACHE)
         app.radio_grp = 0                            # ★ 组出现该台
         assert [x["key"] for x in app.radio_list()] == [nat[0]["key"]]
-        app.key(pygame.K_5)                          # 再按取消
+        app.key(pygame.K_5)                          # 再按取消 → 二次确认框
+        assert app.dialog and app.dialog[0] == "unfav"
+        assert app.radio_fav == [nat[0]["key"]]      # 未确认前不动
+        app.draw(canvas)                             # 确认框渲染冒烟
+        app.key(pygame.K_5)                          # 任意非裁决键 = 关框保留
+        assert app.dialog is None and app.radio_fav == [nat[0]["key"]]
+        app.key(pygame.K_5)                          # 再开框 → Enter 真删
+        app.key(pygame.K_RETURN)
+        assert app.dialog is None
         assert app.radio_fav == [] and app.radio_list() == []
         # 持久化回读 (新实例恢复收藏)
         app.radio_grp = 1
@@ -3404,12 +3412,17 @@ def test_tv():
         app.tv_sel = 1
         app.tv_key(pygame.K_RETURN)           # 收藏组 Enter 直接看
         assert app.tv_playing and app.tv_playing[0] == wl[0][0]
-        app.tv_key(pygame.K_5)                # 播放中 5 = 取消收藏当前台
+        app.tv_key(pygame.K_5)                # 播放中 5 = 取消收藏 → 确认框
+        assert app.dialog and app.dialog[0] == "untvfav"
+        assert app.tv_fav == ["CCTV1", wl[0][0]]   # 未确认前不动
+        app.key(pygame.K_RETURN)              # Enter 确认移除
         assert app.tv_fav == ["CCTV1"]
         app.tv_stop()
         app.tv_grp, app.tv_sel = 0, 0
         app.draw(canvas)                      # 单条收藏组不崩
-        app.tv_key(pygame.K_5)                # 组内取消 → 空收藏
+        app.tv_key(pygame.K_5)                # 组内取消 → 确认框 → 空收藏
+        assert app.dialog and app.dialog[0] == "untvfav"
+        app.key(pygame.K_RETURN)
         assert app.tv_fav == []
         app.draw(canvas)                      # 空收藏组提示不崩
         app.tv_key(pygame.K_LEFT)             # 空组仍可 ←→ 离开 → 国际

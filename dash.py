@@ -2255,7 +2255,8 @@ class App:
         self.rscroll = max(0, min(self.rsel - 5, max(0, len(lst) - 7)))
 
     def radio_fav_toggle(self):
-        """5 键收藏/取消 (播放中=当前台, 列表=选中台); 落 radio_fav.json."""
+        """5 键收藏/取消 (播放中=当前台, 列表=选中台); 落 radio_fav.json.
+        取消需二次确认 (用户定版 2026-11-20: 只能逐个删且防误按)."""
         import radio_stations
         cur = next((s for s in radio_stations.STATIONS
                     if s["key"] == self.playing_key), None)
@@ -2265,13 +2266,23 @@ class App:
             return
         k = st["key"]
         if k in self.radio_fav:
-            self.radio_fav.remove(k)
-            self.osd = ("已取消收藏", time.monotonic() + 1.2)
-        else:
-            self.radio_fav.append(k)
-            self.osd = ("已收藏 · %s" % st["name"], time.monotonic() + 1.5)
+            self.dialog = ("unfav", k, st["name"])
+            return
+        self.radio_fav.append(k)
+        self.osd = ("已收藏 · %s" % st["name"], time.monotonic() + 1.5)
         self.radio_fav_save()
         n = len(self.radio_list())            # 收藏组可能变短, 光标钳回
+        if self.radio_grp == 0 and n:
+            self.rsel = min(self.rsel, n - 1)
+
+    def radio_fav_remove(self, k):
+        """确认框 Enter 后真正移除 (radio_fav_toggle 的取消半程)."""
+        if k not in self.radio_fav:
+            return
+        self.radio_fav.remove(k)
+        self.radio_fav_save()
+        self.osd = ("已取消收藏", time.monotonic() + 1.2)
+        n = len(self.radio_list())
         if self.radio_grp == 0 and n:
             self.rsel = min(self.rsel, n - 1)
 
@@ -4022,7 +4033,8 @@ class App:
                                "sel": self.tv_sel})
 
     def tv_fav_toggle(self, name=None):
-        """5 键收藏/取消 (播放中=当前台, 列表=选中台); 落 tv_fav.json."""
+        """5 键收藏/取消 (播放中=当前台, 列表=选中台); 落 tv_fav.json.
+        取消需二次确认 (防误按, 与电台同款)."""
         lst = self.tv_list()
         name = name or (self.tv_playing[0] if self.tv_playing else
                         lst[self.tv_sel][0] if 0 <= self.tv_sel < len(lst)
@@ -4030,13 +4042,24 @@ class App:
         if not name:
             return
         if name in self.tv_fav:
-            self.tv_fav.remove(name)
-            self.osd = ("已取消收藏", time.monotonic() + 1.2)
-        else:
-            self.tv_fav.append(name)
-            self.osd = ("已收藏 · %s" % name, time.monotonic() + 1.5)
+            self.dialog = ("untvfav", name)
+            return
+        self.tv_fav.append(name)
+        self.osd = ("已收藏 · %s" % name, time.monotonic() + 1.5)
         self.tv_fav_save()
         n = len(self.tv_list())                # 收藏组可能变短, 光标钳回
+        if self.tv_grp == 0 and n:
+            self.tv_sel = min(self.tv_sel, n - 1)
+            self.tv_sels[0] = self.tv_sel
+
+    def tv_fav_remove(self, name):
+        """确认框 Enter 后真正移除 (tv_fav_toggle 的取消半程)."""
+        if name not in self.tv_fav:
+            return
+        self.tv_fav.remove(name)
+        self.tv_fav_save()
+        self.osd = ("已取消收藏", time.monotonic() + 1.2)
+        n = len(self.tv_list())
         if self.tv_grp == 0 and n:
             self.tv_sel = min(self.tv_sel, n - 1)
             self.tv_sels[0] = self.tv_sel
@@ -4468,6 +4491,10 @@ class App:
                     self.watch_del(self.dialog[1])   # ("delwatch", idx)
                 elif self.dialog[0] == "delmail":
                     self.mail_del(self.dialog[1])    # ("delmail", email)
+                elif self.dialog[0] == "unfav":
+                    self.radio_fav_remove(self.dialog[1])  # ("unfav", key, 名)
+                elif self.dialog[0] == "untvfav":
+                    self.tv_fav_remove(self.dialog[1])     # ("untvfav", 名)
                 else:
                     self.delete_selected()   # ("del", item) 确认删除
                 self.dialog = None
@@ -8549,6 +8576,12 @@ class App:
         pygame.draw.rect(surf, self.th("border"), r, 1, border_radius=6)
         if self.dialog[0] == "exit":
             textc(surf, "退出 ONEAPP?", 12, self.th("accent"), W // 2, H // 2 - 18)
+        elif self.dialog[0] == "unfav":
+            textc(surf, "取消收藏 %s?" % (self.dialog[2] or self.dialog[1]),
+                  12, self.th("accent"), W // 2, H // 2 - 18)
+        elif self.dialog[0] == "untvfav":
+            textc(surf, "取消收藏 %s?" % (self.dialog[1] or ""),
+                  12, self.th("accent"), W // 2, H // 2 - 18)
         elif self.dialog[0] == "delwatch":
             textc(surf, "删除自选股 %s?" % (self.dialog[1] or ""),
                   12, self.th("accent"), W // 2, H // 2 - 18)
