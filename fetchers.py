@@ -7,11 +7,14 @@
 数据源 (2026-11-14 家庭网络实测全部可达):
   fx  — open.er-api.com/v6/latest/USD   (免 key, 1h TTL)
   ssq — www.cwl.gov.cn 中彩官网开奖 API  (600s TTL + 磁盘快照兜底)
+  dlt — datachart.500.com 大乐透开奖历史表 (600s TTL + 磁盘快照兜底;
+        官方 webapi.sporttery.cn 已加签名校验, Mac/设备直连均 E0001 拒访)
   ipo — datacenter-web.eastmoney.com 新股申购 (1800s TTL)
 """
 
 import json
 import os
+import re
 import time
 import urllib.request
 from datetime import datetime
@@ -33,6 +36,16 @@ def _get_json(url, headers=None, timeout=12):
     req = urllib.request.Request(url, headers=hdrs)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read(1048576).decode("utf-8", "replace"))
+
+
+def _get_text(url, headers=None, timeout=12):
+    """同 _get_json 但返回原文 (500.com 开奖历史表是 HTML, 正则解析)."""
+    hdrs = {"User-Agent": _UA}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(1048576).decode("utf-8", "replace")
 
 
 def _get_json_direct(url, headers=None, timeout=12):
@@ -312,6 +325,56 @@ def ssq_fetch():
     except Exception:
         pass
     return out or _snap_read("ssq.json")
+
+
+# ── 大乐透 (体彩; 官方接口拒访, 500 彩票网开奖历史表 HTML 正则解析) ─────────
+_DLT_URL = "https://datachart.500.com/dlt/history/newinc/history.php?limit=100&sort=0"
+_DLT_HEADERS = {"Referer": "https://datachart.500.com/dlt/"}
+_WEEK = ("一", "二", "三", "四", "五", "六", "日")
+# 行内 <td> 次序 (15 列): 0 期号, 1-5 前区×5, 6-7 后区×2, 8 销售额,
+# 9 一等注数, 10 一等奖金, 11 二等注数, 12 二等奖金, 13 奖池, 14 日期
+
+
+def _dlt_parse(html):
+    m = re.search(r'<tbody id="tdata">(.*?)</tbody>', html, re.S)
+    if not m:
+        return None
+    body = re.sub(r"<!--.*?-->", "", m.group(1))   # 行内历史注释掉的首列
+    issues = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S):
+        tds = [re.sub(r"<[^>]+>", "", td).strip()
+               for td in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+        if len(tds) < 15 or not tds[0].isdigit():
+            continue
+        try:
+            reds = [int(x) for x in tds[1:6]]
+            blues = [int(x) for x in tds[6:8]]
+            nums = [int(x.replace(",", "") or "0") for x in tds[8:14]]
+            week = _WEEK[datetime.strptime(tds[14], "%Y-%m-%d").weekday()]
+        except (ValueError, IndexError):
+            continue
+        if len(reds) != 5 or len(blues) != 2:
+            continue
+        issues.append({"code": tds[0], "date": tds[14], "week": week,
+                       "reds": reds, "blues": blues,
+                       "sales": nums[0], "pool": nums[5],
+                       "grades": [{"level": 1, "num": nums[1], "money": nums[2]},
+                                  {"level": 2, "num": nums[3], "money": nums[4]}]})
+    if not issues:
+        return None
+    return {"ok": True, "latest": issues[0], "issues": issues,
+            "count": len(issues)}
+
+
+def dlt_fetch():
+    out = None
+    try:
+        out = _dlt_parse(_get_text(_DLT_URL, headers=_DLT_HEADERS, timeout=12))
+        if out:
+            _snap_write("dlt.json", out)
+    except Exception:
+        pass
+    return out or _snap_read("dlt.json")
 
 
 # ── 新股申购 (东方财富 RPTA_APP_IPOAPPLY, 只留申购日 ≥ 今日, 按日升序) ──────

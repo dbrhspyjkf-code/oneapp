@@ -100,6 +100,30 @@ def test_fetchers():
         {"level": 1, "money": 9123456, "num": 4},
         {"level": 2, "money": 218866, "num": 88}], out["latest"]["grades"]
     assert fetchers._ssq_parse({"result": []}) is None
+    # 大乐透: 500.com HTML 行解析 (前区×5 + 后区×2 + 注数奖金/奖池, 千分位)
+    html = ('<tbody id="tdata">'
+            '<tr class="t_tr1"><!--<td>2</td>-->'
+            '<td class="t_tr1">26132</td>'
+            '<td class="cfont2">02</td><td class="cfont2">09</td>'
+            '<td class="cfont2">16</td><td class="cfont2">26</td>'
+            '<td class="cfont2">35</td>'
+            '<td class="cfont4">06</td><td class="cfont4">11</td>'
+            '<td class="t_tr1">754,624,606</td><td class="t_tr1">3</td>'
+            '<td class="t_tr1">8,814,866</td><td class="t_tr1">128</td>'
+            '<td class="t_tr1">101,697</td><td class="t_tr1">321,917,081</td>'
+            '<td class="t_tr1">2026-11-18</td></tr>'
+            '<tr class="t_tr1"><td class="t_tr1">垃圾行</td></tr>'
+            '</tbody>')
+    d = fetchers._dlt_parse(html)
+    assert d["ok"] and d["latest"]["code"] == "26132"
+    assert d["latest"]["reds"] == [2, 9, 16, 26, 35]
+    assert d["latest"]["blues"] == [6, 11]
+    assert d["latest"]["week"] == "三"
+    assert d["latest"]["pool"] == 321917081
+    assert d["latest"]["grades"] == [
+        {"level": 1, "money": 8814866, "num": 3},
+        {"level": 2, "money": 101697, "num": 128}], d["latest"]["grades"]
+    assert fetchers._dlt_parse("<html></html>") is None
     # ipo: 已截止剔除 + 形状
     from datetime import datetime, timedelta
     today = datetime.now().strftime("%Y-%m-%d")
@@ -452,6 +476,10 @@ def test_render():
     for tid, _name in dash.TOOL_APPS:
         app.tool = tid
         app.draw(canvas)
+        if tid == "lot":
+            app.lot_type = 1                      # 大乐透页也渲一帧
+            app.draw(canvas)
+            app.lot_type = 0
     app.tool = None
     its = app.news_items()
     assert len(its) == 2 and its[0]["t"].startswith("终端侧AI")
@@ -495,7 +523,7 @@ def test_tools():
 
     app = dash.App(FakeNet())
     app.data = dash.demo_data()
-    # 网格: 方向键 / 数字直开 (fx1 unit2 cal3 ssq4 timer5 music6) / Esc 回主页
+    # 网格: 方向键 / 数字直开 (fx1 unit2 cal3 lot4 timer5 music6) / Esc 回主页
     app.page = 5
     app.key(pygame.K_RIGHT)
     assert app.tsel == 1
@@ -584,16 +612,25 @@ def test_tools():
     app.key(pygame.K_n)
     t = _time.localtime()
     assert app._cal_ym() == (t.tm_year, t.tm_mon)
-    # 双色球: 滚动边界
-    app.tool_open("ssq")
+    # 彩票: ↑↓ 滚动边界 + ←→ 换彩种 (光标归零/环绕)
+    app.tool_open("lot")
     app.data["ssq"] = {"issues": [{"code": "1"}] * 5}
-    app.ssq_scroll = 0
+    app.data["dlt"] = {"issues": [{"code": "1"}] * 7}
+    app.lot_scroll = 0
     app.key(pygame.K_UP)
-    assert app.ssq_scroll == 0                    # 顶界
+    assert app.lot_scroll == 0                    # 顶界
     app.key(pygame.K_DOWN)
-    assert app.ssq_scroll == 1
+    assert app.lot_scroll == 1
+    app.key(pygame.K_RIGHT)
+    assert app.lot_type == 1 and app.lot_scroll == 0   # 大乐透, 光标归零
+    app.key(pygame.K_DOWN)
+    assert app.lot_scroll == 1                    # 大乐透独立滚动
+    app.key(pygame.K_LEFT)
+    assert app.lot_type == 0 and app.lot_scroll == 0   # 回双色球
+    app.key(pygame.K_LEFT)
+    assert app.lot_type == 1                      # ← 环绕到大乐透
     app.tool_close()
-    print("tools OK (grid/fx/timer/cal/ssq)")
+    print("tools OK (grid/fx/timer/cal/lot)")
 
 
 def test_music():
@@ -2954,6 +2991,10 @@ def test_net_live():
     ssq = fetchers.ssq_fetch()
     assert ssq["ok"] and ssq["latest"]["code"]
     print("  ssq latest", ssq["latest"]["code"])
+    dlt = fetchers.dlt_fetch()
+    assert dlt["ok"] and len(dlt["latest"]["blues"]) == 2
+    print("  dlt latest", dlt["latest"]["code"],
+          dlt["latest"]["reds"], "+", dlt["latest"]["blues"])
     ipo = fetchers.ipo_fetch()
     assert ipo["ok"]
     print("  ipo count", ipo["count"])

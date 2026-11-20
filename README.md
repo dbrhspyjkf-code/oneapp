@@ -15,7 +15,7 @@ M5Stack CardputerZero (320×170) 的 pygame 工具箱 app。**零本地服务依
 | 电台 | 20 台内置直连流 (中/英), 12 条频谱 VU, 输出 O 键循环 (本机 / 局域网 AirPlay 音箱) | qingting.fm / cnr.cn / BBC / NPR… |
 | 行情 | 自选股+指数+贵金属, 分时/250日K | 腾讯 qt.gtimg.cn |
 | 新闻 | 7 个中文 RSS 源 | IT之家 / 少数派 / Solidot… |
-| 工具 | 汇率 / 单位换算 / 万年历 / 双色球 / 计时器 / 音乐 / 电视 / 日程 / 设置 | open.er-api.com / 中彩官网 / QQ·网易直连 / 公共直播源 |
+| 工具 | 汇率 / 单位换算 / 万年历 / 彩票(双色球/大乐透) / 计时器 / 音乐 / 电视 / 日程 / 设置 | open.er-api.com / 中彩官网 / 500 彩票网 / QQ·网易直连 / 公共直播源 |
 
 音乐 app: 本地曲库 (mp3/flac/wav) + QQ 音乐 / 网易云**直连协议**
 (musrc.py 自实现 weapi/eapi, 扫码绑定, 歌词走 LRCLIB+网易兜底);

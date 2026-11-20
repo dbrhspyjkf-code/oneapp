@@ -5,7 +5,7 @@
 pygame 直写 /dev/fb_lcd + 裸 evdev 键盘 (与 sudokuzero 同款基建);
 零本地服务依赖, 全部数据源为公网直连:
   天气 Open-Meteo · 行情 腾讯 qt.gtimg.cn · 新闻 RSS×7 (news_rss.py)
-  汇率 open.er-api.com · 双色球 中彩官网 cwl.gov.cn · 新股 东方财富
+  汇率 open.er-api.com · 彩票 双色球 cwl.gov.cn / 大乐透 500.com · 新股 东方财富
   电台 内置站台直连流 · 音乐 QQ/网易云 直连 (musrc.py) + 本地曲库
   歌词 LRCLIB + 网易兜底 (musrc.lrc_fetch)
 
@@ -739,7 +739,7 @@ NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派
 # ── 工具页: app 卡片入口 (卡片=名字+快捷键, 5×2 网格, Z/C/F/X(丝印←→↑↓) 移动
 #    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
 TOOL_APPS = [("fx", "汇率"), ("unit", "换算"),
-             ("cal", "万年历"), ("ssq", "双色球"), ("timer", "计时器"),
+             ("cal", "万年历"), ("lot", "彩票"), ("timer", "计时器"),
              ("music", "音乐"), ("tv", "电视"),
              ("sched", "日程"), ("set", "设置")]   # 日程=8 设置=9 (2026-11-16 定版: 设置挪日程后)
 # 邮件不在工具网格 (2026-11-16 用户定版): 主页底栏 9 邮件 直达
@@ -1410,9 +1410,10 @@ class App:
         self.u_to = 1
         self.cv_field = 0
         self.cv_armed = False                 # 首键替换默认 1, 之后追加 (car-dash 同款)
-        # 双色球 / 计时器
-        self.ssq_scroll = 0                   # 选中期索引 (顶部卡片跟随)
-        self.ssq_view = 0                     # 历史列表窗口起点
+        # 彩票 (双色球/大乐透) / 计时器
+        self.lot_type = 0                     # LOT_TYPES 索引: 0=双色球 1=大乐透
+        self.lot_scroll = 0                   # 选中期索引 (顶部卡片跟随)
+        self.lot_view = 0                     # 历史列表窗口起点
         self.tm_dur = 300                     # 秒
         self.tm_left = 300.0
         self.tm_run = False
@@ -1947,8 +1948,9 @@ class App:
         t = self.tool
         if t == "fx":
             self.net.job("rate", fetchers.fx_fetch, 3600)
-        elif t == "ssq":
+        elif t == "lot":
             self.net.job("ssq", fetchers.ssq_fetch, 600)
+            self.net.job("dlt", fetchers.dlt_fetch, 600)
         elif t == "music":
             self._mu_qr_poll()                # 扫码状态机 (ok→搜索/fail→源页)
         elif t == "mail":
@@ -5447,8 +5449,8 @@ class App:
             return self.cv_key(k, ch, t == "fx")
         if t == "cal":
             return self.cal_key(k)
-        if t == "ssq":
-            return self.ssq_key(k)
+        if t == "lot":
+            return self.lot_key(k)
         if t == "timer":
             return self.timer_key(k)
         if t == "music":
@@ -6485,14 +6487,20 @@ class App:
             self.cal_ym = (t.tm_year, t.tm_mon)
         return True
 
-    # ── 双色球 ──
-    SSQ_RED, SSQ_BLUE = (224, 32, 32), (42, 107, 224)
+    # ── 彩票 (双色球/大乐透, ←→ 换彩种) ──
+    LOT_RED, LOT_BLUE = (224, 32, 32), (42, 107, 224)
+    LOT_TYPES = (("ssq", "双色球"), ("dlt", "大乐透"))
 
-    def ssq_key(self, k):
-        if k in (pygame.K_UP, pygame.K_DOWN):
-            n = len((self.data.get("ssq") or {}).get("issues") or [])
+    def lot_key(self, k):
+        if k in (pygame.K_LEFT, pygame.K_RIGHT):
+            d = 1 if k == pygame.K_RIGHT else -1
+            self.lot_type = (self.lot_type + d) % len(self.LOT_TYPES)
+            self.lot_scroll = self.lot_view = 0     # 换彩种光标归零 (回最新期)
+        elif k in (pygame.K_UP, pygame.K_DOWN):
+            key = self.LOT_TYPES[self.lot_type][0]
+            n = len((self.data.get(key) or {}).get("issues") or [])
             d = -1 if k == pygame.K_UP else 1
-            self.ssq_scroll = max(0, min(n - 1, self.ssq_scroll + d))
+            self.lot_scroll = max(0, min(n - 1, self.lot_scroll + d))
         return True
 
     def timer_key(self, k):
@@ -7621,7 +7629,7 @@ class App:
 
     def draw_tool(self, surf):
         {"fx": self.draw_fx, "unit": self.draw_unit,
-         "cal": self.draw_cal_app, "ssq": self.draw_ssq,
+         "cal": self.draw_cal_app, "lot": self.draw_lot,
          "timer": self.draw_timer, "music": self.draw_mu,
          "mail": self.draw_mail, "tv": self.draw_tv,
          "set": self.draw_set,
@@ -7782,20 +7790,21 @@ class App:
             return "{:,d}".format(int(v))
         return "{:,}".format(float("%.6g" % v))
 
-    # ── 工具·双色球 ──
-    def draw_ssq(self, surf):
+    # ── 工具·彩票 (双色球/大乐透) ──
+    def draw_lot(self, surf):
         acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
                               self.th("soft"), self.th("dim"))
-        self.tool_head(surf, "双色球", "↑↓ 选期")
-        j = self.data.get("ssq") or {}
+        key, name = self.LOT_TYPES[self.lot_type]
+        self.tool_head(surf, name, "↑↓ 选期 · ←→ 彩种")
+        j = self.data.get(key) or {}
         issues = (j.get("issues") or []) if j.get("ok") else []
         if not issues:
             textc(surf, "加载中…" if self.net.mode != "offline" else "离线 · 联网后同步",
                   12, dim, W // 2, 70)
             return
         n = len(issues)
-        self.ssq_scroll = max(0, min(self.ssq_scroll, n - 1))
-        it = issues[self.ssq_scroll]
+        self.lot_scroll = max(0, min(self.lot_scroll, n - 1))
+        it = issues[self.lot_scroll]
         # 顶部卡片 = 选中期, 期号/大球/奖金 全部水平居中
         r = pygame.Rect(4, 17, W - 8, 60)
         pygame.draw.rect(surf, self.card(0), r, border_radius=5)
@@ -7804,58 +7813,66 @@ class App:
             it.get("code", ""), str(it.get("date", ""))[5:],
             it.get("week", "")), 12, hi, W // 2, 21)
         reds = it.get("reds") or []
+        blues = self._lot_blues(it)
         rad = 12
-        bw = len(reds) * (rad * 2 + 5) + 3 + rad * 2
-        self._ssq_balls(surf, reds, it.get("blue"), (W - bw) // 2, 38, rad)
-        g1 = self._ssq_grade(it, 1)
-        g2 = self._ssq_grade(it, 2)
+        bw = (len(reds) + len(blues) - 1) * (rad * 2 + 5) + 3 + rad * 2
+        self._lot_balls(surf, reds, blues, (W - bw) // 2, 38, rad)
+        g1 = self._lot_grade(it, 1)
+        g2 = self._lot_grade(it, 2)
         textc(surf, "奖池 %s · 一等 %s 注 %s · 二等 %s 注 %s" % (
-            self._ssq_yi(it.get("pool")), g1[0], g1[1], g2[0], g2[1]),
+            self._lot_yi(it.get("pool")), g1[0], g1[1], g2[0], g2[1]),
             8, dim, W // 2, 65)
         # 历史窗口 4 行, 选中行高亮, 窗口跟随光标
         rows = 4
-        view = self.ssq_view
-        if self.ssq_scroll < view:
-            view = self.ssq_scroll
-        if self.ssq_scroll >= view + rows:
-            view = self.ssq_scroll - rows + 1
-        self.ssq_view = max(0, view)
+        view = self.lot_view
+        if self.lot_scroll < view:
+            view = self.lot_scroll
+        if self.lot_scroll >= view + rows:
+            view = self.lot_scroll - rows + 1
+        self.lot_view = max(0, view)
         for k in range(rows):
-            idx = self.ssq_view + k
+            idx = self.lot_view + k
             if idx >= n:
                 break
             h = issues[idx]
             y = 83 + k * 16
-            selr = idx == self.ssq_scroll
+            selr = idx == self.lot_scroll
             if selr:
                 hl = pygame.Rect(4, y - 2, W - 8, 15)
                 pygame.draw.rect(surf, self.card(0), hl, border_radius=4)
                 pygame.draw.rect(surf, acc, hl, 1, border_radius=4)
             text(surf, h.get("code", ""), 10, acc if selr else soft, (8, y))
             text(surf, str(h.get("date", ""))[5:], 9, dim, (66, y + 1))
-            self._ssq_balls(surf, h.get("reds") or [], h.get("blue"), 106, y, 6)
-        text(surf, "%d/%d" % (self.ssq_scroll + 1, n),
+            self._lot_balls(surf, h.get("reds") or [], self._lot_blues(h), 106, y, 6)
+        text(surf, "%d/%d" % (self.lot_scroll + 1, n),
              8, dim, (W - 10, 147), right=True)
 
-    def _ssq_balls(self, surf, reds, blue, x, y, rad):
+    @staticmethod
+    def _lot_blues(it):
+        """后区球列表: 大乐透 blues×2; 双色球 blue 单球 → 统一列表."""
+        b = it.get("blues")
+        if b is None:
+            b = [it.get("blue") or 0]
+        return b
+
+    def _lot_balls(self, surf, reds, blues, x, y, rad):
         fs = 7 if rad <= 6 else (10 if rad <= 9 else 13)
         # 数字在球内垂直居中: 用渲染表面字形包围盒中心对圆心 (设备 freetype
         # get_metrics 段错误不可用; 行框含留白, fs//2 经验值会偏)
         yo = y + rad - _ball_glyph_cy(fs)
-        for i, v in enumerate(reds):
-            cx = x + i * (rad * 2 + 5)
-            pygame.draw.circle(surf, self.SSQ_RED, (cx + rad, y + rad), rad)
+        step = rad * 2 + 5
+        gap = 3 if blues else 0               # 前/后区之间留 3px
+        items = ([(self.LOT_RED, v) for v in reds] +
+                 [(self.LOT_BLUE, v) for v in blues])
+        for i, (col, v) in enumerate(items):
+            cx = x + i * step + (gap if i >= len(reds) else 0)
+            pygame.draw.circle(surf, col, (cx + rad, y + rad), rad)
             s = "%02d" % v
             text(surf, s, fs, (255, 255, 255),
                  (cx + rad - textw(s, fs) // 2, yo))
-        bx = x + len(reds) * (rad * 2 + 5) + 3
-        pygame.draw.circle(surf, self.SSQ_BLUE, (bx + rad, y + rad), rad)
-        s = "%02d" % (blue or 0)
-        text(surf, s, fs, (255, 255, 255),
-             (bx + rad - textw(s, fs) // 2, yo))
 
     @staticmethod
-    def _ssq_grade(it, level):
+    def _lot_grade(it, level):
         for g in (it.get("grades") or []):
             if g.get("level") == level:
                 p = g.get("money") or 0
@@ -7865,7 +7882,7 @@ class App:
         return (0, "浮动")
 
     @staticmethod
-    def _ssq_yi(v):
+    def _lot_yi(v):
         return "%.2f 亿" % ((v or 0) / 1e8)
 
     # ── 家居页: HA 设备控制 ──
@@ -8504,6 +8521,23 @@ def demo_data():
              "pool": 2102233441, "sales": 355901122,
              "grades": [{"level": 1, "num": 1, "money": 11002233},
                         {"level": 2, "num": 33, "money": 528833}]},
+        ]},
+        "dlt": {"ok": True, "issues": [
+            {"code": "26132", "date": "2026-11-18", "week": "三",
+             "reds": [2, 9, 16, 26, 35], "blues": [6, 11],
+             "pool": 321917081, "sales": 754624606,
+             "grades": [{"level": 1, "num": 3, "money": 8814866},
+                        {"level": 2, "num": 128, "money": 101697}]},
+            {"code": "26131", "date": "2026-11-16", "week": "一",
+             "reds": [2, 11, 18, 19, 29], "blues": [4, 7],
+             "pool": 323417845, "sales": 731584779,
+             "grades": [{"level": 1, "num": 8, "money": 6352665},
+                        {"level": 2, "num": 139, "money": 100754}]},
+            {"code": "26130", "date": "2026-11-14", "week": "六",
+             "reds": [1, 7, 11, 27, 29], "blues": [2, 6],
+             "pool": 343462222, "sales": 743650197,
+             "grades": [{"level": 1, "num": 11, "money": 5926591},
+                        {"level": 2, "num": 123, "money": 105954}]},
         ]},
         "news": {"ok": True, "feeds": {"ai": {"ok": True, "items": [
             {"t": "终端侧AI:从单点应用走向智能体体验",
