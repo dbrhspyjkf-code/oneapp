@@ -1515,7 +1515,7 @@ class App:
         self.ns_sel = 0                       # 设置视图光标
         self.ns_scroll = 0
         self.ns_input = 0                     # 加/改源输入相: 0关 1标题 2地址
-        self.ns_title = ""                    # 相1收下的标题 (相2期间暂存)
+        self.ns_url = ""                      # 地址相收下的地址 (标题相期间暂存)
         self.ns_edit_id = None                # 编辑中的源 id (None=新增)
         self.esc_t = None                      # Esc 按下时刻 (长按回主页)
         # 邮件 app (工具第 7 卡; IMAP 收 + SMTP 发, 协议层在 mail.py)
@@ -2475,7 +2475,7 @@ class App:
             self.news_detail = None
             self.ns_sel = self.ns_scroll = 0     # 设置视图开着也回到列表头
             self.ns_input = 0                    # 输入中列表被云端换 → 收掉
-            self.ns_title = ""
+            self.ns_url = ""
             self.ns_edit_id = None
             self.buf = ""
             netmod.save_json_file(KV_FILES[k], feeds)   # 直写防回推
@@ -4660,7 +4660,8 @@ class App:
             return True
 
         if self.page == 4 and self.ns_input == 1:
-            # 加/改源·标题输入 (默认拼音, / 切中英; Enter → 地址相)
+            # 加/改源·标题输入 (后标题: 默认拼音, / 切中英 — 标题不含 '/',
+            # '/' 只在这里做切换键, 地址相已过不冲突; Enter=保存)
             if k == pygame.K_SLASH:
                 self.ime_mode = not self.ime_mode
                 self.ime_clear()
@@ -4668,7 +4669,7 @@ class App:
             if self.ime_mode:
                 if not self.ime_buf:
                     if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                        self._ns_phase_url()
+                        self.news_feed_commit()
                         return True
                     if k == pygame.K_ESCAPE:
                         self._ns_input_close()
@@ -4681,12 +4682,12 @@ class App:
                     self.buf = self.buf[:-1]
                 elif tag == "submit":
                     self.ime_clear()
-                    self._ns_phase_url()
+                    self.news_feed_commit()
                 else:
                     self.buf = (self.buf + val)[:20]
                 return True
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                self._ns_phase_url()
+                self.news_feed_commit()
             elif k == pygame.K_ESCAPE:
                 self._ns_input_close()
             elif k == pygame.K_BACKSPACE:
@@ -4697,9 +4698,10 @@ class App:
             return True
 
         if self.page == 4 and self.ns_input == 2:
-            # 加/改源·地址输入 (纯 EN 直输, '/' 在 URL 里是字符; Enter=提交)
+            # 加/改源·地址输入 (先地址: 纯 EN 直输, '/' 是字符绝不劫持 —
+            # sym+n 实发 '/', 不碰 IME 切换; Enter → 标题相)
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                self.news_feed_commit()
+                self._ns_phase_title()
                 return True
             if k == pygame.K_ESCAPE:
                 self._ns_input_close()
@@ -4950,22 +4952,20 @@ class App:
                     self.buf = ""
                 elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     self.news_feed_toggle()
-                elif k == pygame.K_n:             # 加源: 标题 → 地址
-                    self.ns_input = 1
-                    self.ns_title = ""
+                elif k == pygame.K_n:             # 加源: 地址先 (EN '/' 直输)
+                    self.ns_input = 2
+                    self.ns_url = ""
                     self.ns_edit_id = None
                     self.buf = ""
-                    self.ime_mode = True          # 标题默认中文
                     self.ime_clear()
-                elif k == pygame.K_e:             # 改源 (仅自定义)
+                elif k == pygame.K_e:             # 改源 (仅自定义): 地址 → 标题
                     f = self.news_feeds[self.ns_sel] \
                         if 0 <= self.ns_sel < len(self.news_feeds) else None
                     if f and str(f.get("id", "")).startswith("c_"):
-                        self.ns_input = 1
-                        self.ns_title = ""
+                        self.ns_input = 2
+                        self.ns_url = ""
                         self.ns_edit_id = f["id"]
-                        self.buf = str(f.get("name") or "")
-                        self.ime_mode = False     # 改题常为微调, EN 起步
+                        self.buf = str(f.get("url") or "")
                         self.ime_clear()
                     elif f:
                         self.osd = ("内置源不可编辑", time.monotonic() + 2)
@@ -7876,27 +7876,32 @@ class App:
         self._news_feeds_osd("%s %s" % (f.get("name") or "",
                                         "已显示" if f["on"] else "已隐藏"))
 
-    def _ns_phase_url(self):
-        """标题相 → 地址相 (标题暂存, 地址纯 EN 直输)."""
-        self.ns_title = (self.buf or "").strip()
+    def _ns_phase_title(self):
+        """地址相 → 标题相 (地址暂存 ns_url; 编辑态标题预填旧名, 拼音默认)."""
+        self.ns_url = (self.buf or "").strip()
         self.buf = ""
-        self.ns_input = 2
+        if self.ns_edit_id:
+            old = next((x for x in self.news_feeds
+                        if x.get("id") == self.ns_edit_id), None)
+            self.buf = str((old or {}).get("name") or "")
+        self.ns_input = 1
+        self.ime_mode = True                  # 标题默认中文
         self.ime_clear()
 
     def _ns_input_close(self):
         """收掉加/改源输入 (整链作废)."""
         self.ns_input = 0
-        self.ns_title = ""
+        self.ns_url = ""
         self.ns_edit_id = None
         self.buf = ""
         self.ime_clear()
 
     def news_feed_commit(self):
-        """地址相 Enter: 新增 (标题+地址; id=c_+md5(url)[:8] 同址幂等,
-        重加=恢复显示) 或编辑落位 (id/on 不变, 可改标题+地址).
+        """标题相 Enter (地址已在 ns_url): 新增 (标题+地址; id=c_+md5[:8]
+        同址幂等, 重加=恢复显示) 或编辑落位 (id/on 不变, 可改标题+地址).
         标题空 → 域名兜底; 地址无效/与他源重址 → OSD 拒绝."""
-        url = (self.buf or "").strip()
-        title = self.ns_title
+        url = self.ns_url
+        title = (self.buf or "").strip()
         edit_id = self.ns_edit_id
         self._ns_input_close()
         if url and "://" not in url:
@@ -8058,10 +8063,10 @@ class App:
                     text(surf, tag, 10, acc, (lx, ty + 1))
                     lx += textw(tag, 10) + 6
                     raw = self.buf + self.ime_buf
-                    hint = "Enter 下步 · / 中英 · Esc 退"
+                    hint = "Enter 存 · / 中英 · Esc 退"
                 else:
                     raw = self.buf
-                    hint = "Enter 存 · Esc 退"
+                    hint = "Enter 下步 · Esc 退"
                 vw = max(50, r.right - 8 - textw(hint, 9) - 8 - lx)
                 shown = tail_text(raw, BODY, vw)
                 text(surf, shown, BODY, hi, (lx, ty))

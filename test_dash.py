@@ -2632,41 +2632,50 @@ def test_news_settings():
         app.draw(canvas)                           # 列表态: 源已全部隐藏
         for f in app.news_feeds:
             f["on"] = True
-        # 两相加源: N → 标题 (默认拼音, / 切 EN) → Enter → 地址 (EN) → Enter
+        # 两相加源 (地址先行): N → 地址 (EN, sym+n 实发 K_SLASH+'/' 是
+        # 字符绝不劫持) → Enter → 标题 (拼音默认, / 切中英) → Enter 保存
         app.key(pygame.K_s)
         app.key(pygame.K_n)
-        assert app.ns_input == 1 and app.buf == "" \
-            and app.ns_edit_id is None and app.ime_mode is True
-        app.draw(canvas)                           # 标题相渲染冒烟
-        app.buf = "例站"
-        app.key(pygame.K_RETURN)
-        assert app.ns_input == 2 and app.ns_title == "例站" and app.buf == ""
-        app.buf = "rss.example.com/feed"
+        assert app.ns_input == 2 and app.buf == "" \
+            and app.ns_edit_id is None
         app.draw(canvas)                           # 地址相渲染冒烟
+        app.buf = "rss.example.com/feed"
+        app.key(pygame.K_SLASH, "/")
+        assert app.buf.endswith("feed/"), app.buf   # '/' 直输入地址
         app.key(pygame.K_RETURN)
-        assert app.ns_input == 0 and app.ns_title == ""
+        assert app.ns_input == 1 and app.ns_url.endswith("feed/") \
+            and app.buf == "" and app.ime_mode is True   # 标题相拼音默认
+        app.key(pygame.K_SLASH)                    # 标题相: '/' 仍是中英切换
+        assert app.ime_mode is False
+        app.buf = "例站"
+        app.key(pygame.K_SLASH)
+        app.draw(canvas)                           # 标题相渲染冒烟
+        app.key(pygame.K_RETURN)
+        assert app.ns_input == 0 and app.ns_url == ""
         nf = app.news_feeds[-1]
         assert nf["name"] == "例站" and nf["on"] is True
-        assert nf["url"] == "https://rss.example.com/feed"
+        assert nf["url"] == "https://rss.example.com/feed/"
         assert nf["id"].startswith("c_")
         assert app.ns_sel == len(app.news_feeds) - 1
         assert app.ns_scroll == max(0, app.ns_sel - 6)   # 窗口跟随
         # 标题空 → 域名兜底
         app.key(pygame.K_n)
-        app.key(pygame.K_RETURN)                   # 标题空直接下步
         app.buf = "a.example.com/f"
-        app.key(pygame.K_RETURN)
+        app.key(pygame.K_RETURN)                   # 地址 → 标题相
+        app.key(pygame.K_RETURN)                   # 标题空直接存
         assert app.news_feeds[-1]["name"] == "a.example.com"
         assert len(app.news_feeds) == 10
-        # E 编辑自定义源: 标题/地址均可改, id/on 不变
+        # E 编辑自定义源: 地址/标题均可改, id/on 不变
         app.ns_sel = len(app.news_feeds) - 2       # 例站
         fid0 = app.news_feeds[app.ns_sel]["id"]
+        old_url = app.news_feeds[app.ns_sel]["url"]
         app.key(pygame.K_e)
-        assert app.ns_input == 1 and app.ns_edit_id == fid0 \
-            and app.buf == "例站" and app.ime_mode is False
-        app.buf = "例站二"
-        app.key(pygame.K_RETURN)
+        assert app.ns_input == 2 and app.ns_edit_id == fid0 \
+            and app.buf == old_url
         app.buf = "rss2.example.com/feed"
+        app.key(pygame.K_RETURN)                   # 地址 → 标题相 (预填旧名)
+        assert app.ns_input == 1 and app.buf == "例站"
+        app.buf = "例站二"
         app.key(pygame.K_RETURN)
         nf = app.news_feeds[app.ns_sel]
         assert nf["name"] == "例站二" \
@@ -2680,28 +2689,28 @@ def test_news_settings():
         # 编辑重址撞他源 → 拒绝且不改
         app.ns_sel = len(app.news_feeds) - 1       # a.example.com
         app.key(pygame.K_e)
-        app.key(pygame.K_RETURN)                   # 标题不动
         app.buf = "rss2.example.com/feed"          # 撞 例站二
-        app.key(pygame.K_RETURN)
+        app.key(pygame.K_RETURN)                   # 地址 → 标题相
+        app.key(pygame.K_RETURN)                   # 标题不动, 提交
         assert app.ns_input == 0 and "已有源" in app.osd[0]
         assert app.news_feeds[-1]["url"] == "https://a.example.com/f"
         # 地址无效 → 拒绝
         app.key(pygame.K_n)
-        app.key(pygame.K_RETURN)
         app.buf = "not a url"
-        app.key(pygame.K_RETURN)
+        app.key(pygame.K_RETURN)                   # 地址 → 标题相
+        app.key(pygame.K_RETURN)                   # 提交 → 拒
         assert app.ns_input == 0 and "地址无效" in app.osd[0]
         assert len(app.news_feeds) == 10
         # 上限: 临时调小再恢复
         real_max = dash.NEWS_FEEDS_MAX
         dash.NEWS_FEEDS_MAX = 11
         app.key(pygame.K_n)
-        app.key(pygame.K_RETURN)                   # 标题空 → 地址相
         app.buf = "b.example.com/f"
+        app.key(pygame.K_RETURN)                   # 地址 → 标题相
         app.key(pygame.K_RETURN)                   # 第 11 个, 收下
         app.key(pygame.K_n)
-        app.key(pygame.K_RETURN)
         app.buf = "c.example.com/f"
+        app.key(pygame.K_RETURN)
         app.key(pygame.K_RETURN)                   # 第 12 个, 拒
         dash.NEWS_FEEDS_MAX = real_max
         assert len(app.news_feeds) == 11 and "最多" in app.osd[0]
@@ -2709,8 +2718,8 @@ def test_news_settings():
         app.key(pygame.K_n)
         app.buf = "x"
         app.key(pygame.K_RETURN)
-        app.key(pygame.K_ESCAPE)
-        assert app.ns_input == 0 and app.ns_title == "" \
+        app.key(pygame.K_ESCAPE)                   # 标题相 Esc → 整链作废
+        assert app.ns_input == 0 and app.ns_url == "" \
             and app.ns_edit_id is None and app.buf == ""
         assert len(app.news_feeds) == 11
         # 删自定义: D → dialog → Enter 真删; 内置源 D 无效果
