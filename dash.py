@@ -4981,8 +4981,12 @@ class App:
                 self.ns_sel = self.ns_scroll = 0
                 return True
             if k == pygame.K_p:
-                self.page = (self.page + 1) % len(PAGES)   # P 换页 (方向键
-                self.in_input = False                       #   已被占用)
+                # P = 列表翻页 (2026-11-21 用户定版: 换页指条目翻页不是跳页,
+                # 跳工具页的旧行为已删; 大写 Shift+P = 上翻; 详情态翻正文行)
+                if self.news_detail:
+                    self.news_detail_scroll += -7 if ch == "P" else 7
+                else:
+                    self.move_news(-7 if ch == "P" else 7)
                 return True
             digit = k - pygame.K_0
             if pygame.K_1 <= k <= pygame.K_7 and not self.news_detail:
@@ -8109,7 +8113,7 @@ class App:
         elif not items:
             textc(surf, "新闻获取中" if self.net.mode != "offline"
                   else "离线 · 联网后同步", BODY, dim, W // 2, 70)
-        text(surf, "P 换页 · 1-7 打开 · ←→ 源", BODY, soft, (6, 151))
+        text(surf, "P 翻页 · 1-7 打开 · ←→ 源", BODY, soft, (6, 151))
         text(surf, "S 设置", BODY, acc, (W - 6, 151), right=True)
 
     def draw_tool(self, surf):

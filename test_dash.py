@@ -532,10 +532,12 @@ def test_render():
     assert app.news_sel == sel0 + 1                   # ↓ 选择下一条
     app.key(pg.K_UP)
     assert app.news_sel == sel0                       # ↑ 选择上一条
-    # P = 换页 (4→5 工具; 方向键已被选条/切源占用)
+    # P = 列表翻页 (2026-11-21 用户定版, 不再跳工具页; Shift+P 上翻);
+    # demo 仅 2 条, 翻页被钳回原地 — 断言核心是留在新闻页
     app.key(pg.K_p)
-    assert app.page == 5, app.page
-    app.page = 4
+    assert app.page == 4, app.page
+    app.key(pg.K_p, "P")                              # 大写 = 上翻
+    assert app.page == 4 and app.news_detail is None
     print("render OK (6 pages + dialog + ideas-local + fin + tools/news)")
 
 
@@ -2751,7 +2753,7 @@ def test_news_settings():
         app.key(pygame.K_ESCAPE)
         assert not app.news_set
         # 底栏提示分左右两段, 合计不溢出屏宽
-        lw = dash.textw("P 换页 · 1-7 打开 · ←→ 源", 15)
+        lw = dash.textw("P 翻页 · 1-7 打开 · ←→ 源", 15)
         rw = dash.textw("S 设置", 15)
         assert lw + rw <= dash.W - 12, (lw, rw)
         lw = dash.textw("↑↓ 选 · Enter 显/隐", 13)
