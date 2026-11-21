@@ -44,6 +44,10 @@ FEEDS = {
     "wscn":     {"name": "华尔街见闻", "url": "https://dedicated.wallstreetcn.com/rss.xml"},
     "chinanews": {"name": "中新网",
                   "url": "https://www.chinanews.com.cn/rss/scroll-news.xml"},
+    "xh_world": {"name": "新华国际",
+                 "url": "http://www.xinhuanet.com/world/news_world.xml"},
+    "xh_mil":   {"name": "新华军事",
+                 "url": "http://www.xinhuanet.com/mil/news_mil.xml"},
 }
 
 _ACTIVE = dict(FEEDS)                          # 当前生效源表 (dash set_feeds 动态换)
