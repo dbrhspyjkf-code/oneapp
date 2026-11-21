@@ -2594,7 +2594,9 @@ def test_news_settings():
         long_url = "https://www.chinanews.com.cn/rss/scroll-news.xml"
         t = dash.tail_text(long_url, 15, 100)
         assert t.startswith("…") and long_url.endswith(t[1:]), t
+        assert dash.textw(t, 15) <= 100, dash.textw(t, 15)   # 真放下, 不超框
         assert dash.tail_text("abc.com", 15, 100) == "abc.com"
+        assert dash.tail_text("", 15, 100) == ""
         # S 进设置 (关详情) · 渲染冒烟 · Esc 退
         app.page = 4
         app.news_detail = None

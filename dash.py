@@ -580,13 +580,14 @@ def tail_text(s, size, maxw):
     if textw(s0, size) <= maxw:
         out = s0
     else:
-        lo, hi = 0, len(s0) - 1             # 最大 hi 使 "…"+s0[hi:] 放得下
+        # fits(hi) 随 hi 增大而成立 (尾越短越放得下), 找最小可放 hi = 最长可见尾
+        lo, hi = 0, len(s0) - 1
         while lo < hi:
-            mid = (lo + hi + 1) // 2
+            mid = (lo + hi) // 2
             if textw("…" + s0[mid:], size) <= maxw:
-                lo = mid
+                hi = mid
             else:
-                hi = mid - 1
+                lo = mid + 1
         out = "…" + s0[lo:]
     if len(_tail_cache) > 2000:
         _tail_cache.clear()
