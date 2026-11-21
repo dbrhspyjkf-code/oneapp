@@ -3205,9 +3205,9 @@ def test_tv():
     dash.TV_LAST_CACHE = os.path.join(tmp, "tv_last.json")
     dash.TV_FAV_CACHE = os.path.join(tmp, "tv_fav.json")
 
-    # ── 台表: 95 条实测源, 4 组齐全, 无空名/坏协议/短时效 token;
-    #    每频道 urls 列表 (≥30 台多路备胎), aptv host 挂 UA ──
-    assert len(tv_channels.CHANNELS) == 95
+    # ── 台表: 90 条实测源 (2026-11-21 设备侧体检重排, 死源剔除),
+    #    4 组齐全, 无空名/坏协议/短时效 token; ≥20 台多路备胎 ──
+    assert len(tv_channels.CHANNELS) == 90
     assert tv_channels.GROUPS == ["央视", "卫视", "地方", "国际"]
     for g in tv_channels.GROUPS:
         assert any(c[1] == g for c in tv_channels.CHANNELS), g
@@ -3219,8 +3219,7 @@ def test_tv():
             assert u.startswith(("http://", "https://")), (n, u)
             assert "txSecret" not in u and "user_session_id" not in u, n
         assert g in tv_channels.GROUPS
-    assert sum(1 for c in tv_channels.CHANNELS if len(c[2]) > 1) >= 30
-    assert tv_channels.UA_BY_HOST.get("101.35.240.114") == "AptvPlayer-UA"
+    assert sum(1 for c in tv_channels.CHANNELS if len(c[2]) > 1) >= 20
 
     # ── argv: 硬解 copy 前缀 + 解码器旗标; 软解无; 关音频 -an ──
     app = dash.App(FakeNet())
@@ -3239,9 +3238,13 @@ def test_tv():
     assert a_sw[a_sw.index("-vf") + 1].startswith("fps=12,scale=320:170")
     a_an = app.tv_argv("http://x/live.m3u8", False, False)
     assert a_an[-1] == "-an" and "pulse" not in a_an
-    a_ua = app.tv_argv("http://101.35.240.114:88/live.php?id=CCTV1", False, True)
-    assert a_ua[a_ua.index("-user_agent") + 1] == "AptvPlayer-UA"
-    assert "101.35.240.114" in a_ua[a_ua.index("-i") + 1]
+    # UA_BY_HOST 机制: 注入假 host 验证 -user_agent (aptv 转发源已
+    # 全线 404 下线, 表清空留占位)
+    tv_channels.UA_BY_HOST["ua.test.host"] = "Test-UA"
+    a_ua = app.tv_argv("http://ua.test.host:88/live.php?id=CCTV1", False, True)
+    assert a_ua[a_ua.index("-user_agent") + 1] == "Test-UA"
+    assert "ua.test.host" in a_ua[a_ua.index("-i") + 1]
+    tv_channels.UA_BY_HOST.clear()
     assert "-user_agent" not in a_sw
     # 硬解探测: 无 v4l2 的机器 (Mac) 恒 False; True 仅可能出现在有
     # /sys/class/video4linux 的设备 (bcm2835-codec-decode)
