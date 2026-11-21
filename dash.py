@@ -4,7 +4,8 @@
 
 pygame 直写 /dev/fb_lcd + 裸 evdev 键盘 (与 sudokuzero 同款基建);
 零本地服务依赖, 全部数据源为公网直连:
-  天气 Open-Meteo · 行情 腾讯 qt.gtimg.cn · 新闻 RSS×7 (news_rss.py)
+  天气 Open-Meteo · 行情 腾讯 qt.gtimg.cn · 新闻 RSS 源可配置 (news_rss.py,
+  新闻页 S 设置视图 显隐/增删, kv 云同步)
   汇率 open.er-api.com · 彩票 双色球 cwl.gov.cn / 大乐透 500.com · 新股 东方财富
   电台 内置站台直连流 · 音乐 QQ/网易云 直连 (musrc.py) + 本地曲库
   歌词 LRCLIB + 网易兜底 (musrc.lrc_fetch)
@@ -14,6 +15,7 @@ pygame 直写 /dev/fb_lcd + 裸 evdev 键盘 (与 sudokuzero 同款基建);
 """
 
 import glob
+import hashlib
 import io
 import json
 import mmap
@@ -31,6 +33,7 @@ import tempfile
 import threading
 import sys
 import time
+import urllib.parse
 
 import pygame
 
@@ -732,9 +735,10 @@ def wx_code_zh(c):
 PAGES = [("主页", ""), ("想法", ""), ("电台", ""), ("行情", ""), ("新闻", ""), ("工具", "")]
 MODE_LABEL = {"online": ("在线", "ok"), "offline": ("离线", "danger"),
               "probing": ("…", "dim")}
-NEWS_SOURCES = [("ai", "AI新闻"), ("ithome", "IT之家"), ("sspai", "少数派"),
-                ("solidot", "Solidot"), ("ifanr", "爱范儿"),
-                ("leiphone", "雷峰网"), ("wscn", "华尔街见闻")]
+# 新闻源表: 内置 7 源种子 news_rss.defaults() → news_feeds.json (S 设置视图
+# 显隐/增删, kv 云同步); 运行期 [(id,name)] 由 app.news_srcs() 动态给出
+NEWS_FEEDS_FILE = os.path.join(STATE_DIR, "news_feeds.json")  # 源表 (kv 云同步)
+NEWS_FEEDS_MAX = 16                     # 源数上限 (并发抓取时长可控)
 
 # ── 工具页: app 卡片入口 (卡片=名字+快捷键, 5×2 网格, Z/C/F/X(丝印←→↑↓) 移动
 #    光标, Enter 打开, 数字直开, Esc 子应用返回网格) ──
@@ -806,8 +810,9 @@ WATCH_SEED = {"items": [
 # 登录后逐服务对齐 (本地有记录→确认框: Enter 上传 / Esc 云端覆盖);
 # 开机拉取按文件 mtime 判新旧 (LWW, 静默)
 KV_FILES = {"radio_fav": RADIO_FAV_CACHE, "watch": WATCH_FILE,
-            "tv_fav": TV_FAV_CACHE}
-KV_LABEL = {"radio_fav": "电台收藏", "watch": "自选股", "tv_fav": "电视收藏"}
+            "tv_fav": TV_FAV_CACHE, "news_feeds": NEWS_FEEDS_FILE}
+KV_LABEL = {"radio_fav": "电台收藏", "watch": "自选股", "tv_fav": "电视收藏",
+            "news_feeds": "新闻源"}
 VOICES_DIR = os.path.join(STATE_DIR, "voices")   # 语音想法 (本地 wav)
 # 录音 (ES8389 麦克风; amixer 路由照抄 xiaozhi_launcher 已知良好配置 —
 # 驱动默认态=错误路由, 底噪 RMS 2767, 配置后 258; 每次录音前重置, 默认会漂)
@@ -1477,6 +1482,12 @@ class App:
         self.news_detail_scroll = 0           # 详情滚动行数
         self.news_i = 0                       # 主页新闻跑马灯条目轮换
         self._news_at = 0.0
+        self.news_feeds = self._news_feeds_load()  # 源表 [{id,name,url,on}] kv 云同步
+        news_rss.set_feeds(self.news_feeds)   # 抓取层生效源表 (news_fetch_all)
+        self.news_set = False                 # 新闻源设置视图 (S 进, Esc 退)
+        self.ns_sel = 0                       # 设置视图光标
+        self.ns_scroll = 0
+        self.ns_input = False                 # 加源 URL 输入态 (N)
         self.esc_t = None                      # Esc 按下时刻 (长按回主页)
         # 邮件 app (工具第 7 卡; IMAP 收 + SMTP 发, 协议层在 mail.py)
         self.mail = mailmod.load_accounts()    # {"accounts": [...], "last": ...}
@@ -1977,6 +1988,7 @@ class App:
                                  ",day,,,250,qfq", "day", 60)
             if self.page == 4:
                 self.net.job("news", news_rss.news_fetch_all, 600)
+                self.kv_pull("news_feeds")    # 源表云端拉取兜底 (TTL 节流)
             if self.page == 5:
                 self.poll_tool()
             if self.rec_proc and time.monotonic() - self.rec_started >= REC_MAX:
@@ -2287,6 +2299,15 @@ class App:
         netmod.save_json_file(TV_FAV_CACHE, self.tv_fav)
         self.kv_push("tv_fav")
 
+    def news_feeds_save(self):
+        """新闻源表落盘 + kv 推云 + 抓取层换生效源表 (在线时立即重抓)."""
+        netmod.save_json_file(NEWS_FEEDS_FILE, self.news_feeds)
+        news_rss.set_feeds(self.news_feeds)
+        self.net.invalidate(("job", "news"))
+        if self.net.mode == "online":
+            self.net.job("news", news_rss.news_fetch_all, 600)
+        self.kv_push("news_feeds")
+
     def _cloud_base(self):
         return (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
 
@@ -2400,6 +2421,23 @@ class App:
             self.watch = {"items": items}
             self.fsel = self.fscroll = 0
             netmod.save_json_file(KV_FILES[k], self.watch)
+            return
+        if k == "news_feeds":
+            feeds = [f for f in (v or []) if isinstance(f, dict)
+                     and f.get("id") and f.get("url")]
+            if not feeds:
+                # 云端空/404/换号清空 → 内置种子兜底 (不允许零源;
+                # 清零事故同款哲学: 空态不落地)
+                feeds = news_rss.defaults()
+            for f in feeds:
+                f["on"] = bool(f.get("on", True))
+            self.news_feeds = feeds
+            news_rss.set_feeds(feeds)
+            self.news_src_i = 0                  # 可见源集可能变短
+            self.news_sel = self.news_scroll = 0
+            self.news_detail = None
+            self.ns_sel = self.ns_scroll = 0     # 设置视图开着也回到列表头
+            netmod.save_json_file(KV_FILES[k], feeds)   # 直写防回推
             return
         if k in ("radio_fav", "tv_fav"):
             val = [x for x in (v or []) if isinstance(x, str)]
@@ -4460,7 +4498,7 @@ class App:
         """输入态 (F/Z/X/C 保持字母, 丝印方向让位): 想法/行情添加/行情
         KEY 设置/音乐搜索/邮件登录/邮件写信/云注册+登录表单."""
         return (self.in_input or self.fin_input or self.fin_sync
-                or self.mu_input
+                or self.mu_input or self.ns_input
                 or (self.tool == "mail"
                     and self.mail_lv in ("login", "compose"))
                 or (self.tool == "set" and (self.set_edit is not None
@@ -4491,6 +4529,8 @@ class App:
                     self.radio_fav_remove(self.dialog[1])  # ("unfav", key, 名)
                 elif self.dialog[0] == "untvfav":
                     self.tv_fav_remove(self.dialog[1])     # ("untvfav", 名)
+                elif self.dialog[0] == "delnfeed":
+                    self.news_feed_del(self.dialog[1])    # ("delnfeed", fid)
                 else:
                     self.delete_selected()   # ("del", item) 确认删除
                 self.dialog = None
@@ -4575,6 +4615,22 @@ class App:
                 self.buf = self.buf[:-1]
             elif ch and 0x20 <= ord(ch) < 0x7F:
                 if len(self.buf) < 16:
+                    self.buf += ch
+            return True
+
+        if self.page == 4 and self.ns_input:
+            # 新闻加源 URL 输入 (纯 EN 直输, URL 无中文; Enter=保存)
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.news_feed_add_commit()
+                return True
+            if k == pygame.K_ESCAPE:
+                self.ns_input = False
+                self.buf = ""
+                return True
+            if k == pygame.K_BACKSPACE:
+                self.buf = self.buf[:-1]
+            elif ch and 0x20 <= ord(ch) < 0x7F:
+                if len(self.buf) < 200:
                     self.buf += ch
             return True
 
@@ -4700,7 +4756,9 @@ class App:
                         and not self.fin_sync:
                 self._move_fsel(-3 if k == pygame.K_UP else -1)
             elif self.page == 4:
-                if k == pygame.K_LEFT:
+                if self.news_set:
+                    self._ns_move(-1)              # 设置视图: 四向都移光标
+                elif k == pygame.K_LEFT:
                     self._news_src_cycle(-1)       # ← 切换源
                 elif self.news_detail:
                     self.news_detail_scroll = max(0,
@@ -4728,7 +4786,9 @@ class App:
                         and not self.fin_sync:
                 self._move_fsel(3 if k == pygame.K_DOWN else 1)
             elif self.page == 4:
-                if k == pygame.K_RIGHT:
+                if self.news_set:
+                    self._ns_move(1)
+                elif k == pygame.K_RIGHT:
                     self._news_src_cycle(1)        # → 切换源
                 elif self.news_detail:
                     self.news_detail_scroll += 1       # 下滚一行
@@ -4741,6 +4801,9 @@ class App:
         elif k == pygame.K_ESCAPE:
             if self.news_detail:              # 新闻详情 → 关详情
                 self.news_detail = None
+            elif self.page == 4 and self.news_set:   # 源设置 → 回新闻列表
+                self.news_set = False
+                self.buf = ""
             elif self.fdetail:                # 图表详情 → 关图表
                 self.fdetail = None
             elif self.page == 1 and self.iview == "cloud":
@@ -4803,6 +4866,27 @@ class App:
             # (方向键已在上方分支转入 tool_grid_key; Esc 全局分支 → 回主页)
             self.tool_grid_key(k)
         elif self.page == 4:
+            if self.news_set:
+                # 源设置视图: S/Esc 退 · Enter 显/隐 · N 加源 · D 删自定义
+                if k in (pygame.K_s, pygame.K_ESCAPE):
+                    self.news_set = False
+                    self.buf = ""
+                elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.news_feed_toggle()
+                elif k == pygame.K_n:
+                    self.ns_input = True          # URL 输入 (EN 直输)
+                    self.buf = ""
+                elif k == pygame.K_d:
+                    f = self.news_feeds[self.ns_sel] \
+                        if 0 <= self.ns_sel < len(self.news_feeds) else None
+                    if f and str(f.get("id", "")).startswith("c_"):
+                        self.dialog = ("delnfeed", f["id"])
+                return True
+            if k == pygame.K_s:                   # 进源设置 (列表态)
+                self.news_set = True
+                self.news_detail = None
+                self.ns_sel = self.ns_scroll = 0
+                return True
             if k == pygame.K_p:
                 self.page = (self.page + 1) % len(PAGES)   # P 换页 (方向键
                 self.in_input = False                       #   已被占用)
@@ -7065,9 +7149,15 @@ class App:
         text(surf, "9 本地 · Enter 播 · 7 删云", 13, soft, (6, 151))
 
     def _news_items(self):
+        """主页新闻卡: 第一个有条目的可见源 (源表可配置后不再钉死 ai)."""
         j = self.data.get("news") or {}
-        ai = (j.get("feeds") or {}).get("ai") or {}
-        return [it for it in (ai.get("items") or []) if it.get("t")][:12]
+        feeds = j.get("feeds") or {}
+        for fid, _n in self.news_srcs():
+            its = [it for it in ((feeds.get(fid) or {}).get("items") or [])
+                   if it.get("t")]
+            if its:
+                return its[:12]
+        return []
 
     def _wrap_lines(self, s_, size, maxw, n):
         """按像素宽折行, 最多 n 行 (超出并到末行加省略号截断).
@@ -7606,18 +7696,121 @@ class App:
 
     # ── 工具页: 万年历 / 汇率 ──
     # ── 新闻页 (car-dash 同源 /news/feeds, 13px) ──
+    @staticmethod
+    def _news_feeds_load():
+        """源表 (news_feeds.json); 坏数据/空 → 内置 7 源种子落盘 (不允许零源)."""
+        v = netmod.load_json_file(NEWS_FEEDS_FILE, None)
+        if isinstance(v, list) and v and all(
+                isinstance(f, dict) and f.get("id") and f.get("url")
+                for f in v):
+            for f in v:
+                f["on"] = bool(f.get("on", True))
+            return v
+        seed = news_rss.defaults()
+        try:
+            netmod.save_json_file(NEWS_FEEDS_FILE, seed)
+        except Exception:
+            pass
+        return seed
+
+    def news_srcs(self):
+        """生效源表 [(id, 显示名)] — 设置里 on=True 的 (列表页 ←→ 只在
+        可见源间循环, 隐藏源不出现)."""
+        return [(f["id"], str(f.get("name") or f["id"]))
+                for f in self.news_feeds if f.get("on", True)]
+
     def news_items(self):
         j = self.data.get("news") or {}
-        src = NEWS_SOURCES[self.news_src_i][0]
-        feed = (j.get("feeds") or {}).get(src) or {}
+        srcs = self.news_srcs()
+        if not srcs:
+            return []
+        self.news_src_i %= len(srcs)      # 源被隐藏/云同步缩短后钳回
+        feed = (j.get("feeds") or {}).get(srcs[self.news_src_i][0]) or {}
         return [it for it in (feed.get("items") or []) if it.get("t")][:30]
 
     def _news_src_cycle(self, d):
         """←/→ 切换新闻源 (原 9 键); 换源清光标/滚动/详情."""
-        self.news_src_i = (self.news_src_i + d) % len(NEWS_SOURCES)
+        srcs = self.news_srcs()
+        if not srcs:
+            return
+        self.news_src_i = (self.news_src_i + d) % len(srcs)
         self.news_sel = 0
         self.news_scroll = 0
         self.news_detail = None
+
+    def _ns_move(self, d):
+        """设置视图光标 (7 行窗口滚动)."""
+        n = len(self.news_feeds)
+        if not n:
+            return
+        self.ns_sel = max(0, min(n - 1, self.ns_sel + d))
+        if self.ns_sel < self.ns_scroll:
+            self.ns_scroll = self.ns_sel
+        elif self.ns_sel >= self.ns_scroll + 7:
+            self.ns_scroll = self.ns_sel - 6
+
+    def _news_feeds_osd(self, msg):
+        """源表变更反馈: 登录态标 已上云 (未登录本地落盘, 开机补推)."""
+        self.osd = (msg + (" · 已上云" if self.cfg.get("cloud_tok") else ""),
+                    time.monotonic() + 2)
+
+    def news_feed_toggle(self):
+        """设置视图 Enter: 显/隐切换 (内置+自定义同权; 云同步跟随源表)."""
+        if not (0 <= self.ns_sel < len(self.news_feeds)):
+            return
+        f = self.news_feeds[self.ns_sel]
+        f["on"] = not f.get("on", True)
+        self.news_src_i = self.news_sel = self.news_scroll = 0
+        self.news_detail = None
+        self.news_feeds_save()
+        self._news_feeds_osd("%s %s" % (f.get("name") or "",
+                                        "已显示" if f["on"] else "已隐藏"))
+
+    def news_feed_add_commit(self):
+        """加源输入 Enter: 无 scheme 补 https://, 名=域名,
+        id=c_+md5[:8] (同址幂等) — 重加已存在源 = 直接恢复显示."""
+        url = (self.buf or "").strip()
+        self.ns_input = False
+        self.buf = ""
+        if url and "://" not in url:
+            url = "https://" + url
+        host = ""
+        try:
+            host = urllib.parse.urlparse(url).hostname or ""
+        except ValueError:
+            host = ""
+        if not url.startswith(("http://", "https://")) or "." not in host:
+            self.osd = ("地址无效 需 http(s)://", time.monotonic() + 2.5)
+            return
+        fid = "c_" + hashlib.md5(url.encode()).hexdigest()[:8]
+        for f in self.news_feeds:
+            if f.get("id") == fid:
+                f["on"] = True
+                self.news_feeds_save()
+                self._news_feeds_osd("%s 已存在 已显示"
+                                     % (f.get("name") or host))
+                return
+        if len(self.news_feeds) >= NEWS_FEEDS_MAX:
+            self.osd = ("最多 %d 个源" % NEWS_FEEDS_MAX,
+                        time.monotonic() + 2.5)
+            return
+        name = host[4:] if host.startswith("www.") else host
+        self.news_feeds.append({"id": fid, "name": name[:20],
+                                "url": url[:200], "on": True})
+        self.ns_sel = len(self.news_feeds) - 1     # 光标落新源
+        self.ns_scroll = max(0, self.ns_sel - 6)
+        self.news_feeds_save()
+        self._news_feeds_osd("已加 %s" % name)
+
+    def news_feed_del(self, fid):
+        """确认框 Enter 后删自定义源 (内置源只可隐藏不可删)."""
+        f = next((x for x in self.news_feeds if x.get("id") == fid), None)
+        if not f or not str(f.get("id", "")).startswith("c_"):
+            return
+        self.news_feeds.remove(f)
+        self.ns_sel = min(self.ns_sel, max(0, len(self.news_feeds) - 1))
+        self.news_feeds_save()
+        self._news_feeds_osd("已删 %s" % (f.get("name") or fid))
 
     def move_news(self, d):
         n = len(self.news_items())
@@ -7638,7 +7831,8 @@ class App:
         acc = self.th("accent")
         track = self.th("track")
         BODY = 15
-        src_name = NEWS_SOURCES[self.news_src_i][1]
+        srcs = self.news_srcs()
+        src_name = srcs[self.news_src_i % len(srcs)][1] if srcs else ""
 
         items = self.news_items()
 
@@ -7672,10 +7866,60 @@ class App:
                                     [(W - 14, 145), (W - 6, 145), (W - 10, 150)])
             return
 
+        if self.news_set:
+            # ── 源设置视图 (S 进): 全源列表 显隐/增删, 云同步状态右上 ──
+            text(surf, "新闻源设置", 14, hi, (6, 2))
+            text(surf, "· %d 源" % len(self.news_feeds), 11, dim,
+                 (6 + textw("新闻源设置", 14) + 6, 4))
+            tok = self.cfg.get("cloud_tok")
+            text(surf, "云✓" if tok else "本地", 10, acc if tok else dim,
+                 (W - 6, 4), right=True)
+            y0, rh = 17, 18
+            for i in range(7):
+                idx = self.ns_scroll + i
+                if idx >= len(self.news_feeds):
+                    break
+                f = self.news_feeds[idx]
+                y = y0 + i * rh
+                sel = idx == self.ns_sel
+                on = f.get("on", True)
+                if sel:
+                    pygame.draw.rect(surf, track, (2, y, W - 4, rh - 1),
+                                     border_radius=3)
+                    pygame.draw.rect(surf, acc, (2, y, 2, rh - 1))
+                text(surf, str(idx - self.ns_scroll + 1), BODY,
+                     acc if sel else dim, (8, y + 1))
+                text(surf, clip_text(str(f.get("name") or f.get("id") or ""),
+                                     BODY, W - 96),
+                     BODY, hi if sel else (soft if on else dim), (26, y + 1))
+                if str(f.get("id", "")).startswith("c_"):
+                    text(surf, "自", 10, dim, (W - 22, y + 3), right=True)
+                text(surf, "显" if on else "隐", 10, acc if on else dim,
+                     (W - 6, y + 3), right=True)
+            text(surf, "↑↓ 选 · Enter 显/隐", 13, soft, (6, 151))
+            text(surf, "N 加源 · D 删 · Esc 退", 13, soft, (W - 6, 151),
+                 right=True)
+            if self.ns_input:
+                # 加源输入条 (行情页东财 KEY 同款底部浮层)
+                r = pygame.Rect(4, 116, W - 8, 27)
+                pygame.draw.rect(surf, self.th("track"), r, border_radius=5)
+                pygame.draw.rect(surf, acc, r, 2, border_radius=5)
+                ty = r.y + (27 - 13) // 2
+                text(surf, "加源", 11, acc, (r.x + 8, ty + 1))
+                lx = r.x + 8 + textw("加源", 11) + 8
+                shown = clip_text(self.buf, BODY, max(60, r.right - 96 - lx))
+                text(surf, shown, BODY, hi, (lx, ty))
+                if int(time.monotonic() * 2) % 2 == 0:
+                    cx2 = lx + textw(shown, BODY) + 1
+                    pygame.draw.rect(surf, acc, (cx2, ty + 2, 7, 13))
+                text(surf, "Enter 存 · Esc 退", 9, dim,
+                     (r.right - 8, ty + 3), right=True)
+            return
+
         # 列表头
         text(surf, "新闻", 14, hi, (6, 2))
-        text(surf, "· %s %d 条" % (src_name, len(items)), 11, dim,
-             (6 + textw("新闻", 14) + 6, 4))
+        text(surf, ("· %s %d 条" % (src_name, len(items))) if srcs
+             else "· 源已全部隐藏", 11, dim, (6 + textw("新闻", 14) + 6, 4))
 
         # 列表行: 均匀分布
         rows = 7
@@ -7698,10 +7942,13 @@ class App:
             if it.get("ts"):
                 text(surf, it["ts"], 10, dim, (W - 6, y + 2), right=True)
 
-        if not items:
+        if not srcs:
+            textc(surf, "S 进源设置 开启或添加源", BODY, dim, W // 2, 70)
+        elif not items:
             textc(surf, "新闻获取中" if self.net.mode != "offline"
                   else "离线 · 联网后同步", BODY, dim, W // 2, 70)
-        text(surf, "P 换页 · ↑↓ 选择 · 1-7 打开 · ←→ 源", BODY, soft, (6, 151))
+        text(surf, "P 换页 · 1-7 打开 · ←→ 源", BODY, soft, (6, 151))
+        text(surf, "S 设置", BODY, acc, (W - 6, 151), right=True)
 
     def draw_tool(self, surf):
         {"fx": self.draw_fx, "unit": self.draw_unit,
@@ -8357,6 +8604,12 @@ class App:
                   12, self.th("accent"), W // 2, H // 2 - 18)
         elif self.dialog[0] == "delwatch":
             textc(surf, "删除自选股 %s?" % (self.dialog[1] or ""),
+                  12, self.th("accent"), W // 2, H // 2 - 18)
+        elif self.dialog[0] == "delnfeed":
+            f = next((x for x in self.news_feeds
+                      if x.get("id") == self.dialog[1]), None)
+            textc(surf, "删除新闻源 %s?" % ((f or {}).get("name")
+                                           or self.dialog[1] or ""),
                   12, self.th("accent"), W // 2, H // 2 - 18)
         else:
             it = self.dialog[1] or {}

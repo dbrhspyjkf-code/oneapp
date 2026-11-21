@@ -166,7 +166,19 @@ def test_news_parse():
 <summary>内容摘要</summary></entry></feed>""".encode("utf-8")
     items = news_rss.parse_feed(atom)
     assert items[0]["t"] == "Atom 条目" and items[0]["u"] == "https://example.com/a"
-    print("news parse OK (rss+atom)")
+    # 动态源表: set_feeds 换生效表 (on=False 不抓), defaults=内置种子
+    d = news_rss.defaults()
+    assert len(d) == 7 and d[0]["id"] == "ai" and d[0]["on"] is True
+    news_rss.set_feeds([{"id": "c_x", "name": "例站", "url":
+                         "https://example.com/feed", "on": True},
+                        {"id": "ai", "name": "AI 新闻",
+                         "url": d[0]["url"], "on": False}])
+    assert "c_x" in news_rss._ACTIVE and "ai" not in news_rss._ACTIVE
+    news_rss.set_feeds([])                 # 空表 → 不抓任何源 (不炸)
+    assert news_rss._ACTIVE == {}
+    news_rss.set_feeds(d)                  # 还原内置表 (后续用例/在线链路用)
+    assert set(news_rss._ACTIVE) == set(news_rss.FEEDS)
+    print("news parse OK (rss+atom+动态源表)")
 
 
 def test_net_cache():
@@ -504,7 +516,7 @@ def test_render():
     app.key(pg.K_LEFT)
     assert app.news_src_i == 0                        # 循环回绕
     app.key(pg.K_LEFT)
-    assert app.news_src_i == len(dash.NEWS_SOURCES) - 1  # 向左回绕到末源
+    assert app.news_src_i == len(app.news_srcs()) - 1  # 向左回绕到末源
     app.key(pg.K_RIGHT)
     assert app.news_src_i == 0
     app.news_detail = None
@@ -2299,6 +2311,7 @@ def test_kv_sync():
     """Oneapp 账户 kv 云同步: 开机拉取/变更即推/LWW (mtime 判新旧)/
     登录对齐确认框 (Enter 上传/Esc 云端覆盖)/模态吞键/队列顺序."""
     import dash
+    import news_rss
     pygame.init()
     pygame.display.set_mode((1, 1))
     canvas = pygame.Surface((dash.W, dash.H))
@@ -2307,21 +2320,25 @@ def test_kv_sync():
     fr = os.path.join(tmp, "radio_fav.json")
     fw = os.path.join(tmp, "watch.json")
     ftv = os.path.join(tmp, "tv_fav.json")
-    dash.KV_FILES.update({"radio_fav": fr, "watch": fw, "tv_fav": ftv})
+    fnf = os.path.join(tmp, "news_feeds.json")
+    dash.KV_FILES.update({"radio_fav": fr, "watch": fw, "tv_fav": ftv,
+                          "news_feeds": fnf})
     dash.RADIO_FAV_CACHE = fr
     dash.WATCH_FILE = fw
     dash.TV_FAV_CACHE = ftv
+    dash.NEWS_FEEDS_FILE = fnf
     dash.EM_KEY_FILE = os.path.join(tmp, "em_key.json")   # 隔离东财 key
     json.dump({"cloud_tok": "t" * 24, "cloud_user": "u"},
               open(dash.SETTINGS_FILE, "w"))
     orig_raw = netmod.http_raw
     now = _time.time()
     try:
-        # 开机: 已登录 → kvsync 两服务拉取入队
+        # 开机: 已登录 → kvsync 全服务拉取入队 (news_feeds 首次缺失 → 种子落盘)
         app = dash.App(FakeNet())
+        assert len(app.news_feeds) == 7 and json.load(open(fnf))
         tags = [t for t, _ in app.net.jobs if t.startswith("kvsync:")]
         assert tags == ["kvsync:radio_fav", "kvsync:watch",
-                        "kvsync:tv_fav"], tags
+                        "kvsync:tv_fav", "kvsync:news_feeds"], tags
         # LWW: 云端明显新 → 覆盖本地 (文件+内存)
         json.dump(["old1"], open(fr, "w"))
         os.utime(fr, (now - 100, now - 100))
@@ -2360,7 +2377,7 @@ def test_kv_sync():
         app.set_key(pygame.K_RETURN, "")
         assert app.kv_confirm is None
         assert app.net.last_job("kvput:radio_fav") is not None
-        assert app.kv_queue == ["watch", "tv_fav"]
+        assert app.kv_queue == ["watch", "tv_fav", "news_feeds"]
         # watch: Esc → 云端覆盖本地 (apply 不回推)
         json.dump({"items": [{"code": "sz000001", "name": "平安银行"}]},
                   open(fw, "w"))              # 本地有记录 → 该出确认框
@@ -2378,12 +2395,16 @@ def test_kv_sync():
         assert json.load(open(fw))["items"][0]["code"] == "sh600519"
         assert len([t for t, _ in app.net.jobs
                     if t.startswith("kvput:watch")]) == n_puts  # 不回推
-        assert app.kv_queue == ["tv_fav"]
+        assert app.kv_queue == ["tv_fav", "news_feeds"]
         # tv_fav: 云端没存过 (404) → 跳过走完
         netmod.http_raw = lambda url, **k: (404, json.dumps(
             {"err": "no such key"}).encode())
         d = app.net.last_job("kvalign:tv_fav")()
         app.on_net("data", "kvalign:tv_fav", d)
+        assert app.kv_queue == ["news_feeds"]
+        # news_feeds: 404 → 跳过 (本地种子在, 首推交给开机 kvsync)
+        d = app.net.last_job("kvalign:news_feeds")()
+        app.on_net("data", "kvalign:news_feeds", d)
         assert app.kv_queue == []          # 队列走完
         # 网络失败 (st=0): 不裁决不首推 (开机 WiFi 未就绪时, 旧码会把陈旧
         # 本地推上去盖掉云端别的端的新收藏); None 结果不落缓存 → 可重试
@@ -2467,6 +2488,24 @@ def test_kv_sync():
         assert dash.App._kv_nonempty(["x"]) is True
         assert dash.App._kv_nonempty({"items": []}) is False
         assert dash.App._kv_nonempty({"items": [{"code": "x"}]}) is True
+        assert dash.App._kv_nonempty([{"id": "ai"}]) is True   # 新闻源表 (dict 列表)
+        # news_feeds: kv_apply 云端覆盖 → 内存+文件+生效源表, 不回推;
+        # 云端空 → 内置种子兜底 (不允许零源, 清零事故同款哲学)
+        n_puts = len([t for t, _ in app.net.jobs if t.startswith("kvput:")])
+        app.kv_apply("news_feeds", [
+            {"id": "ai", "name": "AI 新闻", "url": "https://x/qbitai", "on": False},
+            {"id": "c_1234", "name": "例站", "url": "https://example.com/f",
+             "on": True}])
+        assert [f["id"] for f in app.news_feeds] == ["ai", "c_1234"]
+        assert app.news_feeds[0]["on"] is False
+        assert app.news_srcs() == [("c_1234", "例站")]   # 只剩可见源
+        assert news_rss._ACTIVE == {"c_1234": {"name": "例站",
+                                               "url": "https://example.com/f"}}
+        assert json.load(open(fnf))[1]["id"] == "c_1234"   # 文件已落
+        assert len([t for t, _ in app.net.jobs
+                    if t.startswith("kvput:")]) == n_puts   # apply 不回推
+        app.kv_apply("news_feeds", [])     # 云端空/清空 → 种子兜底
+        assert len(app.news_feeds) == 7 and app.news_srcs()[0][0] == "ai"
         # 进页兜底拉取 kv_pull: 登录态入队
         n_jobs = len(app.net.jobs)
         app.kv_pull("radio_fav")
@@ -2474,6 +2513,8 @@ def test_kv_sync():
         assert len(app.net.jobs) == n_jobs + 1
         app.kv_pull("watch")               # 行情页兜底拉取 (无东财也同步)
         assert app.net.jobs[-1][0] == "kvsync:watch"
+        app.kv_pull("news_feeds")          # 新闻页兜底拉取
+        assert app.net.jobs[-1][0] == "kvsync:news_feeds"
         assert app._fin_sync_tag() == "云✓"    # 登录 + 无东财 key
         # kv_apply 光标钳回: 收藏组开着时云端列表变短 → rsel/tv_sel 收缩
         import radio_stations
@@ -2507,6 +2548,130 @@ def test_kv_sync():
           "align-confirm/modal-swallow/enter-upload/esc-overwrite/"
           "no-push-on-apply/not-logged-in/netfail-no-push/404-first-push/"
           "page-pull/clamp)")
+
+
+def test_news_settings():
+    """新闻源设置视图 (S): 种子落盘/显隐切换(变更即推)/加源(补 scheme·
+    幂等重加·上限)/删自定义(dialog)/云端覆盖钳回/渲染冒烟."""
+    import dash
+    import news_rss
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    fnf = os.path.join(tmp, "news_feeds.json")
+    dash.NEWS_FEEDS_FILE = fnf
+    dash.KV_FILES.update({"news_feeds": fnf})
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    orig_raw = netmod.http_raw
+    try:
+        # 冷启动: 缺文件 → 内置 7 源种子落盘 + 抓取层生效表同步
+        app = dash.App(FakeNet())
+        assert len(app.news_feeds) == 7 and json.load(open(fnf))
+        assert [i for i, _n in app.news_srcs()] == \
+            [f["id"] for f in news_rss.defaults()]
+        assert "ai" in news_rss._ACTIVE
+        # S 进设置 (关详情) · 渲染冒烟 · Esc 退
+        app.page = 4
+        app.news_detail = None
+        app.key(pygame.K_s)
+        assert app.news_set and app.news_detail is None
+        app.draw(canvas)
+        app.key(pygame.K_ESCAPE)
+        assert not app.news_set
+        # ↑↓ 移光标 · Enter 显/隐: 文件+生效表+kv 推+OSD 已上云
+        app.key(pygame.K_s)
+        app.key(pygame.K_DOWN)
+        assert app.ns_sel == 1
+        n_puts = len([t for t, _ in app.net.jobs if t.startswith("kvput:")])
+        app.cfg["cloud_tok"] = "t" * 24            # 登录态
+        app.key(pygame.K_RETURN)                   # 隐藏 ithome
+        f1 = app.news_feeds[1]
+        assert f1["id"] == "ithome" and f1["on"] is False
+        assert len(app.news_srcs()) == 6 and \
+            "ithome" not in [i for i, _n in app.news_srcs()]
+        assert "ithome" not in news_rss._ACTIVE
+        assert json.load(open(fnf))[1]["on"] is False
+        assert app.net.last_job("kvput:news_feeds") is not None
+        assert len([t for t, _ in app.net.jobs
+                    if t.startswith("kvput:")]) == n_puts + 1
+        assert "已隐藏" in app.osd[0] and "已上云" in app.osd[0]
+        app.key(pygame.K_RETURN)                   # 再按恢复显示
+        assert f1["on"] is True and len(app.news_srcs()) == 7
+        # 全隐藏 → 新闻列表/主页跑马灯空态 (渲染冒烟), 再恢复
+        for f in app.news_feeds:
+            f["on"] = False
+        app.news_set = False
+        assert app.news_items() == [] and app._news_items() == []
+        app.draw(canvas)                           # 列表态: 源已全部隐藏
+        for f in app.news_feeds:
+            f["on"] = True
+        # 加源: N → 输入态 → buf + Enter; 无 scheme 补 https://, 名=域名
+        app.key(pygame.K_s)
+        app.key(pygame.K_n)
+        assert app.ns_input and app.buf == ""
+        app.draw(canvas)                           # 输入条渲染冒烟
+        app.buf = "ithome.com/rss/"
+        app.key(pygame.K_RETURN)
+        assert not app.ns_input
+        assert app.news_feeds[-1]["url"] == "https://ithome.com/rss/"
+        assert app.news_feeds[-1]["name"] == "ithome.com"
+        assert app.news_feeds[-1]["id"].startswith("c_")
+        assert app.ns_sel == len(app.news_feeds) - 1
+        assert app.ns_scroll == max(0, app.ns_sel - 6)   # 窗口跟随
+        # 重加同址 = 幂等恢复显示 (不新增行)
+        app.news_feeds[-1]["on"] = False
+        app.key(pygame.K_n)
+        app.buf = "https://ithome.com/rss/"
+        app.key(pygame.K_RETURN)
+        assert len(app.news_feeds) == 8 and app.news_feeds[-1]["on"] is True
+        # 无效地址 → 拒绝 + OSD
+        app.key(pygame.K_n)
+        app.buf = "not a url"
+        app.key(pygame.K_RETURN)
+        assert len(app.news_feeds) == 8 and "地址无效" in app.osd[0]
+        # 上限: 临时调小再恢复
+        real_max = dash.NEWS_FEEDS_MAX
+        dash.NEWS_FEEDS_MAX = 9
+        app.key(pygame.K_n)
+        app.buf = "a.example.com/f"
+        app.key(pygame.K_RETURN)                   # 第 9 个, 收下
+        app.key(pygame.K_n)
+        app.buf = "b.example.com/f"
+        app.key(pygame.K_RETURN)                   # 第 10 个, 拒
+        dash.NEWS_FEEDS_MAX = real_max
+        assert len(app.news_feeds) == 9 and "最多" in app.osd[0]
+        # 删自定义: D → dialog → Enter 真删; 内置源 D 无效果
+        app.ns_sel = len(app.news_feeds) - 1
+        app.key(pygame.K_d)
+        assert app.dialog and app.dialog[0] == "delnfeed"
+        app.draw(canvas)                           # 确认框渲染冒烟
+        app.key(pygame.K_RETURN)
+        assert len(app.news_feeds) == 8 and app.dialog is None
+        app.ns_sel = 0                             # 内置 ai → D 无 dialog
+        app.key(pygame.K_d)
+        assert app.dialog is None and len(app.news_feeds) == 8
+        # 云端覆盖 (kv_apply) → 光标/滚动钳回 + 生效表对齐
+        app.ns_sel = app.ns_scroll = 5
+        app.kv_apply("news_feeds", news_rss.defaults())
+        assert len(app.news_feeds) == 7
+        assert app.ns_sel == 0 and app.ns_scroll == 0
+        assert set(i for i, _n in app.news_srcs()) == set(news_rss.FEEDS)
+        app.draw(canvas)
+        app.key(pygame.K_ESCAPE)
+        assert not app.news_set
+        # 底栏提示分左右两段, 合计不溢出屏宽
+        lw = dash.textw("P 换页 · 1-7 打开 · ←→ 源", 15)
+        rw = dash.textw("S 设置", 15)
+        assert lw + rw <= dash.W - 12, (lw, rw)
+        lw = dash.textw("↑↓ 选 · Enter 显/隐", 13)
+        rw = dash.textw("N 加源 · D 删 · Esc 退", 13)
+        assert lw + rw <= dash.W - 12, (lw, rw)
+    finally:
+        netmod.http_raw = orig_raw
+    print("news_settings OK (seed/s-toggle/push/add-normalize/"
+          "add-idempotent/add-invalid/add-max/del-custom/del-builtin-guard/"
+          "apply-clamp/render)")
 
 
 def test_mail_keys():
@@ -3580,6 +3745,7 @@ if __name__ == "__main__":
     test_settings_app()
     test_cloud()
     test_kv_sync()
+    test_news_settings()
     test_sched()
     test_reg()
     test_login()

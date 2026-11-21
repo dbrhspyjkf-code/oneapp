@@ -14,7 +14,7 @@ M5Stack CardputerZero (320×170) 的 pygame 工具箱 app。**零本地服务依
 | 想法 | 键盘速记 (拼音 IME 本地词表), 本地存储 | — |
 | 电台 | 20 台内置直连流 (中/英), 12 条频谱 VU, 输出 O 键循环 (本机 / 局域网 AirPlay 音箱) | qingting.fm / cnr.cn / BBC / NPR… |
 | 行情 | 自选股+指数+贵金属, 分时/250日K | 腾讯 qt.gtimg.cn |
-| 新闻 | 7 个中文 RSS 源 | IT之家 / 少数派 / Solidot… |
+| 新闻 | 中文 RSS 源 (`S` 源设置: 显/隐 · 加/删自定义源, kv 云同步) | IT之家 / 少数派 / Solidot / 自定义 RSS… |
 | 工具 | 汇率 / 单位换算 / 万年历 / 彩票(双色球/大乐透) / 计时器 / 音乐 / 电视 / 日程 / 设置 | open.er-api.com / 中彩官网 / 500 彩票网 / QQ·网易直连 / 公共直播源 |
 
 音乐 app: 本地曲库 (mp3/flac/wav) + QQ 音乐 / 网易云**直连协议**
@@ -52,12 +52,14 @@ RUN_NET=1 python3 -c "import test_dash; test_dash.test_net_live()"  # 在线链�
 ```
 
 键位: `1-5` 切页 · `Z/C/F/X`(丝印←→↑↓) 翻页 · `t` 换主题(主页) ·
-`Fn+S/D` 音量± · 主页长按 `Esc` 1s 退出。
+`Fn+S/D` 音量± · 新闻页 `S` 源设置 · 主页长按 `Esc` 1s 退出。
 
 ## 数据状态
 
-- 想法/自选股/主题/音乐会话: `~/.local/share/oneapp/`
+- 想法/自选股/主题/音乐会话/新闻源表 (`news_feeds.json`): `~/.local/share/oneapp/`
 - 音乐凭据 (QQ musickey / 网易 MUSIC_U): 同目录, 0600 权限
+- Oneapp 账户 kv 云同步 (noteserver `/v1/kv`, 按账号): 电台收藏 / 自选股 /
+  电视收藏 / **新闻源表** (显隐+自定义源, 本地变更即推 · 开机/进页 LWW 拉取)
 
 ## License
 

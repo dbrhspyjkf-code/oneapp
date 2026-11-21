@@ -4,6 +4,8 @@
 从家庭后端 _rss_news.py 移植为纯 stdlib (urllib + xml.etree):
 RSS2.0 / Atom 双格式, 命名空间无关, 剥 HTML 标签; 单源失败不影响整体.
 源清单 = 大陆直连实测 7/7 全通 (2026-11-14, zero-news 同款 UA 无封锁).
+FEEDS = 内置种子; dash 新闻源设置 (news_feeds.json, kv 云同步) 经 set_feeds()
+动态换生效源表 (on=False 不抓, 自定义源即加即用).
 输出形状与原端点一致: {"ok", "fetched", "feeds": {fid: {ok, name, items}}}.
 
 IPv4 优先: 家宽 IPv6 半残时部分站 AAAA 会拖到超时 (hermes/zero-news 同款处理).
@@ -41,6 +43,26 @@ FEEDS = {
     "leiphone": {"name": "雷峰网",    "url": "https://www.leiphone.com/feed"},
     "wscn":     {"name": "华尔街见闻", "url": "https://dedicated.wallstreetcn.com/rss.xml"},
 }
+
+_ACTIVE = dict(FEEDS)                          # 当前生效源表 (dash set_feeds 动态换)
+
+
+def set_feeds(feeds):
+    """dash 新闻源设置入口: [{id,name,url,on}] → 生效源表 (on=False 不抓).
+    模块级状态: Net.job 的 fn 无参, dash 侧每次变更后调本函数同步."""
+    _ACTIVE.clear()
+    for f in feeds or ():
+        if not isinstance(f, dict) or not f.get("url"):
+            continue
+        if f.get("on", True):
+            _ACTIVE[str(f.get("id") or f["url"])] = {
+                "name": str(f.get("name") or f["url"]), "url": f["url"]}
+
+
+def defaults():
+    """内置 7 源 → news_feeds.json 种子 (云端 404/清空时的回落态)."""
+    return [{"id": fid, "name": m["name"], "url": m["url"], "on": True}
+            for fid, m in FEEDS.items()]
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ONEAPP/1.0"
 _TIMEOUT = 12
@@ -133,9 +155,9 @@ def _fetch_one(fid, meta):
 
 
 def news_fetch_all():
-    """Net.job 入口 (worker 线程调用): 内部线程池并发 7 源."""
+    """Net.job 入口 (worker 线程调用): 内部线程池并发抓生效源 (set_feeds 表)."""
     with ThreadPoolExecutor(max_workers=8) as ex:
-        pairs = list(ex.map(lambda kv: _fetch_one(*kv), FEEDS.items()))
+        pairs = list(ex.map(lambda kv: _fetch_one(*kv), _ACTIVE.items()))
     return {"ok": True,
             "fetched": datetime.datetime.now().strftime("%m-%d %H:%M"),
             "feeds": dict(pairs)}
