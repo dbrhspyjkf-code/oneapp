@@ -237,6 +237,11 @@ def test_render():
     pygame.init()
     pygame.display.set_mode((1, 1))
     canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")   # 设备真档隔离:
+    fnf = os.path.join(tmp, "news_feeds.json")   # 新闻页断言依赖 ai 居首,
+    dash.NEWS_FEEDS_FILE = fnf                   # 真实源表 (用户改过显隐)
+    dash.KV_FILES.update({"news_feeds": fnf})    # 不能进断言
 
     app = dash.App(FakeNet())
     app.data = dash.demo_data()
