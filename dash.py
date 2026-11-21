@@ -568,6 +568,32 @@ def clip_text(s, size, maxw):
     return out
 
 
+_tail_cache = {}
+def tail_text(s, size, maxw):
+    """保留末段截断到 maxw (前缀 …): URL 输入框用 — 正在敲的是尾部,
+    头部截掉才知道输入对不对. 与 clip_text 同款缓存+二分, 不逐字符测宽."""
+    s0 = str(s)
+    key = (s0, size, maxw)
+    hit = _tail_cache.get(key)
+    if hit is not None:
+        return hit
+    if textw(s0, size) <= maxw:
+        out = s0
+    else:
+        lo, hi = 0, len(s0) - 1             # 最大 hi 使 "…"+s0[hi:] 放得下
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if textw("…" + s0[mid:], size) <= maxw:
+                lo = mid
+            else:
+                hi = mid - 1
+        out = "…" + s0[lo:]
+    if len(_tail_cache) > 2000:
+        _tail_cache.clear()
+    _tail_cache[key] = out
+    return out
+
+
 _wrap_cache = {}
 def _wrap_lines_impl(s_, size, maxw, n):
     """贪心折行: 每行二分找最长可放前缀 (输出与旧逐字符实现一致)."""
@@ -1487,7 +1513,9 @@ class App:
         self.news_set = False                 # 新闻源设置视图 (S 进, Esc 退)
         self.ns_sel = 0                       # 设置视图光标
         self.ns_scroll = 0
-        self.ns_input = False                 # 加源 URL 输入态 (N)
+        self.ns_input = 0                     # 加/改源输入相: 0关 1标题 2地址
+        self.ns_title = ""                    # 相1收下的标题 (相2期间暂存)
+        self.ns_edit_id = None                # 编辑中的源 id (None=新增)
         self.esc_t = None                      # Esc 按下时刻 (长按回主页)
         # 邮件 app (工具第 7 卡; IMAP 收 + SMTP 发, 协议层在 mail.py)
         self.mail = mailmod.load_accounts()    # {"accounts": [...], "last": ...}
@@ -2436,6 +2464,7 @@ class App:
                 # 云端空/404/换号清空 → 内置种子兜底 (不允许零源;
                 # 清零事故同款哲学: 空态不落地)
                 feeds = news_rss.defaults()
+            self._news_feeds_merge(feeds)        # 云端旧列表缺新内置源 → 补齐
             for f in feeds:
                 f["on"] = bool(f.get("on", True))
             self.news_feeds = feeds
@@ -2444,6 +2473,10 @@ class App:
             self.news_sel = self.news_scroll = 0
             self.news_detail = None
             self.ns_sel = self.ns_scroll = 0     # 设置视图开着也回到列表头
+            self.ns_input = 0                    # 输入中列表被云端换 → 收掉
+            self.ns_title = ""
+            self.ns_edit_id = None
+            self.buf = ""
             netmod.save_json_file(KV_FILES[k], feeds)   # 直写防回推
             return
         if k in ("radio_fav", "tv_fav"):
@@ -4625,14 +4658,50 @@ class App:
                     self.buf += ch
             return True
 
-        if self.page == 4 and self.ns_input:
-            # 新闻加源 URL 输入 (纯 EN 直输, URL 无中文; Enter=保存)
+        if self.page == 4 and self.ns_input == 1:
+            # 加/改源·标题输入 (默认拼音, / 切中英; Enter → 地址相)
+            if k == pygame.K_SLASH:
+                self.ime_mode = not self.ime_mode
+                self.ime_clear()
+                return True
+            if self.ime_mode:
+                if not self.ime_buf:
+                    if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self._ns_phase_url()
+                        return True
+                    if k == pygame.K_ESCAPE:
+                        self._ns_input_close()
+                        return True
+                act = self.ime_key(k, ch)
+                if act is None:
+                    return True
+                tag, val = act
+                if tag == "del":
+                    self.buf = self.buf[:-1]
+                elif tag == "submit":
+                    self.ime_clear()
+                    self._ns_phase_url()
+                else:
+                    self.buf = (self.buf + val)[:20]
+                return True
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                self.news_feed_add_commit()
+                self._ns_phase_url()
+            elif k == pygame.K_ESCAPE:
+                self._ns_input_close()
+            elif k == pygame.K_BACKSPACE:
+                self.buf = self.buf[:-1]
+            elif ch and 0x20 <= ord(ch) < 0x7F:
+                if len(self.buf) < 20:
+                    self.buf += ch
+            return True
+
+        if self.page == 4 and self.ns_input == 2:
+            # 加/改源·地址输入 (纯 EN 直输, '/' 在 URL 里是字符; Enter=提交)
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.news_feed_commit()
                 return True
             if k == pygame.K_ESCAPE:
-                self.ns_input = False
-                self.buf = ""
+                self._ns_input_close()
                 return True
             if k == pygame.K_BACKSPACE:
                 self.buf = self.buf[:-1]
@@ -4874,15 +4943,31 @@ class App:
             self.tool_grid_key(k)
         elif self.page == 4:
             if self.news_set:
-                # 源设置视图: S/Esc 退 · Enter 显/隐 · N 加源 · D 删自定义
+                # 源设置视图: S/Esc 退 · Enter 显/隐 · N 加 · E 改 · D 删自定义
                 if k in (pygame.K_s, pygame.K_ESCAPE):
                     self.news_set = False
                     self.buf = ""
                 elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     self.news_feed_toggle()
-                elif k == pygame.K_n:
-                    self.ns_input = True          # URL 输入 (EN 直输)
+                elif k == pygame.K_n:             # 加源: 标题 → 地址
+                    self.ns_input = 1
+                    self.ns_title = ""
+                    self.ns_edit_id = None
                     self.buf = ""
+                    self.ime_mode = True          # 标题默认中文
+                    self.ime_clear()
+                elif k == pygame.K_e:             # 改源 (仅自定义)
+                    f = self.news_feeds[self.ns_sel] \
+                        if 0 <= self.ns_sel < len(self.news_feeds) else None
+                    if f and str(f.get("id", "")).startswith("c_"):
+                        self.ns_input = 1
+                        self.ns_title = ""
+                        self.ns_edit_id = f["id"]
+                        self.buf = str(f.get("name") or "")
+                        self.ime_mode = False     # 改题常为微调, EN 起步
+                        self.ime_clear()
+                    elif f:
+                        self.osd = ("内置源不可编辑", time.monotonic() + 2)
                 elif k == pygame.K_d:
                     f = self.news_feeds[self.ns_sel] \
                         if 0 <= self.ns_sel < len(self.news_feeds) else None
@@ -7704,14 +7789,31 @@ class App:
     # ── 工具页: 万年历 / 汇率 ──
     # ── 新闻页 (car-dash 同源 /news/feeds, 13px) ──
     @staticmethod
-    def _news_feeds_load():
-        """源表 (news_feeds.json); 坏数据/空 → 内置 7 源种子落盘 (不允许零源)."""
+    def _news_feeds_merge(feeds):
+        """内置源补齐: 表里缺的内置 id → 追加种子 (版本升级新增内置源时,
+        老本地/云端列表自动拿到; 用户显隐态/自定义源不动)."""
+        have = {f.get("id") for f in feeds}
+        added = False
+        for d in news_rss.defaults():
+            if d["id"] not in have:
+                feeds.append(d)
+                added = True
+        return added
+
+    @classmethod
+    def _news_feeds_load(cls):
+        """源表 (news_feeds.json); 坏数据/空 → 内置种子; 缺内置 → 补齐落盘."""
         v = netmod.load_json_file(NEWS_FEEDS_FILE, None)
         if isinstance(v, list) and v and all(
                 isinstance(f, dict) and f.get("id") and f.get("url")
                 for f in v):
             for f in v:
                 f["on"] = bool(f.get("on", True))
+            if cls._news_feeds_merge(v):
+                try:
+                    netmod.save_json_file(NEWS_FEEDS_FILE, v)
+                except Exception:
+                    pass
             return v
         seed = news_rss.defaults()
         try:
@@ -7773,12 +7875,29 @@ class App:
         self._news_feeds_osd("%s %s" % (f.get("name") or "",
                                         "已显示" if f["on"] else "已隐藏"))
 
-    def news_feed_add_commit(self):
-        """加源输入 Enter: 无 scheme 补 https://, 名=域名,
-        id=c_+md5[:8] (同址幂等) — 重加已存在源 = 直接恢复显示."""
-        url = (self.buf or "").strip()
-        self.ns_input = False
+    def _ns_phase_url(self):
+        """标题相 → 地址相 (标题暂存, 地址纯 EN 直输)."""
+        self.ns_title = (self.buf or "").strip()
         self.buf = ""
+        self.ns_input = 2
+        self.ime_clear()
+
+    def _ns_input_close(self):
+        """收掉加/改源输入 (整链作废)."""
+        self.ns_input = 0
+        self.ns_title = ""
+        self.ns_edit_id = None
+        self.buf = ""
+        self.ime_clear()
+
+    def news_feed_commit(self):
+        """地址相 Enter: 新增 (标题+地址; id=c_+md5(url)[:8] 同址幂等,
+        重加=恢复显示) 或编辑落位 (id/on 不变, 可改标题+地址).
+        标题空 → 域名兜底; 地址无效/与他源重址 → OSD 拒绝."""
+        url = (self.buf or "").strip()
+        title = self.ns_title
+        edit_id = self.ns_edit_id
+        self._ns_input_close()
         if url and "://" not in url:
             url = "https://" + url
         host = ""
@@ -7789,21 +7908,37 @@ class App:
         if not url.startswith(("http://", "https://")) or "." not in host:
             self.osd = ("地址无效 需 http(s)://", time.monotonic() + 2.5)
             return
-        fid = "c_" + hashlib.md5(url.encode()).hexdigest()[:8]
-        for f in self.news_feeds:
-            if f.get("id") == fid:
-                f["on"] = True
-                self.news_feeds_save()
-                self._news_feeds_osd("%s 已存在 已显示"
-                                     % (f.get("name") or host))
+        url = url[:200]
+        old = next((x for x in self.news_feeds
+                    if x.get("id") == edit_id), None) if edit_id else None
+        if edit_id and not old:
+            return                          # 编辑目标已消失 (云端覆盖竞态)
+        fid = old["id"] if old else \
+            "c_" + hashlib.md5(url.encode()).hexdigest()[:8]
+        dup = next((x for x in self.news_feeds if x is not old and
+                    (x.get("id") == fid or x.get("url") == url)), None)
+        if old:
+            if dup:
+                self.osd = ("该地址已有源", time.monotonic() + 2.5)
                 return
+            old["url"] = url
+            old["name"] = (title or old.get("name") or host)[:20]
+            self.news_feeds_save()
+            self._news_feeds_osd("已改 %s" % old["name"])
+            return
+        if dup:
+            dup["on"] = True                # 重加同址 = 恢复显示
+            self.news_feeds_save()
+            self._news_feeds_osd("%s 已存在 已显示"
+                                 % (dup.get("name") or host))
+            return
         if len(self.news_feeds) >= NEWS_FEEDS_MAX:
             self.osd = ("最多 %d 个源" % NEWS_FEEDS_MAX,
                         time.monotonic() + 2.5)
             return
-        name = host[4:] if host.startswith("www.") else host
+        name = title or (host[4:] if host.startswith("www.") else host)
         self.news_feeds.append({"id": fid, "name": name[:20],
-                                "url": url[:200], "on": True})
+                                "url": url, "on": True})
         self.ns_sel = len(self.news_feeds) - 1     # 光标落新源
         self.ns_scroll = max(0, self.ns_sel - 6)
         self.news_feeds_save()
@@ -7904,23 +8039,37 @@ class App:
                 text(surf, "显" if on else "隐", 10, acc if on else dim,
                      (W - 6, y + 3), right=True)
             text(surf, "↑↓ 选 · Enter 显/隐", 13, soft, (6, 151))
-            text(surf, "N 加源 · D 删 · Esc 退", 13, soft, (W - 6, 151),
+            text(surf, "N加 · E改 · D删 · Esc 退", 13, soft, (W - 6, 151),
                  right=True)
             if self.ns_input:
-                # 加源输入条 (行情页东财 KEY 同款底部浮层)
+                # 加/改源输入条 (两相: 标题[拼音]→地址[EN]; 长文本保尾段
+                # 前缀 … — 正在敲的是尾部, 头截尾留才看得出对错)
                 r = pygame.Rect(4, 116, W - 8, 27)
                 pygame.draw.rect(surf, self.th("track"), r, border_radius=5)
                 pygame.draw.rect(surf, acc, r, 2, border_radius=5)
                 ty = r.y + (27 - 13) // 2
-                text(surf, "加源", 11, acc, (r.x + 8, ty + 1))
-                lx = r.x + 8 + textw("加源", 11) + 8
-                shown = clip_text(self.buf, BODY, max(60, r.right - 96 - lx))
+                lab = ("改" if self.ns_edit_id else "") + \
+                      ("标题" if self.ns_input == 1 else "地址")
+                text(surf, lab, 11, acc, (r.x + 8, ty + 1))
+                lx = r.x + 8 + textw(lab, 11) + 8
+                if self.ns_input == 1:
+                    tag = "拼" if self.ime_mode else "EN"
+                    text(surf, tag, 10, acc, (lx, ty + 1))
+                    lx += textw(tag, 10) + 6
+                    raw = self.buf + self.ime_buf
+                    hint = "Enter 下步 · / 中英 · Esc 退"
+                else:
+                    raw = self.buf
+                    hint = "Enter 存 · Esc 退"
+                vw = max(50, r.right - 8 - textw(hint, 9) - 8 - lx)
+                shown = tail_text(raw, BODY, vw)
                 text(surf, shown, BODY, hi, (lx, ty))
                 if int(time.monotonic() * 2) % 2 == 0:
                     cx2 = lx + textw(shown, BODY) + 1
                     pygame.draw.rect(surf, acc, (cx2, ty + 2, 7, 13))
-                text(surf, "Enter 存 · Esc 退", 9, dim,
-                     (r.right - 8, ty + 3), right=True)
+                text(surf, hint, 9, dim, (r.right - 8, ty + 3), right=True)
+                if self.ns_input == 1:
+                    self.ime_bar(surf, 146)
             return
 
         # 列表头
