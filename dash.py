@@ -2312,9 +2312,16 @@ class App:
         return (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
 
     def kv_push(self, k):
-        """本地文件变更后推云端 (登录态才推; 失败静默, 下次变更/开机补)."""
+        """本地文件变更后推云端 (登录态才推; 失败静默, 下次变更/开机补).
+        显式变更 = 归属落位: 残留 kv_owner(旧号/善后态) ≠ 当前号 → 落位
+        当前号 — 用户在哪个号上手改数据, 文件就归哪个号 (静默开机补推/
+        首推路径仍被归属闸拦, 不经本落位)."""
         if not self.cfg.get("cloud_tok"):
             return
+        if self.cfg.get("kv_owner") not in (None, "") \
+                and self.cfg["kv_owner"] != self.cfg.get("cloud_user"):
+            self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""
+            self.cfg_save()
         self.net.invalidate(("job", "kvput:" + k))
         self.net.job("kvput:" + k, lambda k=k: self._kv_put_fn(k), ttl=10)
 

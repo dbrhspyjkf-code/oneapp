@@ -2542,6 +2542,13 @@ def test_kv_sync():
         assert len(app2.net.jobs) == n2     # 静默跳过
         app2.radio_fav_save()
         assert app2.net.last_job("kvput:radio_fav") is None
+        # 显式变更 = 归属落位: kv_push 时残留旧号 owner → 落位当前号
+        # (开机静默补推/首推仍被归属闸拦, 见上残留保护段)
+        app.cfg["kv_owner"] = "alice"
+        app.cfg["cloud_user"] = "bob"
+        app.radio_fav_save()
+        assert app.cfg["kv_owner"] == "bob"
+        assert app.net.last_job("kvput:radio_fav") is not None
     finally:
         netmod.http_raw = orig_raw
     print("kv_sync OK (boot-pull/lww-apply/lww-push/change-push/"
