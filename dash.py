@@ -824,7 +824,6 @@ CARD_KEYS = ("sched", "hitokoto", "news", "fin")
 # 主页卡缓存标签: 进 app 秒显上次数据, 后台刷新后再覆盖 (用户要求免"获取中")
 HOME_CACHE_TAGS = ("wx", "news", "ipo", "quotes")
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")        # 自选股 (本地)
-EM_KEY_FILE = os.path.join(STATE_DIR, "em_key.json")      # 东财妙想 API-KEY
 # 自选股种子 (qt.gtimg.cn 代码; watch.json 存在则整体覆盖)
 WATCH_SEED = {"items": [
     {"code": "sh600519", "name": "贵州茅台"},
@@ -1420,7 +1419,6 @@ class App:
         # 行情页状态
         self.fin_view = 0                     # 0 自选 1 指数 2 商品
         self.fin_input = False                # 添加自选股输入态 (n 键)
-        self.fin_sync = False                 # 东财 API-KEY 设置态 (s 键)
         self._hk_at = 0.0                     # 每日一句跑马灯相位
         self._wk_at = 0.0                     # 主页自选股跑马灯相位
         self._tk_at = 0.0                     # 行情顶部跑马灯相位
@@ -1640,38 +1638,6 @@ class App:
                         os.path.join(CACHE_DIR, a + ".json"), b)
                 except Exception:
                     pass
-            if a == "emwatch" and isinstance(b, dict):
-                if b.get("ok"):
-                    got = {it.get("code") for it in b.get("items") or []}
-                    local_only = [it.get("code") for it in
-                                  self.watch.get("items", [])
-                                  if it.get("code") not in got]
-                    self.watch = {"items": b.get("items") or []}
-                    self.watch_save()
-                    self.fsel = self.fscroll = 0
-                    if local_only:             # 推送失败/离线时加的, 提醒
-                        self.osd = ("已同步 %d 只 · %s 等 %d 只未上云"
-                                    % (len(self.watch["items"]),
-                                       local_only[0], len(local_only)),
-                                    time.monotonic() + 4)
-                    else:
-                        self.osd = ("已同步 %d 只 (替换)"
-                                    % len(self.watch["items"]),
-                                    time.monotonic() + 2)
-                else:
-                    self.osd = ("同步失败 %s" % (b.get("err") or "")[:24],
-                                time.monotonic() + 2.5)
-            if a.startswith("empush:") and isinstance(b, dict):
-                op, ecode = a[7:].split(":", 1)
-                if b.get("ok"):
-                    self.osd = ("云端已%s %s"
-                                % ("加" if op == "add" else "删", ecode),
-                                time.monotonic() + 1.5)
-                else:
-                    self.osd = ("云端%s失败 %s (%s)"
-                                % ("加" if op == "add" else "删", ecode,
-                                   (b.get("err") or "")[:12]),
-                                time.monotonic() + 3)
             if a == "wxloc" and isinstance(b, dict) and b.get("lat") is not None:
                 old = self.wx_loc or {}
                 if b.get("city") != old.get("city") \
@@ -2001,8 +1967,7 @@ class App:
             if self.page == 3:
                 self.net.job("ipo", fetchers.ipo_fetch, 1800)   # 顶部跑马灯
                 self.kv_pull("watch")         # 自选股云端拉取 (跨端变更/开机
-                                              #   拉取失败的兜底, TTL 节流;
-                                              #   无东财账户的用户也走 Oneapp 云)
+                                              #   拉取失败的兜底, TTL 节流)
                 self.net.pub_text(QT_BASE + ",".join(
                     c for c in self._qt_codes()), "quotes", 12)
                 self.net.pub_text(QT_BASE + ",".join(c for _, c in IDX_LIST),
@@ -2079,21 +2044,8 @@ class App:
         return [qt_code(it["code"]) for it in self.watch.get("items", [])
                 if it.get("code")][:16]
 
-    def _em_key(self):
-        return str(netmod.load_json_file(EM_KEY_FILE, {}).get("key") or "")
-
-    def _em_push(self, code, add):
-        """开同步 (已存 API-KEY) 才推: 单只增/删镜像到东财云端账户,
-        结果 on_net "empush:…" 落 OSD. 每操作唯一 tag (job 同 tag 会撞缓存)."""
-        key = self._em_key()
-        if not key:
-            return
-        tag = "empush:%s:%s" % ("add" if add else "del", code)
-        self.net.job(tag, lambda k=key, c=code, a=add:
-                     fetchers.em_watch_manage(k, c, a), 0)
-
     def fin_add_commit(self):
-        """输入框 Enter: 规范化代码 → 去重 → 落 watch.json (开同步推云端)."""
+        """输入框 Enter: 规范化代码 → 去重 → 落 watch.json (登录即上云)."""
         code = norm_stock_code(self.buf)
         self.buf = ""
         if not code:
@@ -2107,26 +2059,9 @@ class App:
         self.osd = ("已添加 " + code
                     + (" · 已上云" if self.cfg.get("cloud_tok") else ""),
                     time.monotonic() + 1.5)
-        self._em_push(code, True)          # 开同步 → 云端账户同步加
-
-    def fin_sync_commit(self):
-        """KEY 输入框 Enter: 保存 → 异步同步东财自选股 (结果 on_net 落表)."""
-        key = self.buf.strip()
-        self.buf = ""
-        self.fin_sync = False
-        if not key:
-            self.osd = ("东财 API-KEY 为空", time.monotonic() + 1.5)
-            return
-        try:
-            netmod.save_json_file(EM_KEY_FILE, {"key": key})
-        except Exception:
-            pass
-        self.osd = ("同步中…", time.monotonic() + 6)
-        self.net.job("emwatch", lambda k=key: fetchers.em_watchlist_fetch(k),
-                     0)
 
     def watch_del(self, code):
-        """删除自选股 (dialog 确认后调, 按 code) → 落 watch.json (开同步推云端)."""
+        """删除自选股 (dialog 确认后调, 按 code) → 落 watch.json (登录即上云)."""
         items = self.watch.get("items", [])
         n0 = len(items)
         self.watch["items"] = [x for x in items if x.get("code") != code]
@@ -2137,7 +2072,6 @@ class App:
             self.osd = ("已删除 " + (code or "")
                         + (" · 已上云" if self.cfg.get("cloud_tok") else ""),
                         time.monotonic() + 1.2)
-            self._em_push(code, False)     # 开同步 → 云端账户同步删
 
     def open_detail(self, code, name, view="min"):
         self.fdetail = {"code": code, "name": name, "view": view, "zoom": 1.0}
@@ -4536,9 +4470,9 @@ class App:
 
     # ── 键 ──
     def _silk_input_active(self):
-        """输入态 (F/Z/X/C 保持字母, 丝印方向让位): 想法/行情添加/行情
-        KEY 设置/音乐搜索/邮件登录/邮件写信/云注册+登录表单."""
-        return (self.in_input or self.fin_input or self.fin_sync
+        """输入态 (F/Z/X/C 保持字母, 丝印方向让位): 想法/行情添加/音乐
+        搜索/邮件登录/邮件写信/云注册+登录表单."""
+        return (self.in_input or self.fin_input
                 or self.mu_input or self.ns_input
                 or (self.tool == "mail"
                     and self.mail_lv in ("login", "compose"))
@@ -4579,40 +4513,6 @@ class App:
                 self.dialog = None
             else:                             # 其余任意键 = 关闭对话框
                 self.dialog = None
-            return True
-
-        if self.page == 3 and self.fin_sync:
-            # 东财 API-KEY 输入 (默认英文; Enter=保存并同步)
-            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                self.fin_sync_commit()
-                return True
-            if k == pygame.K_ESCAPE:
-                self.fin_sync = False
-                self.buf = ""
-                self.ime_clear()
-                return True
-            if k == pygame.K_SLASH:
-                self.ime_mode = not self.ime_mode
-                self.ime_clear()
-                return True
-            if self.ime_mode:
-                act = self.ime_key(k, ch)
-                if act is None:
-                    return True
-                tag, val = act
-                if tag == "del":
-                    self.buf = self.buf[:-1]
-                elif tag == "submit":
-                    self.ime_clear()
-                    self.fin_sync_commit()
-                else:
-                    self.buf = (self.buf + val)[:64]
-                return True
-            if k == pygame.K_BACKSPACE:
-                self.buf = self.buf[:-1]
-            elif ch and 0x20 <= ord(ch) < 0x7F:
-                if len(self.buf) < 64:
-                    self.buf += ch
             return True
 
         if self.page == 3 and self.fin_input:
@@ -4831,8 +4731,7 @@ class App:
                     self.radio_grp_cycle(-1)   # ← 切分组 (↑ 仍移光标)
                 else:
                     self.move_rsel(-1)
-            elif self.page == 3 and not self.fdetail and not self.fin_input \
-                        and not self.fin_sync:
+            elif self.page == 3 and not self.fdetail and not self.fin_input:
                 self._move_fsel(-3 if k == pygame.K_UP else -1)
             elif self.page == 4:
                 if self.news_set:
@@ -4861,8 +4760,7 @@ class App:
                     self.radio_grp_cycle(1)    # → 切分组 (↓ 仍移光标)
                 else:
                     self.move_rsel(1)
-            elif self.page == 3 and not self.fdetail and not self.fin_input \
-                        and not self.fin_sync:
+            elif self.page == 3 and not self.fdetail and not self.fin_input:
                 self._move_fsel(3 if k == pygame.K_DOWN else 1)
             elif self.page == 4:
                 if self.news_set:
@@ -4889,8 +4787,8 @@ class App:
                 self.iview = "local"          # 云端列表 → 本地卡片 (逐层)
                 self.csel = 0
             elif self.page != 0:
-                if self.fin_input or self.fin_sync:   # 输入态: Esc 先退输入
-                    self.fin_input = self.fin_sync = False
+                if self.fin_input:                    # 输入态: Esc 先退输入
+                    self.fin_input = False
                     self.buf = ""
                     self.ime_clear()
                     return True
@@ -5020,16 +4918,8 @@ class App:
                 if k == pygame.K_n and self.fin_view == 0:   # 添加自选股
                     self.ime_clear()
                     self.fin_input = True
-                    self.fin_sync = False
                     self.buf = ""
                     self.cv_armed = False
-                elif k == pygame.K_s and self.fin_view == 0:  # 东财同步设置
-                    self.ime_clear()
-                    self.fin_sync = True
-                    self.fin_input = False
-                    self.ime_mode = False     # API-KEY 英文直输
-                    self.buf = netmod.load_json_file(EM_KEY_FILE, {})\
-                        .get("key", "")
                 elif (k == pygame.K_d) \
                         and self.fin_view == 0 and self.fin_items():
                     items = self.fin_items()
@@ -7568,7 +7458,7 @@ class App:
                  (6 + textw("行情", 14) + 6, 4))
             stag = self._fin_sync_tag()
             text(surf, stag, 10, acc if "云✓" in stag else dim,
-                 (W - 6, 4), right=True)   # 同步状态: 云✓ (东财✓) / 本地
+                 (W - 6, 4), right=True)   # 同步状态: 云✓ / 本地
             self._draw_fin_ticker(surf)   # 顶部标题: 自选股行情+新股 跑马灯
 
         if self.fdetail:
@@ -7617,24 +7507,8 @@ class App:
         text(surf, "ENTER 日线", 13, soft, (6 + textw("4 切换行情", 13)
                                             + textw("我我", 13), y))
         if view == 0:
-            text(surf, "n 添加 · d 删 · s 同步", 13, soft, (W - 6, y),
+            text(surf, "n 添加 · d 删", 13, soft, (W - 6, y),
                  right=True)
-
-        # 东财 API-KEY 设置框 (同步自选股)
-        if self.fin_sync:
-            r = pygame.Rect(M, 116, W - 2 * M, 27)
-            pygame.draw.rect(surf, self.th("track"), r, border_radius=5)
-            pygame.draw.rect(surf, acc, r, 2, border_radius=5)
-            ty = r.y + (27 - 13) // 2
-            text(surf, "东财API-KEY", 11, acc, (r.x + 8, ty + 1))
-            lx = r.x + 8 + textw("东财API-KEY", 11) + 8
-            shown = clip_text(self.buf, BODY, max(60, r.right - 8 - 130 - lx))
-            text(surf, shown, BODY, hi, (lx, ty))
-            if int(time.monotonic() * 2) % 2 == 0:
-                cx2 = r.x + 38 + textw(shown, BODY) + 1
-                pygame.draw.rect(surf, acc, (cx2, ty + 2, 7, 13))
-            text(surf, "Enter 存并同步 · Esc 退", 9, dim,
-                 (r.right - 8, ty + 3), right=True)
 
         # 添加自选股输入框 (第 2 排卡片之上浮层)
         if self.fin_input:
@@ -7656,14 +7530,8 @@ class App:
                 pass
 
     def _fin_sync_tag(self):
-        """行情页右上同步状态: Oneapp 云 (登录即有, 与东财无关) + 东财
-        (可选镜像); 未登录显示 本地."""
-        t = []
-        if self.cfg.get("cloud_tok"):
-            t.append("云✓")
-        if self._em_key():
-            t.append("东财✓")
-        return " ".join(t) or "本地"
+        """行情页右上同步状态: Oneapp 云 (登录即有); 未登录显示 本地."""
+        return "云✓" if self.cfg.get("cloud_tok") else "本地"
 
     def _draw_fin_ticker(self, surf):
         """顶部标题跑马灯: 仅新股申购信息 (个股行情在卡片列表里, 不重复)."""

@@ -378,75 +378,13 @@ def test_render():
     app.key(pygame.K_RETURN)
     assert [i["code"] for i in app.watch["items"]] == ["sh600519"]
     app.draw(canvas)                              # 顶部跑马灯渲染
-    # 东财妙想自选股同步: 响应解析 (纯函数) + s 设置流 + job 投递
-    import fetchers
-    sample = {"code": 0, "message": "ok", "data": {"allResults": [
-        {"result": {"dataList": [
-            {"SECURITY_CODE": "600519", "SECURITY_SHORT_NAME": "贵州茅台",
-             "MARKET_SHORT_NAME": "SH"},
-            {"SECURITY_CODE": "000001", "SECURITY_SHORT_NAME": "平安银行",
-             "MARKET_SHORT_NAME": "SZ"},
-            {"SECURITY_CODE": "hk00700", "SECURITY_SHORT_NAME": "腾讯",
-             "MARKET_SHORT_NAME": "HK"}]}}]}}
-    pr = fetchers.em_watchlist_parse(sample)
-    assert pr["ok"] and [i["code"] for i in pr["items"]] == \
-        ["sh600519", "sz000001"], pr
-    assert pr["items"][0]["name"] == "贵州茅台"
-    assert not fetchers.em_watchlist_parse({"code": -1})["ok"]
-    dash.EM_KEY_FILE = os.path.join(tmp, "em_key.json")
-    app.key(pygame.K_s)
-    assert app.fin_sync and app.ime_mode is False
-    for chr_ in "testkey123":
-        app.key(0, chr_)
-    app.key(pygame.K_RETURN)
-    assert not app.fin_sync
-    import json as _jj
-    assert _jj.load(open(dash.EM_KEY_FILE))["key"] == "testkey123"
-    assert ("job", "emwatch") in app.net.got, app.net.got[-3:]
-    app.on_net("data", "emwatch", pr)
-    assert [i["code"] for i in app.watch["items"]] == \
-        ["sh600519", "sz000001"]                     # 替换 + 港股剔除
-    app.draw(canvas)                                 # 同步框渲染
-    # 开同步后本地增删 → 云端 manage 推送 (唯一 tag job) + 结果 OSD
-    assert fetchers.em_manage_parse({"code": 0, "status": 0,
-                                     "data": "已为您将1个标的(贵州茅台)添加自选"})["ok"]
-    assert not fetchers.em_manage_parse({"code": -1, "message": "x"})["ok"]
-    assert not fetchers.em_watch_manage("", "sh600519")["ok"]   # 无 KEY 不推
+    # n 添加 → 本地落盘 + 上云 OSD (云同步走 kv; 东财镜像同步已删)
     app.buf = "601318"                               # 新代码 (不撞去重门)
     app.fin_input = False
     app.fin_add_commit()
     assert [i["code"] for i in app.watch["items"]] == \
-        ["sh600519", "sz000001", "sh601318"], app.watch["items"]  # 本地已加
-    assert ("job", "empush:add:sh601318") in app.net.got, app.net.got[-3:]
-    app.on_net("data", "empush:add:sh601318", {"ok": True})
-    assert "云端已加" in app.osd[0], app.osd
-    # d 删当前行 → dialog (显示序=涨跌幅序: 平安+0.61 > 茅台-0.53 > 无行情,
-    # 光标显式指到茅台那行, 不受排序影响)
-    app.fsel = [i["code"] for i in app.fin_items()].index("sh600519")
-    app.key(pygame.K_d)
-    assert app.dialog and app.dialog[0] == "delwatch"
-    app.key(pygame.K_RETURN)                         # Enter 确认
-    assert [i["code"] for i in app.watch["items"]] == \
-        ["sz000001", "sh601318"], app.watch["items"]
-    assert ("job", "empush:del:sh600519") in app.net.got
-    app.on_net("data", "empush:del:sh600519", {"ok": False, "err": "boom"})
-    assert "云端删失败" in app.osd[0], app.osd
-    # 本地独有 (推送失败遗留) → 拉取替换时提示未上云
-    app.watch["items"].append({"code": "bj430047", "name": ""})
-    pr2 = fetchers.em_watchlist_parse(sample)   # 新鲜副本 (on_net 不拷贝)
-    app.on_net("data", "emwatch", pr2)
-    assert "未上云" in app.osd[0], app.osd
-    assert [i["code"] for i in app.watch["items"]] == \
-        ["sh600519", "sz000001"]                     # 云为拉取真源
-    # 未开同步 (无 KEY) → 本地增删不投推送 job
-    dash.EM_KEY_FILE = os.path.join(tmp, "absent_key.json")
-    app3 = dash.App(FakeNet())
-    app3.buf = "000651"                              # 盘上没有的代码
-    app3.fin_add_commit()
-    assert not [t for t, _ in app3.net.jobs if t.startswith("empush")]
-    assert [i["code"] for i in app3.watch["items"]][-1] == "sz000651"
-    app3.watch_del("sz000651")
-    assert not [t for t, _ in app3.net.jobs if t.startswith("empush")]
+        ["sh600519", "sh601318"], app.watch["items"]
+    app.draw(canvas)                                 # 行情页渲染 (无 KEY 框)
     # 每日一句: 内置 CSV 本地轮换 (与 hermes 同算法, 车机/ONEAPP 同句)
     ds = dash.daily_sentence()
     assert ds["ok"] and ds["text"] and ds["from"], ds
@@ -2336,7 +2274,6 @@ def test_kv_sync():
     dash.WATCH_FILE = fw
     dash.TV_FAV_CACHE = ftv
     dash.NEWS_FEEDS_FILE = fnf
-    dash.EM_KEY_FILE = os.path.join(tmp, "em_key.json")   # 隔离东财 key
     json.dump({"cloud_tok": "t" * 24, "cloud_user": "u"},
               open(dash.SETTINGS_FILE, "w"))
     orig_raw = netmod.http_raw
@@ -2523,11 +2460,11 @@ def test_kv_sync():
         app.kv_pull("radio_fav")
         assert app.net.jobs[-1][0] == "kvsync:radio_fav"
         assert len(app.net.jobs) == n_jobs + 1
-        app.kv_pull("watch")               # 行情页兜底拉取 (无东财也同步)
+        app.kv_pull("watch")               # 行情页兜底拉取 (登录即云同步)
         assert app.net.jobs[-1][0] == "kvsync:watch"
         app.kv_pull("news_feeds")          # 新闻页兜底拉取
         assert app.net.jobs[-1][0] == "kvsync:news_feeds"
-        assert app._fin_sync_tag() == "云✓"    # 登录 + 无东财 key
+        assert app._fin_sync_tag() == "云✓"    # 登录即云
         # kv_apply 光标钳回: 收藏组开着时云端列表变短 → rsel/tv_sel 收缩
         import radio_stations
         import tv_channels

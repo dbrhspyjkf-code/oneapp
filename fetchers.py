@@ -15,7 +15,6 @@
 import json
 import os
 import re
-import time
 import urllib.request
 from datetime import datetime
 
@@ -155,109 +154,6 @@ def wx_locate():
         pass
     snap = _snap_read("wx_loc.json")           # 断网: 沿用上次归属地
     return snap
-
-
-# ── 东方财富妙想 Skills 自选股同步 (MX_APIKEY) ─────────────────────────────
-_EM_SEL_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/self-select/get"
-
-
-def em_watchlist_parse(j):
-    """妙想 mx_selfselect 响应 → {"ok", "items":[{code,name}], "err"?}
-    (纯函数便于离线测试). code 统一补 sh/sz/bj 前缀."""
-    try:
-        if str(j.get("code")) not in ("0", "200") \
-                and j.get("status") not in (0, "0", "success", 200):
-            return {"ok": False,
-                    "err": str(j.get("message") or j.get("status"))[:30]}
-    except Exception:
-        return {"ok": False, "err": "bad resp"}
-    items = []
-    allr = (j.get("data") or {}).get("allResults") or {}
-    blocks = allr if isinstance(allr, list) else [allr]   # dict/list 双形态
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        res = block.get("result") or {}
-        for row in res.get("dataList") or []:
-            code = str(row.get("SECURITY_CODE") or "").strip().lower()
-            if not code:
-                continue
-            if code[:2] not in ("sh", "sz", "bj"):
-                mkt = str(row.get("MARKET_SHORT_NAME") or "").strip().lower()
-                if mkt in ("sh", "sz", "bj"):
-                    code = mkt + code
-                elif code[:1].isdigit():
-                    code = ("sh" if code[0] in "569"
-                            else ("bj" if code[0] in "48" else "sz")) + code
-                else:
-                    continue                     # 港美股等跳过
-            items.append({"code": code,
-                          "name": str(row.get("SECURITY_SHORT_NAME") or "")})
-    if not items:
-        return {"ok": False, "err": "empty · 去东财App确认"}
-    return {"ok": True, "items": items}
-
-
-def em_watchlist_fetch(apikey):
-    """拉取通行证账户自选股 (POST, apikey 放 header). → parse 结果.
-
-    接口异步: 首响可能只有 SELECT_STOCK 查询容器 (无 allResults, 实测),
-    间隔 1.2s 重试至多 3 次."""
-    if not apikey:
-        return {"ok": False, "err": "未配置 API-KEY"}
-    try:
-        for attempt in range(3):
-            req = urllib.request.Request(
-                _EM_SEL_URL, data=b"{}", method="POST",
-                headers={"apikey": apikey, "Content-Type": "application/json",
-                         "User-Agent": _UA})
-            with _OPENER_DIRECT.open(req, timeout=12) as r:
-                j = json.loads(r.read().decode("utf-8", "replace"))
-            if (j.get("data") or {}).get("allResults") is not None \
-                    or attempt == 2:
-                return em_watchlist_parse(j)
-            time.sleep(1.2)
-    except Exception as e:
-        return {"ok": False, "err": repr(e)[:40]}
-    return {"ok": False, "err": "no results"}
-
-
-_EM_MANAGE_URL = _EM_SEL_URL.replace("/get", "/manage")
-
-
-def em_manage_parse(j):
-    """妙想 manage 响应 → {"ok": bool, "msg"?/"err"?} (纯函数便于离线测试).
-    实测同步返回: status/code=0, data 是确认文案 ("…已为您将1个标的(贵州茅台)添加自选…")."""
-    try:
-        if str(j.get("code")) not in ("0", "200") \
-                and j.get("status") not in (0, "0", "success", 200):
-            return {"ok": False,
-                    "err": str(j.get("message") or j.get("status"))[:30]}
-    except Exception:
-        return {"ok": False, "err": "bad resp"}
-    return {"ok": True, "msg": str(j.get("data") or "")[:48]}
-
-
-def em_watch_manage(apikey, code, add=True):
-    """单只自选股增/删推送东财通行证账户 (自然语言 manage 接口, apikey
-    放 header; 裸 6 位代码实测可解析, 北交所云端自动归一 430xxx→920xxx).
-    同步 ~1.6s 返回 → em_manage_parse 结果."""
-    if not apikey:
-        return {"ok": False, "err": "未配置 API-KEY"}
-    bare = str(code or "")[-6:]
-    q = ("把%s添加到我的自选股列表" if add
-         else "把%s从我的自选股列表删除") % bare
-    try:
-        req = urllib.request.Request(
-            _EM_MANAGE_URL,
-            data=json.dumps({"query": q}).encode("utf-8"), method="POST",
-            headers={"apikey": apikey, "Content-Type": "application/json",
-                     "User-Agent": _UA})
-        with _OPENER_DIRECT.open(req, timeout=20) as r:
-            j = json.loads(r.read().decode("utf-8", "replace"))
-        return em_manage_parse(j)
-    except Exception as e:
-        return {"ok": False, "err": repr(e)[:40]}
 
 
 # ── 双色球 (中彩官网; 参考 hermes _ssq.py 同源移植) ─────────────────────────
