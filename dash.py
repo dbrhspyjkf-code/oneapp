@@ -1561,7 +1561,7 @@ class App:
         self.set_edit = None                   # None=常态 glm/ds=KEY 弹窗
         self.reg = None                        # 注册表单态 {name,invite,field}
         self.reg_busy = False                  # 注册提交中 (防重复)
-        self.login = None                      # 登录表单态 {tok}
+        self.login = None                      # 登录表单态 {user,pw,tok,field}
         self.login_busy = False                # 登录验证中 (防重复)
         self.qrlogin = None                    # 扫码登录态 {st,dc,url,mat,err}
         self.qr_poll_at = 0.0                  # 扫码轮询节流
@@ -5025,7 +5025,7 @@ class App:
                 self.qrlogin = None
                 self.qr_poll_at = 0.0
             return True
-        if self.login is not None:             # 登录表单态: TOKEN 单字段
+        if self.login is not None:             # 登录表单态: 用户名/密码/TOKEN
             return self._login_key(k, ch)
         if self.reg is not None:               # 注册表单态: 两字段 ASCII
             return self._reg_key(k, ch)
@@ -5096,7 +5096,7 @@ class App:
                                  ttl=10)
                     self.osd = ("出码中…", time.monotonic() + 5)
             elif rid == "login":               # 登录/更换账户 表单
-                self.login = {"tok": ""}
+                self.login = {"user": "", "pw": "", "tok": "", "field": 0}
             elif rid == "logout":              # 退出登录 (本地数据不动)
                 u = self.cfg.get("cloud_user") or ""
                 if self.cfg.get("cloud_tok"):
@@ -5111,19 +5111,27 @@ class App:
         return True
 
     def _login_key(self, k, ch):
-        """登录表单键流: 已有用户名+TOKEN 的用户 — 填 TOKEN → ping 验证."""
+        """登录表单键流: ↑↓ 换字段 (用户名/密码/TOKEN) / ASCII 直输
+        (用户名强制小写) / Enter 按 填了TOKEN→ping 或 用户名+密码→
+        /v1/auth/login 验证."""
         f = self.login
         if k == pygame.K_ESCAPE:
             self.login = None
             return True
+        if k in (pygame.K_UP, pygame.K_DOWN):
+            f["field"] = (f["field"] + 1) % 3
+            return True
         if k == pygame.K_BACKSPACE:
-            f["tok"] = f["tok"][:-1]
+            key = ("user", "pw", "tok")[f["field"]]
+            f[key] = f[key][:-1]
             return True
         if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
             if self.login_busy:
                 return True
-            if not f["tok"].strip():
-                self.osd = ("先填 TOKEN", time.monotonic() + 2)
+            if not (f["tok"].strip()
+                    or (f["user"].strip() and f["pw"])):
+                self.osd = ("先填 TOKEN 或 用户名+密码",
+                            time.monotonic() + 2)
                 return True
             self.login_busy = True
             self.net.invalidate(("job", "cloudlogin"))
@@ -5131,36 +5139,66 @@ class App:
             self.osd = ("登录中…", time.monotonic() + 5)
             return True
         if ch and 0x20 <= ord(ch) < 0x7F:
-            f["tok"] = (f["tok"] + ch)[:40]
+            key = ("user", "pw", "tok")[f["field"]]
+            cap = (16, 64, 48)[f["field"]]
+            if key == "user":
+                ch = ch.lower()                    # 用户名小写
+            f[key] = (f[key] + ch)[:cap]
         return True
 
     def _cloud_login_fn(self):
-        """worker: 现有 TOKEN ping 验证 → {ok, user, tok, url}."""
-        tok = (self.login or {}).get("tok", "").strip()
+        """worker: 填了 TOKEN → ping 验证; 否则用户名+密码 →
+        POST /v1/auth/login 换 30 天会话 token. 成功统一 →
+        {ok, user, tok, url, now} (now=换号 csync 重置水位)."""
+        f = self.login or {}
         url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
-        if not tok:
-            return {"ok": 0, "err": "先填 TOKEN", "st": 0}
-        st, body = netmod.http_raw(url + "/v1/ping", timeout=8,
-                                   headers={"Authorization": "Bearer " + tok})
+        tok = f.get("tok", "").strip()
+        if tok:
+            st, body = netmod.http_raw(url + "/v1/ping", timeout=8,
+                                       headers={"Authorization":
+                                                "Bearer " + tok})
+            try:
+                j = json.loads(body.decode("utf-8", "replace"))
+            except ValueError:
+                j = {}
+            if st == 200 and j.get("ok"):
+                return {"ok": 1, "user": j.get("user") or "?",
+                        "tok": tok, "url": url,
+                        "now": self._cloud_now(url, tok)}
+            return {"ok": 0, "st": st,
+                    "err": "TOKEN 无效" if st == 401 else
+                           ("HTTP %s" % st if st else "网络异常")}
+        body = json.dumps({"username": f.get("user", "").strip(),
+                           "password": f.get("pw", ""),
+                           "name": "zero"}).encode()
+        st, rbody = netmod.http_raw(url + "/v1/auth/login", method="POST",
+                                    body=body, timeout=8,
+                                    headers={"Content-Type":
+                                             "application/json"})
         try:
-            j = json.loads(body.decode("utf-8", "replace"))
+            j = json.loads(rbody.decode("utf-8", "replace"))
         except ValueError:
             j = {}
         if st == 200 and j.get("ok"):
-            now = None                      # 换号 → csync 重置到新号当前
-            st2, b2 = netmod.http_raw(url + "/v1/tombstones?since=0",
-                                      timeout=8,
-                                      headers={"Authorization": "Bearer " + tok})
-            if st2 == 200:
-                try:
-                    now = json.loads(b2.decode("utf-8", "replace")).get("now")
-                except ValueError:
-                    now = None
+            tok2 = j.get("token") or ""
             return {"ok": 1, "user": j.get("user") or "?",
-                    "tok": tok, "url": url, "now": now}
+                    "tok": tok2, "url": url,
+                    "now": self._cloud_now(url, tok2)}
         return {"ok": 0, "st": st,
-                "err": "TOKEN 无效" if st == 401 else
+                "err": j.get("err") or
                        ("HTTP %s" % st if st else "网络异常")}
+
+    def _cloud_now(self, url, tok):
+        """tombstones 水位 (换号 → csync 重置到新号当前), 失败不拦登录."""
+        st, b2 = netmod.http_raw(url + "/v1/tombstones?since=0",
+                                 timeout=8,
+                                 headers={"Authorization": "Bearer " + tok})
+        if st == 200:
+            try:
+                return json.loads(b2.decode("utf-8", "replace")).get("now")
+            except ValueError:
+                return None
+        return None
 
     def _reg_key(self, k, ch):
         """注册表单键流: ↑↓ 换字段 / ASCII 直输 (name/invite 强制小写) /
@@ -5446,26 +5484,33 @@ class App:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
                      self.th("danger"), (box.right - 12, box.y + 87),
                      right=True)
-        # ── 登录表单 (覆盖): 已有用户名+TOKEN 的用户 / 换账户 ──
+        # ── 登录表单 (覆盖): 用户名+密码 或 TOKEN / 换账户 ──
         if self.login is not None:
-            box = pygame.Rect(24, 52, W - 48, 76)
+            box = pygame.Rect(24, 44, W - 48, 112)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
             cur = self.cfg.get("cloud_user") or ""
             title = ("更换账户 (当前 @%s)" % cur) \
                 if self.cfg.get("cloud_tok") else "登录 Oneapp 账户"
             text(surf, title, 13, hi, (box.x + 12, box.y + 8))
-            text(surf, "TOKEN", 12, dim, (box.x + 12, box.y + 30))
-            shown = clip_text(self.login["tok"][-24:] + "_", 12, 170)
-            text(surf, shown, 12, hi, (box.x + 66, box.y + 30))
-            text(surf, "Enter 登录 · Esc 取消", 10, dim,
-                 (box.x + 12, box.y + 52))
+            for i, (lab2, key2) in enumerate((("用户名", "user"),
+                                              ("密码", "pw"),
+                                              ("TOKEN", "tok"))):
+                y2 = box.y + 30 + i * 18
+                cur2 = self.login["field"] == i
+                text(surf, lab2, 12, acc if cur2 else dim, (box.x + 12, y2))
+                val = self.login[key2]
+                shown = clip_text(val[-20:] + ("_" if cur2 else ""), 12, 146)
+                text(surf, shown, 12, hi if val else dim,
+                     (box.x + 74, y2))
+            text(surf, "↑↓ 换行 · Enter 登录 · Esc 取消", 10, dim,
+                 (box.x + 12, box.y + 86))
             if self.login_busy:
                 text(surf, "验证中…", 12, acc,
-                     (box.right - 12, box.y + 52), right=True)
+                     (box.right - 12, box.y + 86), right=True)
             elif self.osd and "失败" in self.osd[0]:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
-                     self.th("danger"), (box.right - 12, box.y + 53),
+                     self.th("danger"), (box.right - 12, box.y + 87),
                      right=True)
         # ── kv 云同步确认框 (覆盖): 本地 vs 云端 ──
         if self.kv_confirm is not None:
