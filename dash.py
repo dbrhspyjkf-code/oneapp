@@ -5221,8 +5221,8 @@ class App:
             if not f["name"] or not f["invite"]:
                 self.osd = ("用户名和邀请码都要填", time.monotonic() + 2)
                 return True
-            if f["password"] and not (6 <= len(f["password"]) <= 64):
-                self.osd = ("密码 6-64 位 (可留空)", time.monotonic() + 2)
+            if not (6 <= len(f["password"]) <= 64):
+                self.osd = ("密码必填 6-64 位", time.monotonic() + 2)
                 return True
             self.reg_busy = True
             self.net.invalidate(("job", "cloudregqr"))
@@ -5460,7 +5460,7 @@ class App:
                  soft, (box.x + 12, box.y + 30))   # 尾窗 28 字符防溢出
             text(surf, "Enter 保存 · Esc 取消", 10, dim,
                  (box.x + 12, box.y + 46))
-        # ── 注册表单 (覆盖): 用户名 / 邀请码 / 密码(可空) 三字段 ──
+        # ── 注册表单 (覆盖): 用户名 / 邀请码 / 密码必填 三字段 ──
         if self.reg is not None:
             box = pygame.Rect(24, 44, W - 48, 112)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
@@ -5468,7 +5468,7 @@ class App:
             text(surf, "注册 Oneapp 账号", 13, hi, (box.x + 12, box.y + 8))
             for i, (lab2, key2) in enumerate((("用户名", "name"),
                                               ("邀请码", "invite"),
-                                              ("密码(可空)", "password"))):
+                                              ("密码", "password"))):
                 y2 = box.y + 30 + i * 18
                 cur = self.reg["field"] == i
                 text(surf, lab2, 12, acc if cur else dim, (box.x + 12, y2))

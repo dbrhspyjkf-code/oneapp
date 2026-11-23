@@ -1893,6 +1893,8 @@ def test_reg():
         app.key(pygame.K_UP)
     while app.reg["password"]:
         app.key(pygame.K_BACKSPACE)
+    app.key(pygame.K_RETURN)               # 密码空 → 必填拦下 (用户定版:
+    assert app.osd and "6-64" in app.osd[0]    #  注册密码不能空, 密码登录兜底)
     for c in "Pw123456":
         app.key(0, c)
     assert app.reg["password"] == "Pw123456"
