@@ -2007,9 +2007,10 @@ def test_reg():
 
 
 def test_login():
-    """登录表单: 行进入/三字段 (用户名小写/密码/TOKEN 48 上限)/空值提示/
-    TOKEN ping 验证成功 → 存 tok+user 关表单 / 密码登录换会话 token /
-    401 失败保表单 / Esc 关 / 登录行右侧状态."""
+    """登录表单 (两字段, TOKEN 登录已去 — 只走密码/扫码): 行进入/
+    用户名小写/密码 64 上限/空值提示/密码登录换会话 token 存 tok+user
+    关表单 / 401 服务端 err 透传保表单 / Esc 关 / 换号 csync 重置 /
+    登录行右侧状态."""
     import dash
     pygame.init()
     pygame.display.set_mode((1, 1))
@@ -2022,11 +2023,12 @@ def test_login():
     assert rows.index("login") == 0 and rows.index("qrlogin") == 1 \
         and rows.index("wxbind") == 2 and rows.index("reg") == 3
     assert rows[0] == "login" and "key:cloud" not in rows
+    assert ("qrlogin", "扫码登录") in app._set_rows()   # 免输token 标签随 TOKEN 去
     app.tool = "set"
     app.draw(canvas)                       # 未登录: login 行右侧 "未登录"
     app.set_sel = rows.index("login")
     app.key(pygame.K_RETURN)
-    assert app.login == {"user": "", "pw": "", "tok": "", "field": 0}
+    assert app.login == {"user": "", "pw": "", "field": 0}
     # FXZC 真实键值 = 字母 (白名单含 login 表单) → 落用户名字段且小写
     for kk, c2 in ((pygame.K_f, "f"), (pygame.K_z, "z"),
                    (pygame.K_c, "C")):
@@ -2036,46 +2038,21 @@ def test_login():
     app.key(pygame.K_BACKSPACE)
     app.key(pygame.K_BACKSPACE)
     app.key(pygame.K_RETURN)               # 全空 → 提示
-    assert app.osd and "先填" in app.osd[0]
-    # 密码字段上限 64 / TOKEN 字段上限 48 (会话 token 48 hex 不截断)
+    assert app.osd and "都要填" in app.osd[0]
+    # 字段上限: 用户名 16 / 密码 64 (会话 token 48 hex 落 cloud_tok,
+    # 不再手输 — 无 TOKEN 字段)
+    for c in "u" * 20:
+        app.key(0, c)
+    assert len(app.login["user"]) == 16
+    app.login["user"] = ""
     app.key(pygame.K_DOWN)
     for c in "p" * 70:
         app.key(0, c)
     assert len(app.login["pw"]) == 64
-    app.login["pw"] = ""
-    app.key(pygame.K_DOWN)
-    for c in "x" * 60:
-        app.key(0, c)
-    assert len(app.login["tok"]) == 48
-    app.login["tok"] = ""
-    for c in "8545eeb9e745ad046aec6333":
-        app.key(0, c)
-    assert app.login["tok"] == "8545eeb9e745ad046aec6333"
     app.draw(canvas)                       # 表单渲染冒烟
-    orig_raw = netmod.http_raw
-    netmod.http_raw = lambda url, **k: (200, json.dumps(
-        {"ok": 1, "user": "zero"}).encode())
-    app.key(pygame.K_RETURN)
-    d = app.net.last_job("cloudlogin")()
-    assert d["ok"] == 1 and d["user"] == "zero" and d["tok"].startswith("8545")
-    app.on_net("data", "cloudlogin", d)
-    assert app.login is None
-    assert app.cfg["cloud_tok"] == "8545eeb9e745ad046aec6333"
-    assert app.cfg["cloud_user"] == "zero"
-    assert app.osd and "已登录" in app.osd[0]
-    assert app.net.last_job("cloudping") is not None
-    assert json.load(open(dash.SETTINGS_FILE))["cloud_user"] == "zero"
-    # 失败: 401 → 表单保留 + OSD
-    netmod.http_raw = lambda url, **k: (401, b"{}")
-    app.login = {"user": "", "pw": "", "tok": "wrong", "field": 2}
-    app.key(pygame.K_RETURN)
-    d = app.net.last_job("cloudlogin")()
-    assert d["ok"] == 0 and d["err"] == "TOKEN 无效"
-    app.on_net("data", "cloudlogin", d)
-    assert app.login == {"user": "", "pw": "", "tok": "wrong", "field": 2}
-    assert app.osd and "登录失败" in app.osd[0]
     # 密码登录: 用户名+密码 → POST /v1/auth/login 换会话 token → 落盘
-    app.login = {"user": "lee", "pw": "secret1", "tok": "", "field": 1}
+    app.login = {"user": "lee", "pw": "secret1", "field": 1}
+    orig_raw = netmod.http_raw
     def raw_pw(url, **k):
         if "/v1/auth/login" in url:
             body = json.loads(k["body"])
@@ -2093,22 +2070,24 @@ def test_login():
     app.on_net("data", "cloudlogin", d)
     assert app.login is None and app.cfg["cloud_tok"] == "s" * 48
     assert app.cfg["cloud_user"] == "lee"
+    assert app.osd and "已登录" in app.osd[0]
     assert app.net.last_job("cloudping") is not None
-    # 密码 401: 服务端 err 透传 + 表单保留
-    app.login = {"user": "lee", "pw": "bad", "tok": "", "field": 1}
+    assert json.load(open(dash.SETTINGS_FILE))["cloud_user"] == "lee"
+    # 失败: 401 → 服务端 err 透传 + 表单保留
+    app.login = {"user": "lee", "pw": "bad", "field": 1}
     netmod.http_raw = lambda url, **k: (401, json.dumps(
         {"err": "账号或密码不对"}).encode())
     app.key(pygame.K_RETURN)
     d = app.net.last_job("cloudlogin")()
     assert d["ok"] == 0 and "账号或密码不对" in d["err"]
     app.on_net("data", "cloudlogin", d)
-    assert app.login == {"user": "lee", "pw": "bad", "tok": "", "field": 1}
+    assert app.login == {"user": "lee", "pw": "bad", "field": 1}
     assert app.osd and "登录失败" in app.osd[0]
-    # 只有用户名没密码也没 TOKEN → 提示不发请求
-    app.login = {"user": "lee", "pw": "", "tok": "", "field": 1}
+    # 只有用户名没密码 → 提示不发请求
+    app.login = {"user": "lee", "pw": "", "field": 1}
     njobs = len(app.net.jobs)
     app.key(pygame.K_RETURN)
-    assert app.osd and "先填" in app.osd[0]
+    assert app.osd and "都要填" in app.osd[0]
     assert len(app.net.jobs) == njobs
     # ping 回填用户名 (cloud_user 变更才落盘)
     app.on_net("data", "cloudping", {"ok": 1, "user": "zero2"})
@@ -2116,16 +2095,18 @@ def test_login():
     netmod.http_raw = orig_raw
     app.key(pygame.K_ESCAPE)
     assert app.login is None and app.tool == "set"
-    # 换账户: 已登录 → login 行标签变"更换账户"; 换号成功 csync 重置
+    # 换账户: 已登录 → login 行标签变"更换账户"; 密码换号 csync 重置
     assert ("login", "更换账户") in app._set_rows()
     app.ideas = {"texts": [], "voices": [], "csync": 1}
-    orig_raw = netmod.http_raw
     def raw_switch(url, **k):
+        if "/v1/auth/login" in url:
+            return 200, json.dumps({"ok": 1, "user": "other",
+                                    "token": "n" * 48}).encode()
         if "/v1/tombstones" in url:
             return 200, json.dumps({"ids": [], "now": 777.0}).encode()
-        return 200, json.dumps({"ok": 1, "user": "other"}).encode()
+        return 500, b"{}"
     netmod.http_raw = raw_switch
-    app.login = {"user": "", "pw": "", "tok": "n" * 24, "field": 2}
+    app.login = {"user": "other", "pw": "pw2", "field": 0}
     app.key(pygame.K_RETURN)
     d = app.net.last_job("cloudlogin")()
     assert d["ok"] == 1 and d["now"] == 777.0

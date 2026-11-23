@@ -5010,7 +5010,7 @@ class App:
         if tab == "账户":
             return [("login", "更换账户" if self.cfg.get("cloud_tok")
                      else "登录"),
-                    ("qrlogin", "扫码登录 (免输token)"),
+                    ("qrlogin", "扫码登录"),
                     ("wxbind", "绑定微信"),
                     ("reg", "注册新账号"), ("logout", "退出登录")]
         return [("sw:hitokoto", "每日一句"), ("sw:news", "新闻"),
@@ -5046,7 +5046,7 @@ class App:
                 self.qrlogin = None
                 self.qr_poll_at = 0.0
             return True
-        if self.login is not None:             # 登录表单态: 用户名/密码/TOKEN
+        if self.login is not None:             # 登录表单态: 用户名/密码
             return self._login_key(k, ch)
         if self.reg is not None:               # 注册表单态: 两字段 ASCII
             return self._reg_key(k, ch)
@@ -5117,7 +5117,7 @@ class App:
                                  ttl=10)
                     self.osd = ("出码中…", time.monotonic() + 5)
             elif rid == "login":               # 登录/更换账户 表单
-                self.login = {"user": "", "pw": "", "tok": "", "field": 0}
+                self.login = {"user": "", "pw": "", "field": 0}
             elif rid == "logout":              # 退出登录 (本地数据不动)
                 u = self.cfg.get("cloud_user") or ""
                 if self.cfg.get("cloud_tok"):
@@ -5132,27 +5132,24 @@ class App:
         return True
 
     def _login_key(self, k, ch):
-        """登录表单键流: ↑↓ 换字段 (用户名/密码/TOKEN) / ASCII 直输
-        (用户名强制小写) / Enter 按 填了TOKEN→ping 或 用户名+密码→
-        /v1/auth/login 验证."""
+        """登录表单键流: ↑↓ 换字段 (用户名/密码) / ASCII 直输 (用户名
+        强制小写) / Enter → POST /v1/auth/login 验证."""
         f = self.login
         if k == pygame.K_ESCAPE:
             self.login = None
             return True
         if k in (pygame.K_UP, pygame.K_DOWN):
-            f["field"] = (f["field"] + 1) % 3
+            f["field"] = (f["field"] + 1) % 2
             return True
         if k == pygame.K_BACKSPACE:
-            key = ("user", "pw", "tok")[f["field"]]
+            key = ("user", "pw")[f["field"]]
             f[key] = f[key][:-1]
             return True
         if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
             if self.login_busy:
                 return True
-            if not (f["tok"].strip()
-                    or (f["user"].strip() and f["pw"])):
-                self.osd = ("先填 TOKEN 或 用户名+密码",
-                            time.monotonic() + 2)
+            if not (f["user"].strip() and f["pw"]):
+                self.osd = ("用户名和密码都要填", time.monotonic() + 2)
                 return True
             self.login_busy = True
             self.net.invalidate(("job", "cloudlogin"))
@@ -5160,35 +5157,18 @@ class App:
             self.osd = ("登录中…", time.monotonic() + 5)
             return True
         if ch and 0x20 <= ord(ch) < 0x7F:
-            key = ("user", "pw", "tok")[f["field"]]
-            cap = (16, 64, 48)[f["field"]]
+            key = ("user", "pw")[f["field"]]
+            cap = (16, 64)[f["field"]]
             if key == "user":
                 ch = ch.lower()                    # 用户名小写
             f[key] = (f[key] + ch)[:cap]
         return True
 
     def _cloud_login_fn(self):
-        """worker: 填了 TOKEN → ping 验证; 否则用户名+密码 →
-        POST /v1/auth/login 换 30 天会话 token. 成功统一 →
+        """worker: 用户名+密码 → POST /v1/auth/login 换 30 天会话 token →
         {ok, user, tok, url, now} (now=换号 csync 重置水位)."""
         f = self.login or {}
         url = (self.cfg.get("cloud_url") or CLOUD_URL_DEFAULT).rstrip("/")
-        tok = f.get("tok", "").strip()
-        if tok:
-            st, body = netmod.http_raw(url + "/v1/ping", timeout=8,
-                                       headers={"Authorization":
-                                                "Bearer " + tok})
-            try:
-                j = json.loads(body.decode("utf-8", "replace"))
-            except ValueError:
-                j = {}
-            if st == 200 and j.get("ok"):
-                return {"ok": 1, "user": j.get("user") or "?",
-                        "tok": tok, "url": url,
-                        "now": self._cloud_now(url, tok)}
-            return {"ok": 0, "st": st,
-                    "err": "TOKEN 无效" if st == 401 else
-                           ("HTTP %s" % st if st else "网络异常")}
         body = json.dumps({"username": f.get("user", "").strip(),
                            "password": f.get("pw", ""),
                            "name": "zero"}).encode()
@@ -5201,10 +5181,10 @@ class App:
         except ValueError:
             j = {}
         if st == 200 and j.get("ok"):
-            tok2 = j.get("token") or ""
+            tok = j.get("token") or ""
             return {"ok": 1, "user": j.get("user") or "?",
-                    "tok": tok2, "url": url,
-                    "now": self._cloud_now(url, tok2)}
+                    "tok": tok, "url": url,
+                    "now": self._cloud_now(url, tok)}
         return {"ok": 0, "st": st,
                 "err": j.get("err") or
                        ("HTTP %s" % st if st else "网络异常")}
@@ -5505,9 +5485,10 @@ class App:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
                      self.th("danger"), (box.right - 12, box.y + 87),
                      right=True)
-        # ── 登录表单 (覆盖): 用户名+密码 或 TOKEN / 换账户 ──
+        # ── 登录表单 (覆盖): 用户名+密码 / 换账户 (TOKEN 登录已去 —
+        #    只走 密码 或 扫码) ──
         if self.login is not None:
-            box = pygame.Rect(24, 44, W - 48, 112)
+            box = pygame.Rect(24, 44, W - 48, 80)
             pygame.draw.rect(surf, self.card(0), box, border_radius=6)
             pygame.draw.rect(surf, acc, box, 2, border_radius=6)
             cur = self.cfg.get("cloud_user") or ""
@@ -5515,8 +5496,7 @@ class App:
                 if self.cfg.get("cloud_tok") else "登录 Oneapp 账户"
             text(surf, title, 13, hi, (box.x + 12, box.y + 8))
             for i, (lab2, key2) in enumerate((("用户名", "user"),
-                                              ("密码", "pw"),
-                                              ("TOKEN", "tok"))):
+                                              ("密码", "pw"))):
                 y2 = box.y + 30 + i * 18
                 cur2 = self.login["field"] == i
                 text(surf, lab2, 12, acc if cur2 else dim, (box.x + 12, y2))
@@ -5525,13 +5505,13 @@ class App:
                 text(surf, shown, 12, hi if val else dim,
                      (box.x + 74, y2))
             text(surf, "↑↓ 换行 · Enter 登录 · Esc 取消", 10, dim,
-                 (box.x + 12, box.y + 86))
+                 (box.x + 12, box.y + 66))
             if self.login_busy:
                 text(surf, "验证中…", 12, acc,
-                     (box.right - 12, box.y + 86), right=True)
+                     (box.right - 12, box.y + 66), right=True)
             elif self.osd and "失败" in self.osd[0]:
                 text(surf, clip_text(self.osd[0], 10, 130), 10,
-                     self.th("danger"), (box.right - 12, box.y + 87),
+                     self.th("danger"), (box.right - 12, box.y + 67),
                      right=True)
         # ── kv 云同步确认框 (覆盖): 本地 vs 云端 ──
         if self.kv_confirm is not None:
