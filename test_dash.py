@@ -2069,9 +2069,11 @@ def test_login():
     d = app.net.last_job("cloudlogin")()
     assert d["ok"] == 1 and d["user"] == "lee" and d["tok"] == "s" * 48
     assert d["now"] == 555.0
+    app.cfg["kv_owner"] = "staleold"           # 残留旧号 (真机 lilihome 同款)
     app.on_net("data", "cloudlogin", d)
     assert app.login is None and app.cfg["cloud_tok"] == "s" * 48
     assert app.cfg["cloud_user"] == "lee"
+    assert app.cfg["kv_owner"] == "lee"        # 登录即归属落位 (不再反复补对齐)
     assert app.osd and "已登录" in app.osd[0]
     assert app.net.last_job("cloudping") is not None
     assert json.load(open(dash.SETTINGS_FILE))["cloud_user"] == "lee"
@@ -2370,6 +2372,7 @@ def test_kv_sync():
         n_puts = len([t for t, _ in app.net.jobs if t.startswith("kvput:watch")])
         app.set_key(pygame.K_ESCAPE, "")
         assert app.kv_confirm is None
+        assert app.cfg["kv_owner"] == "u"      # 裁决即归属落位
         assert app.watch["items"][0]["code"] == "sh600519"
         assert json.load(open(fw))["items"][0]["code"] == "sh600519"
         assert len([t for t, _ in app.net.jobs
@@ -2418,6 +2421,23 @@ def test_kv_sync():
         assert app.kv_confirm and app.kv_confirm["k"] == "tv_fav"
         app.set_key(pygame.K_ESCAPE, "")
         assert app.tv_fav == ["tv2"] and app.kv_queue == []
+        # Esc 全局路由修: kv_confirm 模态优先于关工具 — 全 key() 入口按
+        # Esc 必裁决弹框 (原: 工具态 Esc 直接 tool_close → 弹框永远无法
+        # 关闭, 重进设置又见; 用户实测 '按 ESC 返回工具的页面')
+        app.tool = "set"
+        json.dump(["tvX"], open(ftv, "w"))
+        app.tv_fav = ["tvX"]
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": ["tvY"], "updated": now}).encode())
+        app.kv_queue = ["tv_fav"]
+        d = app.net.last_job("kvalign:tv_fav")()
+        app.on_net("data", "kvalign:tv_fav", d)
+        assert app.kv_confirm and app.kv_confirm["k"] == "tv_fav"
+        app.key(pygame.K_ESCAPE)               # 全局 Esc → 裁决而非关工具
+        assert app.kv_confirm is None and app.tv_fav == ["tvY"]
+        assert app.tool == "set"               # 保持在设置页 (未跳工具网格)
+        assert app.cfg["kv_owner"] == "u"
+        app.tool = None
         # 网络失败 (st=0): 不裁决不首推 (开机 WiFi 未就绪时, 旧码会把陈旧
         # 本地推上去盖掉云端别的端的新收藏); None 结果不落缓存 → 可重试
         netmod.http_raw = lambda url, **k: (0, b"")

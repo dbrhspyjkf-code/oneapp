@@ -1744,7 +1744,8 @@ class App:
                         self.cfg["cloud_url"] = b.get("url") \
                             or CLOUD_URL_DEFAULT
                     self.cfg["cloud_user"] = new_user
-                    if prev_user and prev_user != new_user:
+                    self.cfg["kv_owner"] = new_user   # 登录即落位 (残留旧号
+                    if prev_user and prev_user != new_user:  #   不再反复补对齐)
                         self.kv_switch = True    # 换号: 本地 kv 是旧号残留
                     self.cfg_save()
                     self.login = None          # 成功: 关表单 + ping 复核
@@ -1794,6 +1795,7 @@ class App:
                         self.cfg["cloud_url"] = CLOUD_URL_DEFAULT
                     self.cfg["cloud_tok"] = b["token"]
                     self.cfg["cloud_user"] = new_user
+                    self.cfg["kv_owner"] = new_user   # 登录即落位 (同上)
                     if prev_user and prev_user != new_user:
                         self.kv_switch = True    # 换号: 本地 kv 是旧号残留
                     self.cfg_save()
@@ -2341,6 +2343,12 @@ class App:
         if self.cfg.get("cloud_tok"):
             self.net.job("kvsync:" + k, lambda k=k: self._kv_get_fn(k),
                          ttl=ttl)
+
+    def _kv_own_settle(self):
+        """kv 裁决后归属落位: kv_owner=当前账号 — 修 残留旧号 (换号后换回)
+        每次开机补对齐反复弹框的根 (2026-11-23 真机 kv_owner=lilihome)."""
+        self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""
+        self.cfg_save()
 
     def kv_align_trigger(self):
         """登录成功后: 逐服务本地 vs 云端对齐; 本地有记录→确认框."""
@@ -4681,6 +4689,8 @@ class App:
         # 换肤键 t 仅主页 (工具内 t 是输入字符, 不劫持).
         if self.tool:
             if k == pygame.K_ESCAPE:
+                if self.tool == "set" and self.kv_confirm is not None:
+                    return self.set_key(k, ch)  # kv 裁决框模态: Esc 先裁决
                 if self.tool == "set" and (self.set_edit is not None
                                            or self.reg is not None
                                            or self.login is not None
@@ -5028,13 +5038,15 @@ class App:
             d = self.kv_confirm
             if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.kv_confirm = None
-                self.kv_push(d["k"])           # 上传本地到云端
+                self._kv_own_settle()          # 裁决即归属落位 (断开机
+                self.kv_push(d["k"])           #   反复补对齐弹框)
                 self.osd = ("%s 已上传本地到云端"
                             % KV_LABEL.get(d["k"], d["k"]),
                             time.monotonic() + 2)
                 self.kv_align_next()
             elif k in (pygame.K_ESCAPE, pygame.K_c):
                 self.kv_confirm = None
+                self._kv_own_settle()
                 self.kv_apply(d["k"], d.get("v"))   # 云端覆盖本地
                 self.osd = ("%s 已用云端覆盖本地"
                             % KV_LABEL.get(d["k"], d["k"]),
