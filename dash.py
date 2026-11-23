@@ -5405,12 +5405,13 @@ class App:
         pygame.draw.line(surf, border, (6, 42), (W - 6, 42))
         rows = self._set_rows()
         n_rows = len(rows)
-        # ── 内容区 ──
+        # ── 内容区 (卡底 8px 边距 — 设置页无页脚, 原留 22px 全是空白;
+        #    行距 18 给底部行留呼吸, 不再压卡边框) ──
         pygame.draw.rect(surf, self.card(0),
-                         pygame.Rect(6, 46, W - 12, H - 46 - 22),
+                         pygame.Rect(6, 46, W - 12, H - 46 - 8),
                          border_radius=4)
         pygame.draw.rect(surf, border,
-                         pygame.Rect(6, 46, W - 12, H - 46 - 22), 1,
+                         pygame.Rect(6, 46, W - 12, H - 46 - 8), 1,
                          border_radius=4)
         vis_n = min(n_rows, 6)
         start = max(0, min(self.set_sel - (vis_n - 1), max(0, n_rows - vis_n)))
@@ -5420,7 +5421,7 @@ class App:
                 break
             rid, lab = rows[ri]
             sel = ri == self.set_sel
-            y = 52 + i * 17
+            y = 52 + i * 18
             if sel:
                 pygame.draw.rect(surf, self.th("track"),
                                  pygame.Rect(10, y - 2, W - 20, 15),
