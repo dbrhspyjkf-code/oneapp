@@ -2402,6 +2402,39 @@ def test_kv_sync():
         d = app.net.last_job("kvalign:news_feeds")()
         app.on_net("data", "kvalign:news_feeds", d)
         assert app.kv_queue == []          # 队列走完
+        # 一致免确认 (修: 旧码凡本地有记录就弹 — 裁决完/内容相同时每次
+        # 登录原样再弹, 4 服务连问): 归一后 == 云端 → 静默过不弹框
+        json.dump(["tv1", "tv2"], open(ftv, "w"))
+        app.tv_fav = ["tv1", "tv2"]            # 内存=文件 (真实态一致)
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": ["tv1", "tv2"], "updated": now}).encode())
+        app.kv_queue = ["tv_fav"]
+        d = app.net.last_job("kvalign:tv_fav")()
+        app.on_net("data", "kvalign:tv_fav", d)
+        assert app.kv_confirm is None and app.tv_fav == ["tv1", "tv2"]
+        assert app.kv_queue == []              # 静默走完, 本地不动
+        # news_feeds: 云端旧表缺新内置源 → 归一补齐后 == 本地 → 免确认
+        json.dump([{"id": "ai", "name": "AI", "url": "https://x/ai",
+                    "on": True}], open(fnf, "w"))
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": [{"id": "ai", "name": "AI",
+                             "url": "https://x/ai", "on": True}],
+             "updated": now}).encode())
+        app.kv_queue = ["news_feeds"]
+        d = app.net.last_job("kvalign:news_feeds")()
+        app.on_net("data", "kvalign:news_feeds", d)
+        assert app.kv_confirm is None and app.kv_queue == []
+        # 真不一致仍弹 → Esc 云端覆盖 (回归旧路径)
+        json.dump(["tv1"], open(ftv, "w"))
+        app.tv_fav = ["tv1"]
+        netmod.http_raw = lambda url, **k: (200, json.dumps(
+            {"ok": 1, "v": ["tv2"], "updated": now}).encode())
+        app.kv_queue = ["tv_fav"]
+        d = app.net.last_job("kvalign:tv_fav")()
+        app.on_net("data", "kvalign:tv_fav", d)
+        assert app.kv_confirm and app.kv_confirm["k"] == "tv_fav"
+        app.set_key(pygame.K_ESCAPE, "")
+        assert app.tv_fav == ["tv2"] and app.kv_queue == []
         # 网络失败 (st=0): 不裁决不首推 (开机 WiFi 未就绪时, 旧码会把陈旧
         # 本地推上去盖掉云端别的端的新收藏); None 结果不落缓存 → 可重试
         netmod.http_raw = lambda url, **k: (0, b"")

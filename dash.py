@@ -2359,7 +2359,8 @@ class App:
 
     def _kv_align_step(self, k, b):
         """拉取结果裁决: 双空/失败跳过; 本地空→直接跟随云端;
-        本地有→确认框 (Enter 上传 / Esc 云端覆盖).
+        本地与云端 (归一后) 一致→静默过; 真不一致→确认框
+        (Enter 上传 / Esc 云端覆盖).
         换号 (kv_switch): 本地是旧号残留 — 静默跟随新号云端,
         404/失败清空本地 (旧数据已在旧号云端, 清本地无损)."""
         if self.kv_queue and self.kv_queue[0] == k:
@@ -2374,6 +2375,9 @@ class App:
         local = netmod.load_json_file(KV_FILES[k], None)
         cv = b.get("v")
         if local:
+            if cv is not None and \
+                    self._kv_norm(k, local) == self._kv_norm(k, cv):
+                return self.kv_align_next()    # 已一致: 免确认静默过
             n = len(local) if isinstance(local, list) else \
                 len(local.get("items", []) or [])
             cn = len(cv) if isinstance(cv, list) else \
@@ -2383,6 +2387,23 @@ class App:
         if cv is not None:
             self.kv_apply(k, cv)
         self.kv_align_next()
+
+    def _kv_norm(self, k, v):
+        """kv 对齐比较用归一 — 两侧各过一遍再比, 与 kv_apply 落地形状
+        同构 (云端旧形状/缺新内置源不算差异); 一致 → 不弹确认框."""
+        if k in ("radio_fav", "tv_fav"):
+            return [x for x in (v or []) if isinstance(x, str)]
+        if k == "watch":
+            return (v or {}).get("items", []) \
+                if isinstance(v, dict) else []
+        if k == "news_feeds":
+            feeds = [dict(f) for f in (v or []) if isinstance(f, dict)
+                     and f.get("id") and f.get("url")]
+            self._news_feeds_merge(feeds)      # 内置补齐 (原地追加种子)
+            for f in feeds:
+                f["on"] = bool(f.get("on", True))
+            return feeds
+        return v
 
     def kv_apply(self, k, v):
         """云端覆盖本地 (内存+文件; 直写不走 save helpers 防回推)."""
