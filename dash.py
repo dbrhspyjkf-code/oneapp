@@ -5431,7 +5431,7 @@ class App:
                 text(surf, ("@%s" % user) if tok else "未登录", 12,
                      hi if tok else dim, (W - 14, y), right=True)
                 if sel:
-                    text(surf, "填 TOKEN", 10, acc, (W - 96, y), right=True)
+                    text(surf, "填账号", 10, acc, (W - 96, y), right=True)
             elif rid.startswith("sw:"):
                 ck = rid.split(":", 1)[1]
                 on = self._card_on(ck)
@@ -5541,8 +5541,8 @@ class App:
             mat = self.qrlogin.get("mat")
             if mat:
                 n = len(mat)
-                px = min(118 // n, 4)
-                ox = box.x + (box.w - n * px) // 2
+                px = min((box.h - 58) // n, 4)   # 底部提示/取消两行避开 (修:
+                ox = box.x + (box.w - n * px) // 2   #  大码压过右下角文字)
                 oy = box.y + 24
                 for my in range(n):
                     for mx in range(n):
