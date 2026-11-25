@@ -3782,63 +3782,545 @@ def test_tv():
     print("tv OK  (95 源 · 状态机/看门狗/重试梯级/焦点/持久化)")
 
 
+def _sched_app(tmp, **cfg):
+    """隔离状态目录的日程测试 App (SCHED_CACHE/SCHED_OUT 等指到 tmp)."""
+    import dash
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
+    dash.SCHED_CACHE = os.path.join(tmp, "sched.json")
+    dash.SCHED_OUT = os.path.join(tmp, "sched_out.json")
+    app = dash.App(FakeNet())
+    app.cfg.update(cfg)
+    return app
+
+
+def _type(app, s):
+    """按真实键值形态逐字符敲 ascii (字母 K_x+unicode / 数字 K_0+n) —
+    绕过 key(0, ch) 会漏掉丝印方向劫持层 (见 test_driver_sym)."""
+    for c in s:
+        if c == " ":
+            app.key(pygame.K_SPACE, " ")
+        elif c == "/":
+            app.key(pygame.K_SLASH, "/")
+        elif c.isalpha():
+            app.key(getattr(pygame, "K_" + c), c)
+        else:
+            app.key(pygame.K_0 + int(c), c)
+
+
+def _ymd(t):
+    lt = _time.localtime(t)
+    return lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min
+
+
+def _tk(y, mo, d, hh, mm):
+    return _time.mktime((y, mo, d, hh, mm, 0, 0, 0, -1))
+
+
+class _FakeCloud:
+    """假云端 (内存版 /v1/sched-item|del|done + GET /v1/sched, 真服务端语义的
+    子集) — 只验设备端的出站队列/回执处理; 服务端自身由 noteserver 仓的
+    test_sched.py 覆盖. fail=(状态码, err) 时强制失败."""
+
+    def __init__(self):
+        self.rows, self.hidden, self.tomb, self.calls = {}, set(), set(), []
+        self.fail = None
+
+    def _vis(self, r):
+        return r["src"] == "app" or (r["kind"], r["text"]) not in self.hidden
+
+    def __call__(self, url, **k):
+        base = "https://notes.apisz.top"
+        path = url[len(base):] if url.startswith(base) else url
+        body = k.get("body")
+        body = json.loads(body.decode()) if body else None
+        self.calls.append((k.get("method", "GET"), path, body))
+        if self.fail:
+            return int(self.fail[0]), json.dumps({"err": self.fail[1]}).encode()
+        if path == "/v1/sched":
+            rem = [dict(id=i, text=r["text"], due=r["due"], done=r["done"],
+                        created=r["created"], src=r["src"])
+                   for i, r in self.rows.items()
+                   if r["kind"] == "remind" and not r["done"]
+                   and self._vis(r)]
+            trp = [dict(id=i, text=r["text"], due=r["due"], tend=r["tend"],
+                        loc=r["loc"], created=r["created"], src=r["src"])
+                   for i, r in self.rows.items()
+                   if r["kind"] == "trip" and self._vis(r)]
+            return 200, json.dumps({"now": _time.time(), "reminds": rem,
+                                    "trips": trp}).encode()
+        if path == "/v1/sched-item":
+            r = self.rows.get(body["id"])
+            if r and r["src"] != "app":
+                return 409, b'{"err": "source"}'
+            if not r and body["id"] in self.tomb:
+                return 409, b'{"err": "deleted"}'
+            fo = body.get("fork_of")
+            if fo and fo in self.rows and self.rows[fo]["src"] != "app":
+                self.hidden.add((self.rows[fo]["kind"],
+                                 self.rows[fo]["text"]))
+            self.rows[body["id"]] = dict(
+                kind=body["kind"], text=body["text"], due=body["due"],
+                tend=body.get("tend") or 0, loc=body.get("loc") or "",
+                done=1 if body.get("done") else 0, src="app",
+                created=_time.time())
+            return 200, json.dumps({"ok": 1, "id": body["id"],
+                                    "dup": r is not None}).encode()
+        if path == "/v1/sched-del":
+            r = self.rows.pop(body["id"], None)
+            if r is None or r["src"] == "app":
+                self.tomb.add(body["id"])
+                return 200, b'{"ok": 1, "mode": "deleted"}'
+            self.hidden.add((r["kind"], r["text"]))
+            return 200, b'{"ok": 1, "mode": "hidden"}'
+        if path == "/v1/sched-done":
+            r = self.rows.get(body["id"])
+            if not r:
+                return 404, b'{"err": "not found"}'
+            if r["kind"] != "remind":
+                return 400, b'{"err": "trip has no done"}'
+            if r["src"] == "app":
+                r["done"] = 1 if body.get("done") else 0
+                return 200, b'{"ok": 1, "mode": "done"}'
+            if body.get("done"):
+                self.hidden.add((r["kind"], r["text"]))
+                return 200, b'{"ok": 1, "mode": "hidden"}'
+            return 400, b'{"err": "source"}'
+        return 404, b'{"err": "not found"}'
+
+
 def test_sched():
-    """日程卡 (只读): 无登录态不拉取/进卡拉取落盘/排序渲染/无管理动作/主页卡冒烟."""
+    """日程卡列表 (本地优先): 未登录可渲染不入队/拉取落盘/排序/光标钳制/
+    来源提醒完成/删除确认框 (D 与旧键位 7, Esc 取消)/行程无完成态/
+    离线只落本机/主页卡冒烟."""
     import dash
     pygame.init()
     pygame.display.set_mode((1, 1))
     canvas = pygame.Surface((dash.W, dash.H))
-    tmp = tempfile.mkdtemp(prefix="oneapp")
-    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
-    dash.IDEAS_FILE = os.path.join(tmp, "ideas.json")
-    dash.SCHED_CACHE = os.path.join(tmp, "sched.json")
-    app = dash.App(FakeNet())
-    # 未登录: 渲染冒烟, 4 刷新不入队 (无 token)
+    app = _sched_app(tempfile.mkdtemp(prefix="oneapp"))
+    app.page = 5
     app.tool = "sched"
-    app.draw(canvas)
+    app.draw(canvas)                              # 未登录空态渲染
     app.key(pygame.K_4)
-    assert not app.net.jobs
-    # 想法云同 token → 拉取落盘
-    app.cfg["cloud_url"] = "https://notes.apisz.top"
-    app.cfg["cloud_tok"] = "b" * 24
+    assert not app.net.jobs                       # 无 token 不拉取
+    app.cfg.update(cloud_url="https://notes.apisz.top", cloud_tok="b" * 24,
+                   cloud_user="alice")
     app.sched_refresh(False)
     assert app.net.last_job("schedget") is not None
-    orig_raw = netmod.http_raw
-    calls = []
     payload = {"now": 100.0,
                "reminds": [
                    {"id": "a" * 12, "text": "milk", "due": 1800000000.0,
-                    "done": 0},
-                   {"id": "c" * 12, "text": "old", "due": 100.0, "done": 0}],
+                    "done": 0, "created": 1.0, "src": "app"},
+                   {"id": "c" * 12, "text": "old", "due": 100.0, "done": 0,
+                    "created": 1.0, "src": "mac"}],
                "trips": [{"id": "e" * 12, "text": "trip", "due": 1800003600.0,
-                          "tend": 1800036000.0, "loc": "hq"}]}
-    netmod.http_raw = lambda url, **k: (
-        calls.append((k.get("method", "GET"), url))
-        or (200, json.dumps(payload).encode()))
-    d = app.net.last_job("schedget")()
+                          "tend": 1800036000.0, "loc": "hq",
+                          "created": 1.0, "src": "mac"}]}
+    orig_raw = netmod.http_raw
+    netmod.http_raw = lambda url, **k: (200, json.dumps(payload).encode())
+    try:
+        d = app.net.last_job("schedget")()
+    finally:
+        netmod.http_raw = orig_raw
     assert d["ok"] == 1 and len(d["reminds"]) == 2 and len(d["trips"]) == 1
     app.on_net("data", "schedget", d)
     assert json.load(open(dash.SCHED_CACHE))["reminds"][0]["id"] == "a" * 12
-    items = app._sched_items()
-    assert [x["id"][0] for x in items] == ["c", "a", "e"]   # 时间升序
-    app.draw(canvas)                                        # 渲染冒烟
-    # 只读: Enter/7 均无管理动作 (零新 job, 无 dialog, 数据不变)
-    n_jobs = len(app.net.jobs)
+    ids = lambda: [x["id"][0] for x in app._sched_items()]   # noqa: E731
+    assert ids() == ["c", "a", "e"]              # 时间升序
+    app.draw(canvas)                             # 列表渲染冒烟
+    # 光标: ↓↓↓ 钳在末行, ↑↑↑↑↑↑ 钳回首行
+    assert app.ssel == 0
+    for _ in range(5):
+        app.key(pygame.K_DOWN)
+    assert app.ssel == 2
+    for _ in range(5):
+        app.key(pygame.K_UP)
+    assert app.ssel == 0
+    # D → 确认框 (带条目 id); Esc 取消不动数据
+    app.key(pygame.K_d)
+    assert app.dialog == ("scheddel", "c" * 12)
+    app.draw(canvas)                             # 确认框渲染 (有专属分支)
+    app.key(pygame.K_ESCAPE)
+    assert app.dialog is None and ids() == ["c", "a", "e"]
+    assert app.sched_out["ops"] == []
+    # Enter: 来源提醒 (mac) 完成 = 入队 del (云端隐藏), 本地立即消失
     app.key(pygame.K_RETURN)
+    assert ids() == ["a", "e"]
+    assert [(o["op"], o["id"], o.get("done")) for o in app.sched_out["ops"]] \
+        == [("del", "c" * 12, 1)]
+    # 7 (旧键位) → 确认 → Enter: 自建提醒删除 = 入队 del
     app.key(pygame.K_7)
-    app.key(pygame.K_UP)
-    app.key(pygame.K_DOWN)
-    assert len(app.net.jobs) == n_jobs
-    assert app.dialog is None
-    assert [x["id"][0] for x in app._sched_items()] == ["c", "a", "e"]
-    # 主页右列「提醒/行程」卡: 开关默认开 + 渲染冒烟
+    assert app.dialog == ("scheddel", "a" * 12)
+    app.key(pygame.K_RETURN)
+    assert app.dialog is None and ids() == ["e"]
+    assert [o["op"] for o in app.sched_out["ops"]] == ["del", "del"]
+    # 行程 Enter: 无完成态 (零新操作)
+    app.key(pygame.K_RETURN)
+    assert ids() == ["e"] and len(app.sched_out["ops"]) == 2
+    assert "没有完成态" in app.osd[0]
+    # 离线 (FakeNet 默认): 操作只落本机, 不发同步请求
+    assert not [t for t, _ in app.net.jobs if t.startswith("schedsync:")]
+    disk = json.load(open(dash.SCHED_OUT))["ops"]
+    assert [o["ow"] for o in disk] == ["alice", "alice"]
+    # 主页右列「提醒/行程」卡: 渲染冒烟 (叠加后的列表)
     app.cfg["cards"]["sched"] = True
     app.tool = None
     app.page = 0
     app.draw(canvas)
-    netmod.http_raw = orig_raw
-    print("sched OK  (fetch/cache/sort/readonly/home-card)")
+    print("sched OK  (fetch/cache/sort/cursor/dialog/del/done/home-card)")
 
+
+def test_sched_sync():
+    """日程出站队列: 离线新建只落本机 → 在线按序上云出队; 断网/401 保留 +
+    退避; 409 丢弃; worker 异常; 在途期间同条目再改 (按入队序号对号);
+    改来源条目 = fork; 换号归属隔离; 登录/退出清缓存; 刷新先发后拉."""
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    app = _sched_app(tempfile.mkdtemp(prefix="oneapp"),
+                     cloud_url="https://notes.apisz.top",
+                     cloud_tok="b" * 24, cloud_user="alice")
+    app.tool = "sched"
+    cloud = _FakeCloud()
+    cloud.rows["d" * 12] = dict(
+        kind="trip", text="mac 行程", due=1800000000.0, tend=1800003600.0,
+        loc="", done=0, src="mac", created=1.0)
+    cloud.rows["f" * 12] = dict(
+        kind="remind", text="mac 提醒", due=1800000100.0, tend=0, loc="",
+        done=0, src="ios", created=1.0)
+    orig_raw = netmod.http_raw
+    netmod.http_raw = cloud
+    texts = lambda: [x["text"] for x in app._sched_items()]   # noqa: E731
+    tags = lambda: [t for t, _ in app.net.jobs             # noqa: E731
+                    if t.startswith("schedsync:")]
+
+    def add(text, due=1800000200.0):
+        app.sched_form_open(None)
+        app.sched_form["text"], app.sched_form["due"] = text, due
+        app.sched_form_save()
+
+    def round_():
+        """跑最后一轮同步: worker fn 主线程直调 + 回执送进 UI 线程."""
+        tag = tags()[-1]
+        d = app.net.last_job(tag)()
+        app.on_net("data", tag, d)
+        return d
+    try:
+        # 初始: 在线拉一次云端缓存 (两条来源条目)
+        app.net.mode = "online"
+        app.sched_refresh(False)
+        app.on_net("data", "schedget", app.net.last_job("schedget")())
+        assert texts() == ["mac 行程", "mac 提醒"]
+        cloud.calls = []                         # 后面只数同步轮的请求
+        # 离线: 新建只落本机 (入盘 + 列表立即可见, 零请求)
+        app.net.mode = "offline"
+        add("离线建的提醒")
+        assert cloud.calls == [] and len(app.sched_out["ops"]) == 1
+        assert json.load(open(dash.SCHED_OUT))["ops"][0]["ow"] == "alice"
+        assert texts() == ["mac 行程", "mac 提醒", "离线建的提醒"]
+        # 在线: 一轮 = 先发 (sched-item) 后拉 (GET); 出队; 缓存更新
+        app.net.mode = "online"
+        app.sched_sync_trigger()
+        assert tags() == ["schedsync:1"]
+        d = round_()
+        assert app.sched_out["ops"] == [] and d["res"][0]["st"] == 200
+        assert [c[1] for c in cloud.calls] == ["/v1/sched-item", "/v1/sched"]
+        its = app._sched_items()
+        assert [x["text"] for x in its] == ["mac 行程", "mac 提醒", "离线建的提醒"]
+        assert its[2]["src"] == "app"           # 现在来自云端缓存 (待传叠加已出队)
+        assert json.load(open(dash.SCHED_CACHE))["reminds"][1]["text"] \
+            == "离线建的提醒"
+        assert app._sched_sync_busy == 0.0 and "已上云" in app.osd[0]
+        # 改来源行程 = fork: 新 id + fork_of; 本地列表里原件立即被顶替
+        app.ssel = 0                            # mac 行程
+        app.key(pygame.K_e)
+        assert app.sched_form["mode"] == "fork" \
+            and app.sched_form["fork_of"] == "d" * 12 \
+            and app.sched_form["id"] != "d" * 12
+        app.sched_form["text"] = "改过的行程"
+        app.sched_form["due"], app.sched_form["tend"] = \
+            1800000500.0, 1800000600.0
+        app.sched_form_save()                   # 保存即入队即发 (无退避)
+        assert tags() == ["schedsync:1", "schedsync:2"]
+        assert texts() == ["mac 提醒", "离线建的提醒", "改过的行程"]
+        round_()
+        fork = cloud.calls[-2][2]
+        assert fork["fork_of"] == "d" * 12 and "d" * 12 in cloud.rows
+        assert ("trip", "mac 行程") in cloud.hidden
+        assert texts() == ["mac 提醒", "离线建的提醒", "改过的行程"]
+        # 删除自建条目 → 云端删除 (终态); 之后重传 409
+        it = next(x for x in app._sched_items() if x["text"] == "离线建的提醒")
+        app.sched_delete(it["id"])
+        round_()
+        assert it["id"] in cloud.tomb and "离线建的提醒" not in texts()
+        # 断网: 操作保留; 15s 退避内不再发起
+        cloud.fail = ("0", "")
+        add("断网时建的")
+        d = round_()
+        assert d["res"][0]["keep"] and len(app.sched_out["ops"]) == 1
+        assert app._sched_sync_busy == 0.0 and "断网时建的" in texts()
+        n = len(tags())
+        app.sched_sync_trigger()
+        assert len(tags()) == n                 # 退避
+        app._sched_sync_at = 0.0                # 退避窗口已过
+        cloud.fail = None
+        app.sched_sync_trigger()
+        assert len(tags()) == n + 1
+        round_()
+        assert app.sched_out["ops"] == []
+        # 401: 保留 + 提示重新登录
+        cloud.fail = ("401", "bad token")
+        add("甲")
+        round_()
+        assert len(app.sched_out["ops"]) == 1 and "重新登录" in app.osd[0]
+        cloud.fail = None
+        app._sched_sync_at = 0.0
+        app.sched_sync_trigger()
+        round_()
+        # 409: 云端不可能再接受 → 出队丢弃 + 提示
+        cloud.fail = ("409", "deleted")
+        add("乙")
+        round_()
+        assert app.sched_out["ops"] == [] and "未接受" in app.osd[0]
+        cloud.fail = None
+        # worker 抛异常 (error 事件): 操作保留, 在途标记复位
+        add("丙")
+        app.on_net("error", tags()[-1], None)
+        assert len(app.sched_out["ops"]) == 1 and app._sched_sync_busy == 0.0
+        app._sched_sync_at = 0.0
+        # 在途期间同一条目再改: 回执按入队序号对号, 新操作不丢
+        add("丁")                               # 同轮: [丙, 丁]
+        tag = tags()[-1]
+        it = next(x for x in app._sched_items() if x["text"] == "丁")
+        app.sched_form_open(it)
+        app.sched_form["text"] = "丁改"
+        app.sched_form_save()                   # 入队即发 → 在途, 新 job 排队
+        assert app._sched_sync_busy != 0.0
+        app.on_net("data", tag, app.net.last_job(tag)())   # 旧快照回执
+        assert [o["text"] for o in app.sched_out["ops"]] == ["丁改"]
+        assert any(r["text"] == "丙" for r in cloud.rows.values())   # 丙已上云
+        round_()                                # 在途期间的新改动立即续传
+        assert app.sched_out["ops"] == []
+        assert any(r["text"] == "丁改" for r in cloud.rows.values())
+        # 换号归属: bob 建的操作在 alice 号下不显示、不发送
+        app.sched_out["ops"].append(
+            {"op": "put", "id": "9" * 12, "kind": "remind", "text": "bob 的",
+             "due": 1800000900.0, "tend": 0, "loc": "", "s": 900, "ow": "bob"})
+        app._sched_save_out()
+        assert "bob 的" not in texts()
+        add("alice 的", 1800000800.0)
+        assert "alice 的" in texts()
+        # 有归属本号的待同步操作时「刷新」= 先发后拉 (不另起 schedget)
+        n_get = len([t for t, _ in app.net.jobs if t == "schedget"])
+        app.sched_refresh(True)
+        assert len([t for t, _ in app.net.jobs if t == "schedget"]) == n_get
+        n_calls = len(cloud.calls)
+        round_()
+        sent = [c[2]["id"] for c in cloud.calls[n_calls:]
+                if c[1] == "/v1/sched-item"]
+        assert "9" * 12 not in sent and "9" * 12 not in cloud.rows
+        assert [o["ow"] for o in app.sched_out["ops"]] == ["bob"]
+        # 退出登录: 云端缓存清空 (旧号条目不再显示); bob 的仍不显示
+        app.cfg.update(cloud_tok="", cloud_user="")
+        app.sched_reset_cache()
+        assert texts() == []
+        assert json.load(open(dash.SCHED_CACHE)) == {"reminds": [], "trips": []}
+        # 未登录新建 (ow="") 可见; bob 登录 → 清缓存 + 把 bob 的和未归属的都传上去
+        add("谁都不是的", 1800000700.0)
+        assert app.sched_out["ops"][-1]["ow"] == "" and texts() == ["谁都不是的"]
+        app.cfg.update(cloud_tok="c" * 24, cloud_user="bob")
+        app.sched_login_sync("alice", "bob")
+        assert texts() == ["谁都不是的", "bob 的"]       # 时间升序
+        round_()
+        assert "9" * 12 in cloud.rows and app.sched_out["ops"] == []
+        assert cloud.calls[-1][1] == "/v1/sched"
+        # 无待同步操作时登录: 清缓存 + 直接拉 (schedget)
+        app.sched_login_sync("bob", "carol")
+        assert json.load(open(dash.SCHED_CACHE)) == {"reminds": [], "trips": []}
+        assert len([t for t, _ in app.net.jobs if t == "schedget"]) == n_get + 1
+        app.draw(canvas)
+    finally:
+        netmod.http_raw = orig_raw
+    print("sched_sync OK  (offline-outbox/flush/retry/409/inflight-edit/"
+          "fork/owner/login)")
+
+
+def test_sched_form():
+    """日程表单: 纯函数 (下一整点/日期·时间直输/标签) + 键流 (类型切换/IME
+    上屏/中英切换/丝印字母不被劫持/日期步进/数字直输/结束不早于开始/
+    空内容拦截/Esc 三层) + 编辑同 id 取代旧 put + 渲染 + 底栏宽度."""
+    import dash
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    app = _sched_app(tempfile.mkdtemp(prefix="oneapp"),
+                     cloud_url="https://notes.apisz.top",
+                     cloud_tok="b" * 24, cloud_user="alice")
+    app.tool = "sched"
+    SF = (dash.SF_KIND, dash.SF_TEXT, dash.SF_SD, dash.SF_ST, dash.SF_ED,
+          dash.SF_ET, dash.SF_LOC)
+    # ── 纯函数 ──
+    t0 = _tk(2026, 11, 25, 10, 27)
+    assert dash._sched_next_hour(t0 + 45) == _tk(2026, 11, 25, 11, 0)
+    assert dash._sched_next_hour(_tk(2026, 11, 30, 23, 30)) \
+        == _tk(2026, 12, 1, 0, 0)
+    dd = dash._sched_date_dig
+    assert dd("1231", t0, t0) == _tk(2026, 12, 31, 10, 27)      # 今年
+    assert dd("0115", t0, t0) == _tk(2027, 1, 15, 10, 27)       # 已过 → 明年
+    assert dd("1125", t0, t0) == t0                            # 今天算今年
+    assert dd("0230", t0, t0) is None and dd("13", t0, t0) is None
+    td = dash._sched_time_dig
+    assert td("9", t0) == _tk(2026, 11, 25, 9, 0)
+    assert td("09", t0) == _tk(2026, 11, 25, 9, 0)
+    assert td("930", t0) == _tk(2026, 11, 25, 9, 30)
+    assert td("0930", t0) == _tk(2026, 11, 25, 9, 30)
+    assert td("2460", t0) is None and td("", t0) is None
+    dl = dash._sched_date_lab
+    assert dl(t0, t0) == ("11-25 周三", " 今天")
+    assert dl(t0 + 86400, t0) == ("11-26 周四", " 明天")
+    assert dl(t0 + 60 * 86400, t0) == ("27-01-24 周日", "")       # 跨年带年号
+    e32 = _tk(2026, 12, 31, 23, 0)
+    assert dl(e32, e32) == ("12-31 周四", " 今天")
+    assert dl(e32 + 3600, e32) == ("27-01-01 周五", " 明天")
+    # ── 键流 ──
+    app.key(pygame.K_n)                          # 新建: 停在类型行
+    f = app.sched_form
+    assert f["mode"] == "new" and f["f"] == SF[0] and f["kind"] == "remind"
+    assert app._sched_fields() == [SF[0], SF[1], SF[2], SF[3]]
+    assert app.ime_mode is True                  # 内容多为中文: 拼音优先
+    app.draw(canvas)
+    app.key(pygame.K_RIGHT)                      # → 行程 (多出 结束/地点)
+    assert f["kind"] == "trip" and f["tend"] == f["due"] + 3600
+    assert app._sched_fields() == list(SF)
+    app.draw(canvas)                             # 行程 7 字段渲染
+    app.key(pygame.K_LEFT)                       # → 提醒
+    assert f["kind"] == "remind"
+    app.key(pygame.K_DOWN)                       # → 内容
+    assert f["f"] == SF[1]
+    _type(app, "mai")
+    assert app.ime_buf == "mai" and app.ime_cands
+    app.draw(canvas)                             # 候选条渲染 (底栏让位)
+    app.key(pygame.K_SPACE, " ")
+    assert f["text"] == "买"
+    _type(app, "baogao")
+    app.key(pygame.K_SPACE, " ")
+    assert f["text"] == "买报告"
+    # 丝印方向键在输入态保持字母 (f/z/x/c 进拼音串, 不被劫持成方向)
+    _type(app, "fxzc")
+    assert app.ime_buf == "fxzc" and f["f"] == SF[1]
+    for _ in range(4):                           # 退拼音串
+        app.key(pygame.K_BACKSPACE)
+    assert app.ime_buf == "" and f["text"] == "买报告"
+    app.key(pygame.K_BACKSPACE)                  # 再退 = 删已提交末字
+    assert f["text"] == "买报"
+    app.key(pygame.K_SLASH, "/")                 # 中 → 英
+    assert app.ime_mode is False
+    _type(app, "a5")
+    assert f["text"] == "买报a5"
+    app.key(pygame.K_SLASH, "/")                 # 英 → 中
+    assert app.ime_mode is True
+    _type(app, "ab")
+    app.key(pygame.K_RETURN)                     # 拼音串未提交: ASCII 直提
+    assert f["text"] == "买报a5ab" and f["f"] == SF[1]
+    app.key(pygame.K_RETURN)                     # → 日期字段
+    assert f["f"] == SF[2]
+    # 日期: ←→ ±1 天; 数字直输 MMDD; 非法日期拦下
+    t = _tk(2026, 12, 31, 10, 27)
+    f["due"], f["dig"] = t, ""
+    app.key(pygame.K_RIGHT)
+    assert f["due"] == t + 86400
+    app.key(pygame.K_LEFT)
+    assert f["due"] == t
+    before = _tk(2026, 11, 25, 10, 27)
+    f["due"] = before
+    _type(app, "1231")
+    assert f["due"] == dd("1231", before, _time.time()) and f["dig"] == ""
+    f["due"] = t
+    _type(app, "0230")
+    assert f["due"] == t and f["dig"] == "" and "日期无效" in app.osd[0]
+    # 时间: ←→ ±5 分; 直输 1 位 = H:00; 末字段 Enter = 保存
+    app.key(pygame.K_DOWN)                       # → 时间字段
+    assert f["f"] == SF[3]
+    f["due"] = _tk(2026, 11, 25, 15, 27)
+    app.key(pygame.K_RIGHT)
+    assert _ymd(f["due"])[3:] == (15, 32)
+    app.key(pygame.K_LEFT)
+    app.key(pygame.K_LEFT)
+    assert _ymd(f["due"])[3:] == (15, 22)
+    _type(app, "9")
+    assert f["dig"] == "9"
+    app.draw(canvas)                             # 直输中途渲染 (按位显示)
+    app.key(pygame.K_RETURN)
+    assert app.sched_form is None
+    op = app.sched_out["ops"][-1]
+    assert op["op"] == "put" and op["kind"] == "remind"
+    assert op["text"] == "买报a5ab" and op["tend"] == 0 and op["loc"] == ""
+    assert op["due"] == int(_tk(2026, 11, 25, 9, 0))
+    # 空内容: 拦在内容字段, 不入队
+    n_ops = len(app.sched_out["ops"])
+    app.key(pygame.K_n)
+    for _ in range(4):
+        app.key(pygame.K_RETURN)                 # 类型 → 内容 → 日期 → 时间 → 存
+    assert app.sched_form is not None and app.sched_form["f"] == SF[1]
+    assert "内容不能为空" in app.osd[0]
+    assert len(app.sched_out["ops"]) == n_ops
+    # Esc 三层: 拼音串 → 表单 (留在日程卡) → 网格
+    _type(app, "ab")
+    assert app.ime_buf == "ab"
+    app.key(pygame.K_ESCAPE)
+    assert app.ime_buf == "" and app.sched_form is not None
+    app.key(pygame.K_ESCAPE)
+    assert app.sched_form is None and app.tool == "sched"
+    app.key(pygame.K_ESCAPE)
+    assert app.tool is None and len(app.sched_out["ops"]) == n_ops
+    # ── 行程表单: 结束不早于开始 ──
+    app.tool = "sched"
+    app.key(pygame.K_n)
+    app.key(pygame.K_RIGHT)                      # 行程
+    f = app.sched_form
+    f["due"], f["tend"] = _tk(2026, 11, 26, 10, 0), _tk(2026, 11, 26, 11, 0)
+    f["f"] = SF[5]                               # 结束时间
+    for _ in range(13):                          # 步进到开始之前 → 钳在开始
+        app.key(pygame.K_LEFT)
+    assert f["tend"] == f["due"]
+    f["tend"] = _tk(2026, 11, 26, 11, 0)         # 直输结束早于开始 → 次日
+    _type(app, "0900")
+    assert f["tend"] == _tk(2026, 11, 27, 9, 0)
+    f["tend"] = _tk(2026, 11, 26, 12, 0)         # 开始挪过结束 → 结束跟到 +1h
+    f["f"] = SF[3]
+    _type(app, "1300")
+    assert f["due"] == _tk(2026, 11, 26, 13, 0)
+    assert f["tend"] == _tk(2026, 11, 26, 14, 0)
+    f["f"] = SF[6]                               # 地点: 上限 16
+    app.key(pygame.K_SLASH, "/")                 # 英文直输
+    _type(app, "abcdefghijklmnopqrstuvwxyz")
+    assert f["loc"] == "abcdefghijklmnop"
+    f["text"] = "行程x"
+    app.sched_form_save()
+    op = app.sched_out["ops"][-1]
+    assert op["kind"] == "trip" and op["tend"] == int(_tk(2026, 11, 26, 14, 0))
+    assert op["loc"] == "abcdefghijklmnop"
+    # ── 编辑自建条目: 同 id, 新 put 取代旧 put; 删除未上云条目只留 del ──
+    it = next(x for x in app._sched_items() if x["text"] == "行程x")
+    app.sched_form_open(it)
+    assert app.sched_form["mode"] == "edit" and app.sched_form["id"] == it["id"]
+    assert app._sched_fields()[0] == SF[1] and app.sched_form["f"] == 0
+    app.draw(canvas)                             # 编辑表单渲染 (无类型行)
+    app.sched_form["text"] = "行程x改"
+    app.sched_form_save()
+    mine = [o for o in app.sched_out["ops"] if o["id"] == it["id"]]
+    assert [o["op"] for o in mine] == ["put"] and mine[0]["text"] == "行程x改"
+    app.sched_delete(it["id"])
+    assert [o["op"] for o in app.sched_out["ops"] if o["id"] == it["id"]] \
+        == ["del"]
+    # ── 底栏宽度 (12px, 起点 x=6): 不得超出 320 屏 ──
+    for labels in (dash.SCHED_FOOT, dash.SCHED_FORM_FOOT):
+        w = sum(dash.textw(l, 12) for l in labels) \
+            + dash.textw("我", 12) * (len(labels) - 1) + 6
+        assert w <= 316, (labels, w)
+    app.draw(canvas)
+    print("sched_form OK  (pure-fns/keys/ime/pickers/trip-rules/edit/foot)")
 
 if __name__ == "__main__":
     test_lunar()
@@ -3862,7 +4344,14 @@ if __name__ == "__main__":
     test_cloud()
     test_kv_sync()
     test_news_settings()
+    # 日程状态文件套件级默认隔离 (登录类测试会经 sched_login_sync 写缓存)
+    import dash as _dash
+    _st = tempfile.mkdtemp(prefix="oneapp")
+    _dash.SCHED_CACHE = os.path.join(_st, "sched.json")
+    _dash.SCHED_OUT = os.path.join(_st, "sched_out.json")
     test_sched()
+    test_sched_sync()
+    test_sched_form()
     test_reg()
     test_login()
     test_mail_keys()

@@ -39,6 +39,16 @@ panel.py 方案); 有 bcm2835-codec-decode 时自动 H.264 硬解 (h264_v4l2m2m)
 (公共源单台失效属正常, 换台即恢复)。上次分组/光标记忆 `tv_last.json`,
 诊断轨迹 `/tmp/oneapp_tv.log`。
 
+日程 app (工具第 8 卡): **提醒 + 行程, 本地优先** — `N` 新建 / `E` 编辑 /
+`D`(或 `7`) 删除 (确认框) / `Enter` 完成提醒 / `4` 刷新 / `↑↓`(F/X) 选。
+改动先写本地待同步队列 (`sched_out.json`), 登录且在线后按序上云 (断网或
+未登录照常可用, 之后自动补传); 与车机 car-dash 经云端互通。数据两类:
+本机/车机**自建**条目可增删改; iPhone/Mac 提交器快照推来的**来源**条目 —
+删除/完成 = 云端隐藏 (重推不复活, 直到来源端自己丢弃), 修改 = 另存一条
+自建条目并隐藏原件 (来源端原条目不变)。表单: 类型 / 内容 (拼音 IME,
+`/` 中英) / 日期·时间 (`←→` 步进: 日期 ±1 天 · 时间 ±5 分; 或数字直输
+`MMDD` / `HHMM`, 时间 1-2 位 = 整点) / 行程再加 结束·地点。
+
 ## 运行
 
 ```bash
@@ -52,7 +62,8 @@ RUN_NET=1 python3 -c "import test_dash; test_dash.test_net_live()"  # 在线链�
 ```
 
 键位: `1-5` 切页 · `Z/C/F/X`(丝印←→↑↓) 翻页 · `t` 换主题(主页) ·
-`Fn+S/D` 音量± · 新闻页 `S` 源设置 · 主页长按 `Esc` 1s 退出。
+`Fn+S/D` 音量± · 新闻页 `S` 源设置 · 工具·日程 `N/E/D` 新建/编辑/删除 ·
+主页长按 `Esc` 1s 退出。
 
 ## 数据状态
 
@@ -60,6 +71,8 @@ RUN_NET=1 python3 -c "import test_dash; test_dash.test_net_live()"  # 在线链�
 - 音乐凭据 (QQ musickey / 网易 MUSIC_U): 同目录, 0600 权限
 - Oneapp 账户 kv 云同步 (noteserver `/v1/kv`, 按账号): 电台收藏 / 自选股 /
   电视收藏 / **新闻源表** (显隐+自定义源, 本地变更即推 · 开机/进页 LWW 拉取)
+- 日程 (提醒/行程): 云端缓存 `sched.json` + 待同步操作队列 `sched_out.json`
+  (逐条操作, 带归属账号; noteserver `/v1/sched-item|sched-del|sched-done`)
 
 ## License
 

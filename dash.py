@@ -791,6 +791,12 @@ TV_LAST_CACHE = os.path.join(STATE_DIR, "tv_last.json")  # 电视上次分组/�
 TV_FAV_CACHE = os.path.join(STATE_DIR, "tv_fav.json")    # 电视收藏 (频道名表)
 IDEAS_FILE = os.path.join(STATE_DIR, "ideas.json")        # 想法 (本地存储)
 SCHED_CACHE = os.path.join(STATE_DIR, "sched.json")      # 日程卡缓存 (提醒/行程)
+SCHED_OUT = os.path.join(STATE_DIR, "sched_out.json")    # 日程待同步操作队列 (本地优先)
+# 日程表单字段序号 (新建/编辑 提醒·行程; 类型行仅新建时有)
+SF_KIND, SF_TEXT, SF_SD, SF_ST, SF_ED, SF_ET, SF_LOC = range(7)
+SF_PICK = (SF_SD, SF_ST, SF_ED, SF_ET)                   # 日期/时间: 步进 + 数字直输
+SCHED_FOOT = ["↑↓ 选", "N 新建", "E 编辑", "D 删除", "Enter 完成", "4 刷新"]
+SCHED_FORM_FOOT = ["↑↓ 换项", "←→ 调", "/ 中英", "Enter 存", "Esc 取消"]
 CLOUD_URL_DEFAULT = "https://notes.apisz.top"   # 注册成功自动配 (可改设置)
 CACHE_DIR = os.path.join(STATE_DIR, "cache")              # 主页数据磁盘缓存
 _SENT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1350,6 +1356,75 @@ def gen_beep(path="/tmp/dz_beep.wav"):
         return False
 
 
+# ── 日程表单: 日期/时间字段 (←→ 步进 + 数字直输; 纯函数可测) ──
+_WK = "一二三四五六日"
+
+
+def _sched_next_hour(now):
+    """下一个整点 (新建条目的默认时间; 纯秒运算, 不碰时区/夏令时)."""
+    lt = time.localtime(now)
+    return now - lt.tm_min * 60 - lt.tm_sec + 3600
+
+
+def _sched_ymd(t):
+    lt = time.localtime(t)
+    return lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min
+
+
+def _sched_at(y, mo, d, hh, mm):
+    """本地时区拼时刻; 越界日期 (2 月 30 日等) 被 mktime 回绕 → None."""
+    try:
+        t = time.mktime((y, mo, d, hh, mm, 0, 0, 0, -1))
+    except (OverflowError, ValueError):
+        return None
+    return t if _sched_ymd(t)[:3] == (y, mo, d) else None
+
+
+def _sched_date_dig(dig, cur, now):
+    """日期字段数字直输 MMDD → 新时刻 (保留原时分). 年份取最近的将来: 今年
+    该日期不早于今天用今年, 否则明年. 非 4 位数字 / 日期不存在 → None."""
+    if len(dig) != 4 or not dig.isdigit():
+        return None
+    mo, d = int(dig[:2]), int(dig[2:])
+    y, _, _, hh, mm = _sched_ymd(cur)
+    if (y, mo, d) < _sched_ymd(now)[:3]:
+        y += 1
+    return _sched_at(y, mo, d, hh, mm)
+
+
+def _sched_time_dig(dig, cur):
+    """时间字段数字直输 → 新时刻 (保留原年月日): 1 位=H:00 / 2 位=HH:00 /
+    3 位=H:MM / 4 位=HHMM. 空 / 非数字 / 超范围 → None."""
+    if not dig or not dig.isdigit():
+        return None
+    hh, mm = ((int(dig), 0) if len(dig) == 1 else
+              (int(dig), 0) if len(dig) == 2 else
+              (int(dig[0]), int(dig[1:])) if len(dig) == 3 else
+              (int(dig[:2]), int(dig[2:])))
+    if hh > 23 or mm > 59:
+        return None
+    y, mo, d, _, _ = _sched_ymd(cur)
+    return _sched_at(y, mo, d, hh, mm)
+
+
+def _sched_date_lab(t, now):
+    """日期字段显示 (基本串, 相对串): "11-26 周四" + " 今天/明天/后天";
+    跨年时基本串带年号 "27-01-05 周二"."""
+    lt, ln = time.localtime(t), time.localtime(now)
+    rel = ""
+    try:
+        import datetime
+        dd = (datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday)
+              - datetime.date(ln.tm_year, ln.tm_mon, ln.tm_mday)).days
+        rel = {0: " 今天", 1: " 明天", 2: " 后天"}.get(dd, "")
+    except ValueError:
+        pass
+    base = ("" if lt.tm_year == ln.tm_year
+            else "%02d-" % (lt.tm_year % 100))
+    return base + "%02d-%02d 周%s" % (lt.tm_mon, lt.tm_mday,
+                                      _WK[lt.tm_wday]), rel
+
+
 class App:
     def __init__(self, netins):
         self.net = netins
@@ -1373,6 +1448,17 @@ class App:
         self.sched = netmod.load_json_file(SCHED_CACHE,
                                            {"reminds": [], "trips": []})
         self._sched_home_at = 0.0             # 主页日程卡刷新节流
+        # 日程本地优先: 改动先入待同步队列 (put/del/done, 带归属账号与入队
+        # 序号), 登录在线后按序上云; 列表/主页卡 = 云端缓存 + 队列叠加
+        self.sched_out = netmod.load_json_file(SCHED_OUT, {"ops": []})
+        if not isinstance(self.sched_out, dict) \
+                or not isinstance(self.sched_out.get("ops"), list):
+            self.sched_out = {"ops": []}
+        self.ssel = 0                         # 日程卡光标
+        self.sched_form = None                # 新建/编辑表单 (None=列表层)
+        self._sched_sync_busy = 0.0           # 同步一轮在途起点 (monotonic; 0=空闲)
+        self._sched_sync_n = 0                # 同步轮次 (每轮唯一 job tag)
+        self._sched_sync_at = 0.0             # 上次没发成的时刻 (失败退避 15s)
         self.watch = netmod.load_json_file(WATCH_FILE, WATCH_SEED)
         self.wx_loc = netmod.load_json_file(WX_LOC_FILE, None) or dict(WX_HOME)
         # 语音想法: 录音 (arecord) + 本地播放 (ffplay)
@@ -1754,6 +1840,7 @@ class App:
                         netmod.save_json_file(IDEAS_FILE, self.ideas)
                     self.cloud_ping_trigger()
                     self.kv_align_trigger()    # Oneapp 账户: 登录即对齐
+                    self.sched_login_sync(prev_user, new_user)
                     self.osd = ("已登录 %s" % b.get("user"),
                                 time.monotonic() + 2.5)
                 else:
@@ -1806,6 +1893,7 @@ class App:
                         netmod.save_json_file(IDEAS_FILE, self.ideas)
                     self.cloud_ping_trigger()
                     self.kv_align_trigger()    # Oneapp 账户: 登录即对齐
+                    self.sched_login_sync(prev_user, new_user)
                     self.osd = (("注册成功 已绑定微信 %s" if isreg
                                  else "扫码登录 ✓ %s") % b.get("user"),
                                 time.monotonic() + 2.5)
@@ -1869,13 +1957,16 @@ class App:
                         self.kv_push(k)
                 # (st==0 网络失败: 不裁决不首推 — 首推会把陈旧本地盖掉
                 #  云端别的端的新收藏, 开机 WiFi 未就绪时必踩)
+            elif a.startswith("schedsync:") and isinstance(b, dict):
+                self._sched_sync_done(b)
             elif a == "schedget" and isinstance(b, dict) \
                     and not b.get("skip"):
                 if b.get("ok"):
                     self.sched = {"reminds": b.get("reminds") or [],
                                   "trips": b.get("trips") or []}
                     netmod.save_json_file(SCHED_CACHE, self.sched)
-                    if self.tool == "sched":
+                    self.sched_clamp()
+                    if self.tool == "sched" and self.sched_form is None:
                         self.osd = ("日程 %d 条"
                                     % len(self._sched_items()),
                                     time.monotonic() + 1.2)
@@ -1928,6 +2019,9 @@ class App:
                 self.kv_align_next()
             elif a.startswith("kvsync:") or a.startswith("kvput:"):
                 pass
+            elif a.startswith("schedsync:"):
+                self._sched_sync_busy = 0.0      # worker 异常: 操作留队列
+                self._sched_sync_at = time.monotonic()   #   退避后重试
             elif a == "schedget":
                 if self.tool == "sched":
                     self.osd = ("日程获取失败 · 网络异常",
@@ -1954,6 +2048,7 @@ class App:
     def poll(self):
         """按页取数: 只拉当前页所需, 页面切换即时响应不排队."""
         self.mu_tick()                        # 音乐连播: 任意页/离线都要走 (本地曲库)
+        self.sched_sync_trigger()             # 日程待同步操作: 登录在线即发 (内部节流)
         if self.net.mode == "online":
             if self.page == 0:
                 self.net.job("news", news_rss.news_fetch_all, 600)   # 主页新闻卡
@@ -4507,7 +4602,8 @@ class App:
                     and self.mail_lv in ("login", "compose"))
                 or (self.tool == "set" and (self.set_edit is not None
                                             or self.reg is not None
-                                            or self.login is not None)))
+                                            or self.login is not None))
+                or (self.tool == "sched" and self.sched_form is not None))
 
     def key(self, k, ch=""):
         # 丝印方向 (非输入态): F/X/Z/C = ↑↓←→ (fn+ 同效, 输入态保持字母)
@@ -4535,6 +4631,8 @@ class App:
                     self.tv_fav_remove(self.dialog[1])     # ("untvfav", 名)
                 elif self.dialog[0] == "delnfeed":
                     self.news_feed_del(self.dialog[1])    # ("delnfeed", fid)
+                elif self.dialog[0] == "scheddel":
+                    self.sched_delete(self.dialog[1])     # ("scheddel", id)
                 else:
                     self.delete_selected()   # ("del", item) 确认删除
                 self.dialog = None
@@ -4724,6 +4822,12 @@ class App:
                 elif self.tool == "mail":
                     if not self.mail_esc():       # 逐层回退; 账号层 → 网格
                         self.tool_close()
+                elif self.tool == "sched" and self.sched_form is not None:
+                    if self.ime_buf:              # 先退拼音串 (IME)
+                        self.ime_clear()
+                    else:                        # 表单 → 回列表 (不保存)
+                        self.sched_form = None
+                        self.ime_clear()
                 else:
                     self.tool_close()
                 return True
@@ -5136,6 +5240,7 @@ class App:
                     self.cfg["cloud_tok"] = ""
                     self.cfg["cloud_user"] = ""
                     self.cfg_save()
+                    self.sched_reset_cache()   # 云端日程缓存不留 (回「仅本机」视图)
                     self.osd = ("已退出 %s · 云数据仅本地" % u
                                 if u else "已退出",
                                 time.monotonic() + 2.5)
@@ -5646,35 +5751,200 @@ class App:
         if t == "tv":
             return self.tv_key(k)
         if t == "sched":
-            return self.sched_key(k)
+            return self.sched_key(k, ch)
         if t == "set":
             return self.set_key(k, ch)
         return True
 
     # ── 邮件 (工具第 7 卡; IMAP 授权码直连, 协议层 mail.py, net.job 后台跑) ──
-    # ── 日程 (工具第 9 卡: 提醒+行程 只读展示 — 数据仅由 iPhone/Mac 提交器
-    #    写入 noteserver /v1/sched-sync, 本端零管理 2026-11-17 用户定版) ──
+    # ── 日程 (工具第 8 卡: 提醒+行程, 本地优先 — 新建/编辑/删除/完成 先落
+    #    本地待同步队列, 登录在线后按序上云. 数据 = 自建条目 (src=app) +
+    #    iPhone/Mac 提交器快照推来的来源条目; 2026-11-25 取代只读定版) ──
     def _sched_items(self):
-        """提醒+行程合并按时间升序 (渲染同一条排序口径)."""
+        """提醒+行程合并按时间升序 (渲染同一条排序口径) = 云端缓存 + 本地
+        待同步操作叠加: 待传条目立即可见, 待删/待完成的条目立即消失."""
         out = []
         for r in self.sched.get("reminds", []):
             out.append({"kind": "remind", "id": r.get("id") or "",
                         "text": r.get("text") or "", "t": r.get("due") or 0,
-                        "tend": 0, "loc": ""})
+                        "tend": 0, "loc": "",
+                        "src": r.get("src") or ""})
         for r in self.sched.get("trips", []):
             out.append({"kind": "trip", "id": r.get("id") or "",
                         "text": r.get("text") or "", "t": r.get("due") or 0,
-                        "tend": r.get("tend") or 0, "loc": r.get("loc") or ""})
+                        "tend": r.get("tend") or 0,
+                        "loc": r.get("loc") or "",
+                        "src": r.get("src") or ""})
+        for o in self._sched_ops():
+            op, oid = o.get("op"), o.get("id") or ""
+            if op == "put":
+                out = [x for x in out if x["id"] not in
+                       (oid, o.get("fork_of") or "")]     # fork: 原件隐藏
+                out.append({"kind": o.get("kind") or "remind", "id": oid,
+                            "text": o.get("text") or "",
+                            "t": o.get("due") or 0,
+                            "tend": o.get("tend") or 0,
+                            "loc": o.get("loc") or "", "src": "app"})
+            else:                               # del / done: 立即消失
+                out = [x for x in out if x["id"] != oid]
         out.sort(key=lambda x: x["t"])
         return out
 
+    def _sched_ops(self):
+        """待同步操作 (按入队顺序), 只取归属当前账号的: 未登录时建的 ow="";
+        别的号建的留在队列里, 等那个号登录再传 (换号不许看到/上传旧号数据)."""
+        ow = self.cfg.get("cloud_user") or ""
+        return [o for o in (self.sched_out.get("ops") or [])
+                if isinstance(o, dict) and (o.get("ow") or "") in ("", ow)]
+
+    def _sched_save_out(self):
+        netmod.save_json_file(SCHED_OUT, self.sched_out)
+
+    def _sched_enqueue(self, op):
+        """改动入队 (本地立即生效) 并触发上云. 同一条目只留最新一条操作 —
+        id 不复用, 新操作之前那条待传 put 已无意义."""
+        oid = op.get("id")
+        self.sched_out["ops"] = [
+            o for o in (self.sched_out.get("ops") or [])
+            if not (isinstance(o, dict) and o.get("id") == oid)]
+        self.sched_out["n"] = self.sched_out.get("n", 0) + 1
+        op["s"] = self.sched_out["n"]          # 入队序号 (回执按它对号)
+        op["ow"] = self.cfg.get("cloud_user") or ""
+        self.sched_out["ops"].append(op)
+        self._sched_save_out()
+        self.sched_sync_trigger()
+
     def sched_refresh(self, force):
-        url, tok = self._cloud_cfg()
+        if self._sched_ops() or self._sched_sync_busy:
+            self.sched_sync_trigger(nowait=force)
+            return                          # 有待同步操作: 先发后拉 (一轮拿最新
+        url, tok = self._cloud_cfg()        #   列表, 不与发送交错)
         if not (url and tok):
             return
         if force:
             self.net.invalidate("schedget")    # 强刷 = 弹 TTL 缓存重跑
         self.net.job("schedget", self._sched_fetch_fn, ttl=300)
+
+    def sched_sync_trigger(self, nowait=False):
+        """有待同步操作 + 已登录 + 在线 → 后台一轮按序发送. 同一时刻只跑
+        一轮 (回执到了才发下一轮); 上一轮失败后 15s 退避 (成功过的改动
+        即做即传), poll 每秒来问."""
+        mo = time.monotonic()
+        if self._sched_sync_busy:
+            if mo - self._sched_sync_busy < 30:
+                return                      # 在途 (30s 兜底: 回执丢了也不卡死)
+            self._sched_sync_busy = 0.0
+        if not nowait and mo - self._sched_sync_at < 15:
+            return                          # 上一轮没发成: 稍后再试
+        url, tok = self._cloud_cfg()
+        ops = self._sched_ops()
+        if not (url and tok) or not ops or self.net.mode != "online":
+            return
+        self._sched_sync_busy = mo
+        self._sched_sync_n += 1
+        self.net.job("schedsync:%d" % self._sched_sync_n,     # 每轮唯一 tag
+                     lambda u=url, t=tok, o=[dict(x) for x in ops]:
+                     self._sched_sync_fn(u, t, o), ttl=0)
+
+    def _sched_sync_fn(self, url, tok, ops):
+        """worker: 按序发送待同步操作, 再拉最新列表. 只读入参快照 (不碰 UI
+        状态). 返回 {"ok":1,"res":[{s,st,err,keep}],reminds?,trips?}:
+        keep=True 的没发成 (断网/鉴权/限速) 留在队列里下轮重试; 断网即停."""
+        hdr = {"Content-Type": "application/json",
+               "Authorization": "Bearer " + tok}
+        path = {"put": "/v1/sched-item", "del": "/v1/sched-del",
+                "done": "/v1/sched-done"}
+        res, down = [], False
+        for o in ops:
+            body = {k: o[k] for k in ("id", "kind", "text", "due", "tend",
+                                      "loc", "done", "fork_of") if k in o}
+            st, raw = netmod.http_raw(
+                url + path[o["op"]], method="POST",
+                body=json.dumps(body).encode("utf-8"), headers=hdr,
+                timeout=8)
+            err = ""
+            try:
+                err = (json.loads(raw.decode("utf-8", "replace"))
+                       .get("err") or "") if raw else ""
+            except (ValueError, AttributeError):
+                pass
+            # 2xx=成功; 400/404/409=云端不可能再接受 (坏数据/已删/来源条目) →
+            # 出队丢弃; 其余 (0=断网, 401, 403, 429, 5xx) 保留重试
+            res.append({"s": o.get("s"), "st": st, "err": err,
+                        "keep": st in (0, 401, 403, 429) or st >= 500})
+            if st == 0:
+                down = True
+                break
+        out = {"ok": 1, "res": res}
+        if not down:                          # 发完顺手拉最新列表
+            st, body = netmod.http_raw(url + "/v1/sched", headers={
+                "Authorization": "Bearer " + tok})
+            if st == 200 and body:
+                try:
+                    j = json.loads(body.decode("utf-8", "replace"))
+                    out["reminds"] = j.get("reminds") or []
+                    out["trips"] = j.get("trips") or []
+                except ValueError:
+                    pass
+        return out
+
+    def _sched_sync_done(self, b):
+        """同步回执 (UI 线程): 成功/永久失败的操作出队, 应用附带的最新列表.
+        按入队序号对号 — 在途期间同一条目的新操作 (新序号) 不受影响."""
+        self._sched_sync_busy = 0.0
+        res = b.get("res") or []
+        gone = {r.get("s") for r in res if not r.get("keep")}
+        n_bad = sum(1 for r in res
+                    if not r.get("keep") and r.get("st") != 200)
+        auth = any(r.get("st") == 401 for r in res)
+        if gone:
+            self.sched_out["ops"] = [
+                o for o in (self.sched_out.get("ops") or [])
+                if o.get("s") not in gone]
+            self._sched_save_out()
+        if any(r.get("keep") for r in res):
+            self._sched_sync_at = time.monotonic()   # 没发成 → 退避计时
+        if "reminds" in b:                    # 附带最新列表 → 覆盖云端缓存
+            self.sched = {"reminds": b.get("reminds") or [],
+                          "trips": b.get("trips") or []}
+            netmod.save_json_file(SCHED_CACHE, self.sched)
+        self.sched_clamp()
+        left = len(self._sched_ops())
+        if self.tool == "sched" and self.sched_form is None and res:
+            if auth:
+                self.osd = ("上云失败 · 请重新登录", time.monotonic() + 3)
+            elif n_bad:
+                self.osd = ("%d 条改动云端未接受" % n_bad,
+                            time.monotonic() + 3)
+            elif left:
+                self.osd = ("同步中 · 还剩 %d 条" % left,
+                            time.monotonic() + 1.5)
+            else:
+                self.osd = ("已上云 · 日程 %d 条" % len(self._sched_items()),
+                            time.monotonic() + 1.5)
+        if left and not any(r.get("keep") for r in res):
+            self.sched_sync_trigger(nowait=True)   # 快照全成功, 剩下的是在途
+        #                                        期间的新改动 → 立即续传 (有
+        #                                        没发成的则走 15s 退避)
+
+    def sched_clamp(self):
+        n = len(self._sched_items())
+        self.ssel = max(0, min(self.ssel, max(0, n - 1)))
+
+    def sched_reset_cache(self):
+        """换号/退出登录: 云端缓存清空 (旧账号的条目不许再显示). 待同步
+        操作按归属留在队列里 (哪个号建的, 等那个号登录再传)."""
+        self.sched = {"reminds": [], "trips": []}
+        netmod.save_json_file(SCHED_CACHE, self.sched)
+        self.ssel = 0
+
+    def sched_login_sync(self, prev_user, new_user):
+        """登录成功: 换号 (或从未登录到登录) 先清旧缓存, 再把归属新号的
+        待同步操作传上去并拉最新列表."""
+        if (prev_user or "") != (new_user or ""):
+            self.sched_reset_cache()
+        self.sched_sync_trigger(nowait=True)
+        self.sched_refresh(True)
 
     def _sched_fetch_fn(self):
         """worker: GET /v1/sched → {"ok",now,reminds,trips} | {"ok":0}."""
@@ -5694,54 +5964,329 @@ class App:
                 "reminds": j.get("reminds") or [],
                 "trips": j.get("trips") or []}
 
-    def sched_key(self, k):
-        if k == pygame.K_4:                    # 只读卡: 唯一动作 = 手动刷新
+    def sched_key(self, k, ch):
+        """列表层: ↑↓ 选 · N 新建 · E 编辑 · D/7 删除 (确认框) · Enter 完成
+        (仅提醒) · 4 刷新; 表单开着归 sched_form_key."""
+        if self.sched_form is not None:
+            return self.sched_form_key(k, ch)
+        items = self._sched_items()
+        n = len(items)
+        if k in (pygame.K_UP, pygame.K_DOWN):
+            if n:
+                self.ssel = max(0, min(n - 1, self.ssel +
+                                       (-1 if k == pygame.K_UP else 1)))
+        elif k == pygame.K_n:
+            self.sched_form_open(None)
+        elif k == pygame.K_e:
+            if self.ssel < n:
+                self.sched_form_open(items[self.ssel])
+        elif k in (pygame.K_d, pygame.K_7):
+            if self.ssel < n:
+                self.dialog = ("scheddel", items[self.ssel]["id"])
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if self.ssel < n:
+                self.sched_complete(items[self.ssel])
+        elif k == pygame.K_4:
             self.sched_refresh(True)
             self.osd = ("刷新中", time.monotonic() + 1.0)
         return True
 
+    def sched_complete(self, it):
+        """Enter: 提醒标记完成 (行程没有完成态). 自建提醒云端翻 done;
+        来源提醒 (Mac/iPhone) = 云端隐藏 — 来源端仍显示未完成."""
+        if it["kind"] != "remind":
+            self.osd = ("行程没有完成态", time.monotonic() + 2)
+            return
+        self._sched_enqueue({"op": "done" if it.get("src") == "app"
+                             else "del", "id": it["id"], "done": 1})
+        self.osd = ("已完成", time.monotonic() + 1.5)
+
+    def sched_delete(self, oid):
+        """确认框后的删除: 自建条目 = 云端删除 (终态), 来源条目 = 云端隐藏."""
+        self._sched_enqueue({"op": "del", "id": oid})
+        self.osd = ("已删除", time.monotonic() + 1.5)
+
+    def sched_form_open(self, it):
+        """N 新建 / E 编辑. 来源条目 (Mac/iPhone 推来的) 不就地改写 — 改它 =
+        fork: 新 id 另存一条自建条目, 保存时云端隐藏原件."""
+        base = _sched_next_hour(time.time())
+        if it is None:
+            f = {"mode": "new", "kind": "remind", "id": _cloud_id(),
+                 "fork_of": "", "text": "", "loc": "", "due": base,
+                 "tend": base + 3600}
+        else:
+            app = it.get("src") == "app"
+            t0 = it["t"] or base
+            f = {"mode": "edit" if app else "fork", "kind": it["kind"],
+                 "id": it["id"] if app else _cloud_id(),
+                 "fork_of": "" if app else it["id"], "text": it["text"],
+                 "loc": it.get("loc") or "", "due": t0,
+                 "tend": it.get("tend") or t0}
+        f["f"], f["dig"] = 0, ""
+        self.sched_form = f
+        self.ime_mode = True                  # 内容多为中文: 拼音优先 (/ 切英文)
+        self.ime_clear()
+
+    def _sched_fields(self):
+        f = self.sched_form
+        fs = [SF_KIND] if f["mode"] == "new" else []
+        fs.append(SF_TEXT)
+        fs += ([SF_SD, SF_ST, SF_ED, SF_ET, SF_LOC] if f["kind"] == "trip"
+               else [SF_SD, SF_ST])
+        return fs
+
+    def _sched_dig_commit(self, fl):
+        """日期/时间字段的数字直输入账 (输满 4 位或离开字段时调). 日期须满
+        4 位 MMDD; 时间 1-4 位都行 (9=9:00, 930=9:30, 0930=9:30)."""
+        f = self.sched_form
+        dig, f["dig"] = f.get("dig") or "", ""
+        if not dig or fl not in SF_PICK:
+            return
+        start = fl in (SF_SD, SF_ST)
+        key = "due" if start else "tend"
+        t = (_sched_date_dig(dig, f[key], time.time())
+             if fl in (SF_SD, SF_ED) else _sched_time_dig(dig, f[key]))
+        if t is None:
+            self.osd = ("日期无效" if fl in (SF_SD, SF_ED) else "时间无效",
+                        time.monotonic() + 2)
+            return
+        f[key] = t
+        self._sched_fix_end("start" if start else "nextday")
+
+    def _sched_fix_end(self, rule):
+        """行程结束不早于开始: 开始挪过结束 → 结束跟着走 (留 1 小时);
+        结束被步进到开始之前 → 钳在开始; 直输的结束早于开始 → 当作次日."""
+        f = self.sched_form
+        if f["kind"] == "trip" and f["tend"] < f["due"]:
+            f["tend"] = {"start": f["due"] + 3600, "clamp": f["due"],
+                         "nextday": f["tend"] + 86400}[rule]
+
+    def sched_form_key(self, k, ch):
+        """表单键流: ↑↓ 换字段 / Enter 下一项 (末项=保存); 内容·地点 = 拼音
+        IME (/ 中英); 日期·时间 = 数字直输 (键盘基层没有冒号) + ←→ 步进
+        (日期 ±1 天, 时间 ±5 分); 类型行 ←→/空格 切 提醒/行程."""
+        f = self.sched_form
+        fs = self._sched_fields()
+        i = max(0, min(len(fs) - 1, f["f"]))
+        cur = fs[i]
+        enter = k in (pygame.K_RETURN, pygame.K_KP_ENTER)
+
+        def nxt():
+            self._sched_dig_commit(cur)
+            self.ime_clear()
+            if i + 1 >= len(fs):
+                self.sched_form_save()
+            else:
+                f["f"] = i + 1
+
+        if k in (pygame.K_UP, pygame.K_DOWN):
+            j = i + (-1 if k == pygame.K_UP else 1)
+            if 0 <= j < len(fs):
+                self._sched_dig_commit(cur)
+                self.ime_clear()
+                f["f"] = j
+            return True
+        # Enter: 拼音串未提交时先交给 IME (ASCII 直提逃生门), 否则下一项/保存
+        if enter and not (cur in (SF_TEXT, SF_LOC) and self.ime_mode
+                          and self.ime_buf):
+            nxt()
+            return True
+        if cur == SF_KIND:
+            if k in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_SPACE):
+                f["kind"] = "trip" if f["kind"] == "remind" else "remind"
+                self._sched_fix_end("start")
+            return True
+        if cur in (SF_TEXT, SF_LOC):           # 文本字段 (IME 同写信层)
+            name = "text" if cur == SF_TEXT else "loc"
+            cap = 40 if cur == SF_TEXT else 16
+            if k == pygame.K_SLASH:            # 中/英切换
+                self.ime_mode = not self.ime_mode
+                self.ime_clear()
+            elif self.ime_mode:
+                act = self.ime_key(k, ch)
+                if act is None:
+                    return True
+                tag, val = act
+                if tag == "del":
+                    f[name] = f[name][:-1]
+                elif tag == "submit":
+                    nxt()
+                else:                          # char / word
+                    f[name] = (f[name] + val)[:cap]
+            elif k == pygame.K_BACKSPACE:
+                f[name] = f[name][:-1]
+            elif ch and 0x20 <= ord(ch) < 0x7F:
+                f[name] = (f[name] + ch)[:cap]
+            return True
+        # ── 日期 / 时间字段 ──
+        start = cur in (SF_SD, SF_ST)
+        key = "due" if start else "tend"
+        if k in (pygame.K_LEFT, pygame.K_RIGHT):
+            step = 86400 if cur in (SF_SD, SF_ED) else 300
+            f[key] += step if k == pygame.K_RIGHT else -step
+            f["dig"] = ""
+            self._sched_fix_end("start" if start else "clamp")
+        elif k == pygame.K_BACKSPACE:
+            f["dig"] = f["dig"][:-1]
+        elif ch and ch in "0123456789" and len(f["dig"]) < 4:
+            f["dig"] += ch
+            if len(f["dig"]) == 4:
+                self._sched_dig_commit(cur)
+        return True
+
+    def sched_form_save(self):
+        """末字段 Enter: 校验 → 入队 (put) → 回列表. 改来源条目带 fork_of
+        (云端一次请求: 隐藏原件 + 写入新条目)."""
+        f = self.sched_form
+        fs = self._sched_fields()
+        self._sched_dig_commit(fs[max(0, min(len(fs) - 1, f["f"]))])
+        tx = f["text"].strip()
+        if not tx:
+            f["f"] = fs.index(SF_TEXT)
+            self.osd = ("内容不能为空", time.monotonic() + 2)
+            return
+        trip = f["kind"] == "trip"
+        op = {"op": "put", "id": f["id"], "kind": f["kind"], "text": tx[:40],
+              "due": int(f["due"]),
+              "tend": int(f["tend"]) if trip else 0,
+              "loc": f["loc"].strip()[:16] if trip else ""}
+        if f["mode"] == "fork":
+            op["fork_of"] = f["fork_of"]
+        self.sched_form = None
+        self.ime_clear()
+        self._sched_enqueue(op)
+        url, tok = self._cloud_cfg()
+        self.osd = (("已保存 · 上云中" if self.net.mode == "online"
+                     else "已保存 · 联网后自动上云")
+                    if (url and tok) else "已保存 · 仅本机 (登录后自动上云)",
+                    time.monotonic() + 2)
+
     def draw_sched(self, surf):
+        if self.sched_form is not None:
+            self.draw_sched_form(surf)
+            return
         hi, soft, dim = self.th("hi"), self.th("soft"), self.th("dim")
         acc = self.th("accent")
         items = self._sched_items()
+        n = len(items)
+        self.ssel = max(0, min(self.ssel, max(0, n - 1)))
+        pend = len(self._sched_ops())
         logged = bool(self._cloud_cfg()[1])
         text(surf, "日程", 14, hi, (6, 3))
-        text(surf, "\u00b7 %d \u6761" % len(items), 10, dim,
-             (6 + textw("\u65e5\u7a0b", 14) + 6, 5))
-        head = ("@%s" % (self.cfg.get("cloud_user") or "")) if logged \
-            else "\u672a\u767b\u5f55"
-        text(surf, head, 10, dim, (W - 6, 5), right=True)
-        if not logged:
-            textc(surf, "\u672a\u767b\u5f55 \u00b7 \u8bbe\u7f6e\u91cc\u914d\u7f6e\u60f3\u6cd5\u4e91\u540e\u53ef\u7528",
-                  14, dim, W // 2, 62)
-            textc(surf, "\u8bbe\u7f6e \u00b7 \u767b\u5f55 \u6216 \u6ce8\u518c\u65b0\u8d26\u53f7",
-                  12, acc, W // 2, 82)
-            self.tool_foot(surf, ["4 \u5237\u65b0", "Esc \u8fd4\u56de"])
-            return
+        text(surf, "· %d 条" % n, 10, dim, (6 + textw("日程", 14) + 6, 5))
+        head = ("待同步 %d" % pend) if pend else (
+            ("@%s" % (self.cfg.get("cloud_user") or "")) if logged
+            else "未登录 · 仅本机")
+        text(surf, head, 10, acc if pend else dim, (W - 6, 5), right=True)
+        if not n:
+            textc(surf, "暂无提醒 / 行程", 14, dim, W // 2, 56)
+            textc(surf, "按 N 新建" + ("" if logged else " · 未登录仅本机保存"),
+                  12, acc, W // 2, 78)
         now = time.time()
-        if not items:
-            textc(surf, "\u6682\u65e0\u63d0\u9192 / \u884c\u7a0b", 14, dim, W // 2, 60)
-            textc(surf, "iPhone/Mac \u63d0\u4ea4\u5668\u540c\u6b65\u540e \u00b7 \u63094 \u5237\u65b0",
-                  12, acc, W // 2, 80)
-        else:
-            for i in range(min(6, len(items))):
-                it = items[i]
-                y = 20 + i * 20
-                t = it["t"]
-                lt = time.localtime(t or now)
-                over = t and t < now and \
-                    (it["kind"] == "remind" or (it["tend"] or t) < now)
-                text(surf, "%02d-%02d %02d:%02d" % (lt.tm_mon, lt.tm_mday,
-                                                    lt.tm_hour, lt.tm_min),
-                     16, acc if over else dim, (8, y + 1))
-                badge = "\u884c" if it["kind"] == "trip" else "\u63d0"
-                text(surf, badge, 16,
-                     acc if it["kind"] == "trip" else soft, (116, y + 1))
-                label = it["text"] + ((" \u00b7 " + it["loc"]) if it["loc"]
-                                      else "")
-                text(surf, clip_text(label, 16, W - 148), 16,
-                     soft, (140, y + 1))
-        self.tool_foot(surf, ["4 \u5237\u65b0", "Esc \u8fd4\u56de"])
+        vis = min(6, n)                        # 6 行滚动窗 (光标跟随)
+        start = max(0, min(self.ssel - (vis - 1), n - vis))
+        for i in range(vis):
+            it = items[start + i]
+            y = 20 + i * 20
+            t = it["t"]
+            lt = time.localtime(t or now)
+            over = t and t < now and \
+                (it["kind"] == "remind" or (it["tend"] or t) < now)
+            sel = start + i == self.ssel
+            if sel:
+                pygame.draw.rect(surf, self.th("track"),
+                                 pygame.Rect(4, y - 2, W - 8, 19),
+                                 border_radius=3)
+                pygame.draw.rect(surf, acc, (4, y - 2, 2, 19))
+            text(surf, "%02d-%02d %02d:%02d" % (lt.tm_mon, lt.tm_mday,
+                                                lt.tm_hour, lt.tm_min),
+                 16, acc if over else dim, (8, y + 1))
+            badge = "行" if it["kind"] == "trip" else "提"
+            text(surf, badge, 16,
+                 acc if it["kind"] == "trip" else soft, (116, y + 1))
+            label = it["text"] + ((" · " + it["loc"]) if it["loc"] else "")
+            text(surf, clip_text(label, 16, W - 148), 16,
+                 hi if sel else soft, (140, y + 1))
+        self.tool_foot(surf, SCHED_FOOT)
+
+    def draw_sched_form(self, surf):
+        """新建/编辑表单: 类型行 (仅新建) + 内容 (IME) + 日期·时间小框
+        (行程两组: 开始/结束) + 地点 (行程). 选中框描边高亮."""
+        acc, hi, soft, dim = (self.th("accent"), self.th("hi"),
+                              self.th("soft"), self.th("dim"))
+        border = self.th("border")
+        f = self.sched_form
+        fs = self._sched_fields()
+        f["f"] = max(0, min(len(fs) - 1, f["f"]))
+        cur = fs[f["f"]]
+        self.tool_head(surf, "日程 · " + ("新建" if f["mode"] == "new"
+                                          else "编辑"),
+                       "Mac/iPhone 条目 · 改后另存新条目"
+                       if f["mode"] == "fork" else "")
+        now = time.time()
+        blink = int(time.monotonic() * 2) % 2 == 0
+
+        def box(x, y, w, h, sel):
+            r = pygame.Rect(x, y, w, h)
+            pygame.draw.rect(surf, self.card(0), r, border_radius=5)
+            pygame.draw.rect(surf, acc if sel else border, r,
+                             2 if sel else 1, border_radius=5)
+
+        def picker(fl, x, w, y):
+            """日期/时间小框: 当前值; 直输中的数字按位替换 (MM-DD / HH:MM)."""
+            sel = fl == cur
+            isdate = fl in (SF_SD, SF_ED)
+            t = f["due" if fl in (SF_SD, SF_ST) else "tend"]
+            if isdate:
+                lab = _sched_date_lab(t, now)
+                shown = lab[0] + lab[1]
+            else:
+                lt = time.localtime(t)
+                shown = "%02d:%02d" % (lt.tm_hour, lt.tm_min)
+            dig = f["dig"] if sel else ""
+            if dig:
+                s = dig + "_" * (4 - len(dig))
+                shown = s[:2] + ("-" if isdate else ":") + s[2:]
+            box(x, y, w, 20, sel)
+            text(surf, clip_text(shown, 12, w - (26 if sel else 14)), 12,
+                 hi, (x + 7, y + 4))
+            if sel:
+                text(surf, "←→", 9, acc, (x + w - 6, y + 6), right=True)
+
+        y = 20
+        for i, fl in enumerate(fs):
+            sel = fl == cur
+            if fl == SF_KIND:
+                box(6, y, W - 12, 20, sel)
+                text(surf, "类型", 11, acc if sel else dim, (14, y + 5))
+                name = ("← " if sel else "") + \
+                    ("行程" if f["kind"] == "trip" else "提醒") + \
+                    (" →" if sel else "")
+                textc(surf, name, 12, hi, W // 2 + 24, y + 4)
+                y += 23
+            elif fl in (SF_TEXT, SF_LOC):
+                box(6, y, W - 12, 22, sel)
+                text(surf, "内容" if fl == SF_TEXT else "地点", 11,
+                     acc if sel else dim, (14, y + 6))
+                val = f["text" if fl == SF_TEXT else "loc"]
+                if not val and fl == SF_LOC:
+                    text(surf, "(可空)", 12, dim, (54, y + 5))
+                else:
+                    text(surf, clip_text(val + ("_" if sel and blink else ""),
+                                          12, W - 112), 12,
+                         hi if val else dim, (54, y + 5))
+                if sel:
+                    text(surf, "拼" if self.ime_mode else "EN", 10, acc,
+                         (W - 14, y + 6), right=True)
+                y += 25
+            elif fl in (SF_SD, SF_ED):
+                text(surf, "开始" if fl == SF_SD else "结束", 11,
+                     acc if sel or fs[i + 1] == cur else dim, (14, y + 5))
+                picker(fl, 50, 130, y)
+                picker(fs[i + 1], 186, W - 192, y)
+                y += 23
+        if not self.ime_bar(surf, 146):        # 候选条在时让位底栏
+            self.tool_foot(surf, SCHED_FORM_FOOT)
 
     def mail_esc(self):
         """Esc 逐层回退. 返回 True=已消化, False=账号层 (调用方回工具网格)."""
@@ -7404,7 +7949,7 @@ class App:
                 text(surf, clip_text(it2["text"], BODY, cw2 - 123), BODY,
                      soft, (cx + 115, vy))
             else:
-                text(surf, "暂无 · iPhone 同步后按4刷新", BODY, dim,
+                text(surf, "暂无 · 工具·日程 里按 N 新建", BODY, dim,
                      (cx + 8, tops_s + 13 + (chh - 13 - BODY) // 2))
 
     FIN_TABS = ["自选股", "指数", "商品"]
@@ -8704,6 +9249,14 @@ class App:
             textc(surf, "删除新闻源 %s?" % ((f or {}).get("name")
                                            or self.dialog[1] or ""),
                   12, self.th("accent"), W // 2, H // 2 - 18)
+        elif self.dialog[0] == "scheddel":
+            it = next((x for x in self._sched_items()
+                       if x["id"] == self.dialog[1]), {}) or {}
+            textc(surf, "删除%s?" % ("行程" if it.get("kind") == "trip"
+                                     else "提醒"),
+                  12, self.th("accent"), W // 2, H // 2 - 20)
+            textc(surf, clip_text(it.get("text") or "", 9, 164), 9,
+                  self.th("soft"), W // 2, H // 2 - 6)
         else:
             it = self.dialog[1] or {}
             textc(surf, "删除这条想法?", 12, self.th("accent"), W // 2, H // 2 - 20)
