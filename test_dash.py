@@ -2183,6 +2183,138 @@ def test_login():
           "switch+csync reset/logout)")
 
 
+def test_logout_wipe():
+    """退出登录 = 本地清库 (2026-11-26 用户定版): 设置行 → cfg 清空+
+    kv_clean 标记 / kv 四表回空态 (news 内置种子) / 日程缓存+待传队列清 /
+    想法文本+语音+wav 清 / 邮件账号清 / QQ·网易绑定清; 重登 → kv_follow
+    静默跟随 (云端有→覆盖, 404→本地保留/游客新增不丢, 全程无弹框)."""
+    import dash
+    import json as json_mod
+    import news_rss
+    import mail as mailmod
+    import musrc
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    canvas = pygame.Surface((dash.W, dash.H))
+    tmp = tempfile.mkdtemp(prefix="oneapp")
+    fr = os.path.join(tmp, "radio_fav.json")
+    fw = os.path.join(tmp, "watch.json")
+    ftv = os.path.join(tmp, "tv_fav.json")
+    fnf = os.path.join(tmp, "news_feeds.json")
+    fsch = os.path.join(tmp, "sched.json")
+    fsout = os.path.join(tmp, "sched_out.json")
+    fid = os.path.join(tmp, "ideas.json")
+    fvc = os.path.join(tmp, "voices")
+    dash.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+    dash.KV_FILES.update({"radio_fav": fr, "watch": fw, "tv_fav": ftv,
+                          "news_feeds": fnf})
+    dash.RADIO_FAV_CACHE = fr
+    dash.WATCH_FILE = fw
+    dash.TV_FAV_CACHE = ftv
+    dash.NEWS_FEEDS_FILE = fnf
+    dash.SCHED_CACHE = fsch
+    dash.SCHED_OUT = fsout
+    dash.IDEAS_FILE = fid
+    dash.VOICES_DIR = fvc
+    mailmod.MAIL_FILE = os.path.join(tmp, "mail.json")
+    musrc.QQ_CRED_FILE = os.path.join(tmp, "qq_cred.json")
+    musrc.QQ_DEV_DIR = os.path.join(tmp, "qqdev")
+    musrc.NE_COOKIE_FILE = os.path.join(tmp, "ne_cookie.json")
+    # ── 造「前一用户」的满档本地状态 ──
+    json_mod.dump({"cloud_tok": "t" * 24, "cloud_user": "old",
+                   "kv_owner": "old"}, open(dash.SETTINGS_FILE, "w"))
+    json_mod.dump(["f1", "f2"], open(fr, "w"))
+    json_mod.dump({"items": [{"code": "sh600519", "name": "贵州茅台"}]},
+                  open(fw, "w"))
+    json_mod.dump(["CCTV-1"], open(ftv, "w"))
+    json_mod.dump([{"id": "custom", "name": "自定源",
+                    "url": "https://x/rss", "on": True}], open(fnf, "w"))
+    json_mod.dump({"reminds": [{"id": "r1", "text": "旧号日程",
+                                "due": 123}], "trips": []}, open(fsch, "w"))
+    json_mod.dump({"ops": [{"op": "put", "id": "r2", "ow": "old", "s": 1,
+                            "kind": "remind", "text": "旧号待传",
+                            "due": 5}]}, open(fsout, "w"))
+    json_mod.dump({"texts": [{"id": "t1", "cid": "c1", "owner": "old",
+                              "text": "旧想法", "createdAt": 1}]},
+                  open(fid, "w"))
+    os.makedirs(fvc)
+    wav = os.path.join(fvc, "v1.wav")
+    open(wav, "wb").write(b"RIFF")
+    mailmod.save_accounts({"accounts": [{"email": "old@163.com",
+                                         "auth": "AUTH"}],
+                           "last": "old@163.com"})
+    json_mod.dump({"credential": "x"}, open(musrc.QQ_CRED_FILE, "w"))
+    os.makedirs(musrc.QQ_DEV_DIR)
+    open(os.path.join(musrc.QQ_DEV_DIR, "dev"), "w").write("d")
+    json_mod.dump({"MUSIC_U": "u"}, open(musrc.NE_COOKIE_FILE, "w"))
+    app = dash.App(FakeNet())
+    app.tool = "set"
+    app.set_tab = 1
+    # ── 退出: 设置行 → 全清 ──
+    app.set_sel = [r[0] for r in app._set_rows()].index("logout")
+    app.key(pygame.K_RETURN)
+    assert app.cfg.get("cloud_tok") == "" and app.cfg.get("cloud_user") == ""
+    assert app.cfg.get("kv_owner") == "" and app.cfg.get("kv_clean") is True
+    assert app.osd and "本地已清空" in app.osd[0]
+    assert app.radio_fav == [] and json_mod.load(open(fr)) == []
+    assert app.watch == {"items": []} \
+        and json_mod.load(open(fw)) == {"items": []}
+    assert app.tv_fav == [] and json_mod.load(open(ftv)) == []
+    assert len(app.news_feeds) == len(news_rss.defaults()) \
+        and json_mod.load(open(fnf)) == app.news_feeds   # 内置种子兜底
+    assert app.sched == {"reminds": [], "trips": []} \
+        and json_mod.load(open(fsch)) == app.sched
+    assert app.sched_out == {"ops": []} \
+        and json_mod.load(open(fsout)) == {"ops": []}    # 旧号待传不留
+    assert app.ideas == {"texts": [], "voices": []} \
+        and json_mod.load(open(fid)) == app.ideas
+    assert not os.path.exists(wav) and not os.path.exists(fvc)
+    assert mailmod.load_accounts() == {"accounts": [], "last": ""}
+    assert app.mail == {"accounts": [], "last": ""}
+    assert app.mail_lv == "acct"
+    assert not os.path.exists(musrc.QQ_CRED_FILE)
+    assert not os.path.exists(musrc.QQ_DEV_DIR)
+    assert not os.path.exists(musrc.NE_COOKIE_FILE)
+    assert app.kv_confirm is None and app.kv_queue == []
+    assert not app.kv_switch and not app.kv_follow
+    app.draw(canvas)                       # 清库后设置页渲染冒烟
+    # ── 游客期新增收藏 (kv_push 无 token 空转, 不出网) ──
+    app.tool = None
+    app.page = 2
+    app.radio_fav = ["guest1"]
+    app.radio_fav_save()
+    assert not any(t == "kvput:radio_fav" for t, _ in app.net.jobs)
+    # ── 重登: kv_clean → kv_follow 静默跟随 (无确认框) ──
+    app.on_net("data", "cloudlogin", {"ok": 1, "user": "new",
+                                      "tok": "n" * 48, "now": 888.0})
+    assert app.cfg["cloud_user"] == "new" and "kv_clean" not in app.cfg
+    assert app.kv_follow is True
+    orig_raw = netmod.http_raw
+    try:
+        netmod.http_raw = lambda url, **k: (
+            (404, b'{"err": "no such key"}')
+            if url.endswith("/kv/radio_fav")
+            else (200, json_mod.dumps({"ok": 1, "updated": 1, "v":
+                                       {"items": [{"code": "sz000001",
+                                                   "name": "平安银行"}]}})
+                  .encode()) if url.endswith("/kv/watch")
+            else (404, b'{"err": "no such key"}'))
+        for k in ("radio_fav", "watch", "tv_fav", "news_feeds"):
+            d = app.net.last_job("kvalign:" + k)()
+            app.on_net("data", "kvalign:" + k, d)
+            assert app.kv_confirm is None   # 全程静默, 不弹框
+        assert app.kv_follow is False       # 队列排空复位
+        assert app.radio_fav == ["guest1"]   # 404 → 游客新增保留 (本地非空)
+        assert json_mod.load(open(fr)) == ["guest1"]
+        assert app.watch["items"][0]["code"] == "sz000001"   # 200 → 云端覆盖
+        assert app.tv_fav == []              # 404 空态保留
+        assert len(app.news_feeds) == len(news_rss.defaults())
+    finally:
+        netmod.http_raw = orig_raw
+    print("logout_wipe OK (cfg+kv_clean/四表空态+种子/日程队列/想法+wav/"
+          "邮件/音乐绑定/重登静默跟随 404留·200盖/无弹框)")
+
+
 def test_qrlogin():
     """扫码登录: 设置行进入/出码(start)/pending 轮询节流/approved 存 token
     +csync 重置/过期自动重出码/Esc 关/网络异常不断轮询/绘制冒烟."""
@@ -4354,6 +4486,7 @@ if __name__ == "__main__":
     test_sched_form()
     test_reg()
     test_login()
+    test_logout_wipe()
     test_mail_keys()
     test_mail_all()
     test_mail_sess()

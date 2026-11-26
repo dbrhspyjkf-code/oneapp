@@ -1654,6 +1654,7 @@ class App:
         self.kv_confirm = None                 # kv 云同步确认框 {k,n,cn,v}
         self.kv_queue = []                     # 登录对齐待处理服务队列
         self.kv_switch = False                 # 换号对齐中 (旧 kv 是别人的)
+        self.kv_follow = False                 # 退出清库后登录 (静默跟随云端)
         self.set_buf = ""
         # 电视 (工具第 8 卡; 直播源内置 tv_channels.py, 单 ffmpeg 视频管道
         # + 音频同进程 — 播放方案移植官方 cardputer-zero-iptv 的 panel.py)
@@ -1833,6 +1834,8 @@ class App:
                     self.cfg["kv_owner"] = new_user   # 登录即落位 (残留旧号
                     if prev_user and prev_user != new_user:  #   不再反复补对齐)
                         self.kv_switch = True    # 换号: 本地 kv 是旧号残留
+                    elif self.cfg.pop("kv_clean", None):
+                        self.kv_follow = True    # 退出清库后登录: 静默跟随
                     self.cfg_save()
                     self.login = None          # 成功: 关表单 + ping 复核
                     if b.get("now"):           # 换号: csync 重置 (本地
@@ -1885,6 +1888,8 @@ class App:
                     self.cfg["kv_owner"] = new_user   # 登录即落位 (同上)
                     if prev_user and prev_user != new_user:
                         self.kv_switch = True    # 换号: 本地 kv 是旧号残留
+                    elif self.cfg.pop("kv_clean", None):
+                        self.kv_follow = True    # 退出清库后登录: 静默跟随
                     self.cfg_save()
                     self.qrlogin = None        # 成功: 关扫码页
                     self.qr_poll_at = 0.0
@@ -2007,11 +2012,16 @@ class App:
             elif a == "cloudqrpoll":
                 self.qr_poll_at = 0.0          # 网络异常: 下帧重试 poll
             elif a.startswith("kvalign:"):
+                k2 = a.split(":", 1)[1]
                 if self.kv_switch:             # 换号对齐: 失败也清 (归旧号)
-                    k2 = a.split(":", 1)[1]
                     if self.kv_queue and self.kv_queue[0] == k2:
                         self.kv_queue.pop(0)
                     self.kv_apply(k2, None)
+                    self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""
+                    self.cfg_save()
+                elif self.kv_follow:           # 清库后登录: 失败只落位不弹框
+                    if self.kv_queue and self.kv_queue[0] == k2:
+                        self.kv_queue.pop(0)
                     self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""
                     self.cfg_save()
                 elif self.kv_queue:
@@ -2445,6 +2455,43 @@ class App:
         self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""
         self.cfg_save()
 
+    def logout_wipe(self):
+        """退出登录 = 本地清库 (2026-11-26 用户定版: 退出后本地不留前一
+        用户的任何数据). 云端有的 (kv 四表/日程/想法) 登录后静默拉回
+        (kv_follow, 404 保留本地空态不弹框); 只存本地的 (邮件账号/
+        QQ·网易云绑定) 清掉须重新绑定. 设备级不动 (主题/输出/音量/主页
+        卡片显隐/归属地缓存/曲库)."""
+        self.cfg["cloud_tok"] = ""             # 先断凭据: 清库途中不带旧
+        self.cfg["cloud_user"] = ""            #   token 出网 (kv_push 空转)
+        self.cfg["kv_owner"] = ""
+        self.cfg["kv_clean"] = True            # 下次登录 → kv_follow 静默跟随
+        self.cfg_save()
+        self.kv_apply("radio_fav", [])         # kv 四表 → 空态 (news 零源
+        self.kv_apply("tv_fav", [])            #   不允许 → 内置种子兜底)
+        self.kv_apply("watch", None)
+        self.kv_apply("news_feeds", None)
+        self.sched_reset_cache()               # 云端日程缓存清 (回空态)
+        self.sched_out = {"ops": []}           # 待传队列不留旧号操作
+        self._sched_save_out()
+        self.stop_player()                     # 语音想法: 播放停 + 索引清 +
+        self.playing_voice = None              #   本地 wav 一并删
+        self.ideas = {"texts": [], "voices": []}
+        netmod.save_json_file(IDEAS_FILE, self.ideas)
+        self.sel = 0
+        shutil.rmtree(VOICES_DIR, ignore_errors=True)
+        mailmod.save_accounts({"accounts": [], "last": ""})   # 邮件只存本地
+        self.mail = {"accounts": [], "last": ""}
+        self.mail_lv = "acct"
+        self.mail_err = ""
+        musrc.qq_clear_cred()                  # QQ 绑定凭据 + 设备指纹
+        shutil.rmtree(musrc.QQ_DEV_DIR,        #   (铁律: 同生共死) + 网易
+                      ignore_errors=True)
+        musrc.ne_clear_cookie()
+        self.kv_confirm = None                 # 对齐模态/队列收尾
+        self.kv_queue = []
+        self.kv_switch = False
+        self.kv_follow = False
+
     def kv_align_trigger(self):
         """登录成功后: 逐服务本地 vs 云端对齐; 本地有记录→确认框."""
         self.kv_confirm = None
@@ -2455,6 +2502,7 @@ class App:
         if not self.kv_queue or not self.cfg.get("cloud_tok"):
             self.kv_queue = []
             self.kv_switch = False             # 队列排空/中止 → 复位
+            self.kv_follow = False
             return
         k = self.kv_queue[0]
         self.net.invalidate(("job", "kvalign:" + k))
@@ -2465,13 +2513,21 @@ class App:
         本地与云端 (归一后) 一致→静默过; 真不一致→确认框
         (Enter 上传 / Esc 云端覆盖).
         换号 (kv_switch): 本地是旧号残留 — 静默跟随新号云端,
-        404/失败清空本地 (旧数据已在旧号云端, 清本地无损)."""
+        404/失败清空本地 (旧数据已在旧号云端, 清本地无损).
+        退出清库后登录 (kv_follow): 同为静默, 但 404/失败保留本地
+        (清库空态/游客期新增不丢, 云端没存过就更不该反手推空)."""
         if self.kv_queue and self.kv_queue[0] == k:
             self.kv_queue.pop(0)
         if self.kv_switch:
             self.kv_apply(k, b.get("v") if b.get("ok") else None)
             self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""
             self.cfg_save()                    # 该文件已归新号
+            return self.kv_align_next()
+        if self.kv_follow:                     # 退出清库后登录: 云端有→静默
+            if b.get("ok"):                    #   覆盖空态; 404/失败→本地保
+                self.kv_apply(k, b.get("v"))   #   留 (清库空态/游客期新增),
+            self.cfg["kv_owner"] = self.cfg.get("cloud_user") or ""  # 无弹框
+            self.cfg_save()
             return self.kv_align_next()
         if not b.get("ok"):
             return self.kv_align_next()
@@ -5234,15 +5290,12 @@ class App:
                     self.osd = ("出码中…", time.monotonic() + 5)
             elif rid == "login":               # 登录/更换账户 表单
                 self.login = {"user": "", "pw": "", "field": 0}
-            elif rid == "logout":              # 退出登录 (本地数据不动)
-                u = self.cfg.get("cloud_user") or ""
+            elif rid == "logout":              # 退出登录 = 本地清库 (用户定版
+                u = self.cfg.get("cloud_user") or ""   #   2026-11-26)
                 if self.cfg.get("cloud_tok"):
-                    self.cfg["cloud_tok"] = ""
-                    self.cfg["cloud_user"] = ""
-                    self.cfg_save()
-                    self.sched_reset_cache()   # 云端日程缓存不留 (回「仅本机」视图)
-                    self.osd = ("已退出 %s · 云数据仅本地" % u
-                                if u else "已退出",
+                    self.logout_wipe()
+                    self.osd = ("已退出 %s · 本地已清空" % u
+                                if u else "已退出 · 本地已清空",
                                 time.monotonic() + 2.5)
                 else:
                     self.osd = ("未登录", time.monotonic() + 1.5)
@@ -5932,8 +5985,9 @@ class App:
         self.ssel = max(0, min(self.ssel, max(0, n - 1)))
 
     def sched_reset_cache(self):
-        """换号/退出登录: 云端缓存清空 (旧账号的条目不许再显示). 待同步
-        操作按归属留在队列里 (哪个号建的, 等那个号登录再传)."""
+        """换号登录/退出清库: 云端缓存清空 (旧账号的条目不许再显示).
+        待同步操作: 换号按归属留在队列里 (等那个号登录再传); 退出清库
+        则由 logout_wipe 整队列清掉."""
         self.sched = {"reminds": [], "trips": []}
         netmod.save_json_file(SCHED_CACHE, self.sched)
         self.ssel = 0
